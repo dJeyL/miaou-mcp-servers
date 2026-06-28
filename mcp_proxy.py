@@ -202,7 +202,7 @@ def build_proxy_server(
     """Construit le Server MCP avec les handlers list_tools / call_tool."""
     server: Server = Server("miaou-proxy")
 
-    @server.list_tools()  # type: ignore[arg-type]
+    @server.list_tools()
     async def handle_list_tools() -> list[types.Tool]:
         tools: list[types.Tool] = []
         for prefix, upstream in upstreams.items():
@@ -218,14 +218,14 @@ def build_proxy_server(
                 )
         return tools
 
-    @server.call_tool()  # type: ignore[arg-type]
+    @server.call_tool()
     async def handle_call_tool(
         name: str, arguments: dict[str, Any] | None
     ) -> list[Any]:
         if name not in tool_map:
             from mcp.shared.exceptions import McpError
-            from mcp.types import ErrorCode # type: ignore
-            raise McpError(ErrorCode.InvalidParams, f"Outil inconnu : '{name}'") # type: ignore
+            from mcp.types import INVALID_PARAMS, ErrorData
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Outil inconnu : '{name}'"))
         upstream_name, orig_name = tool_map[name]
         return await upstreams[upstream_name].call_tool(orig_name, arguments or {})
 
@@ -249,7 +249,7 @@ def build_app(
     )
 
     @asynccontextmanager
-    async def lifespan(app: Starlette):  # type: ignore[type-arg]
+    async def lifespan(app: Starlette):
         for upstream in upstreams.values():
             await upstream.start()
         # session_manager.run() initialise le task group interne requis pour

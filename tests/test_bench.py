@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "servers"))
 
-from mcp_bench import server as bench_server # type: ignore
+from mcp_bench import server as bench_server
 
 
 # Tous les outils ont asyncio.sleep(2) — on le neutralise dans chaque test.
@@ -85,7 +85,8 @@ async def test_get_image_returns_image_object():
         result = await tm.call_tool("get_image", {})
     assert isinstance(result, Image)
     # Vérifie que le PNG commence par la signature PNG
-    png_bytes = result.data if isinstance(result.data, bytes) else base64.b64decode(result.data) # type: ignore
+    assert result.data is not None
+    png_bytes = result.data
     assert png_bytes[:4] == b"\x89PNG"
 
 
@@ -100,7 +101,7 @@ async def test_get_json_resource_returns_embedded_resource():
         result = await tm.call_tool("get_json_resource", {})
     assert isinstance(result, types.EmbeddedResource)
     assert result.resource.mimeType == "application/json"
-    data = json_mod.loads(result.resource.text) # type: ignore
+    data = json_mod.loads(result.resource.text)
     assert data["ok"] is True
     assert data["items"] == [1, 2, 3]
 

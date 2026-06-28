@@ -68,8 +68,8 @@ class BenchServer(MiaouMCPBase):
             await asyncio.sleep(2)
             try:
                 infos = socket.getaddrinfo(hostname, None)
-                addrs = sorted({i[4][0] for i in infos})
-                return f"{hostname} → " + ", ".join(addrs)  # type: ignore[return-value]
+                addrs = sorted({str(i[4][0]) for i in infos})
+                return f"{hostname} → " + ", ".join(addrs)
             except OSError as e:
                 return f"Échec de résolution de {hostname} : {e}"
 
