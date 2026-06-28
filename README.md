@@ -10,13 +10,15 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 |---|---|---|
 | `servers/mcp_bench.py` | 8765 | Banc d'essai : echo, add, DNS, image PNG, resource JSON |
 | `servers/mcp_weather.py` | 8766 | Météo réelle via wttr.in (resource JSON) |
-| `mcp_proxy.py` | configurable | Proxy qui agrège les deux serveurs ci-dessus |
+| `servers/mcp_web.py` | 8768 | Téléchargement d'URL (HTML→texte, text/*, binaire base64) |
+| `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API |
+| `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) |
+| `mcp_proxy.py` | configurable | Proxy qui agrège les serveurs ci-dessus |
 
 ## Prérequis
 
 **Avec uv** (recommandé — les dépendances sont gérées automatiquement) :
 ```bash
-# Vérifier que uv est installé
 uv --version
 ```
 
@@ -32,32 +34,39 @@ pip install -r requirements.txt
 ```bash
 uv run servers/mcp_bench.py                   # HTTP 127.0.0.1:8765
 uv run servers/mcp_weather.py                 # HTTP 127.0.0.1:8766
+uv run servers/mcp_web.py                   # HTTP 127.0.0.1:8768
+uv run servers/mcp_ddg.py                     # HTTP 127.0.0.1:8769
+BRAVE_API_KEY=<key> uv run servers/mcp_brave.py  # HTTP 127.0.0.1:8770
+
 uv run servers/mcp_bench.py --transport stdio # mode stdio
 ```
 
-### Proxy (agrège bench + weather sur un seul port)
+### Proxy (agrège tout sur un seul port)
 
 ```bash
 cp config.sample.json config.json
-# Éditer config.json si nécessaire (port, host)
+# Éditer config.json : BRAVE_API_KEY, activer/désactiver des serveurs
 uv run mcp_proxy.py
 ```
 
-Par défaut `config.sample.json` configure bench et weather en **inprocess** (pas de
-subprocess supplémentaire — les serveurs tournent dans le même processus Python que
-le proxy).
+`config.sample.json` active bench, weather, fetch et duckduckgo par défaut en inprocess.
+brave est désactivé jusqu'à ce que `BRAVE_API_KEY` soit renseigné.
 
 ## Configuration MIAOU
 
 Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 
 ```
-bench    → http://127.0.0.1:8765/mcp   (streamable-http)
-weather  → http://127.0.0.1:8766/mcp   (streamable-http)
-proxy    → http://127.0.0.1:8767/mcp   (streamable-http)
+bench       → http://127.0.0.1:8765/mcp   (streamable-http)
+weather     → http://127.0.0.1:8766/mcp   (streamable-http)
+fetch       → http://127.0.0.1:8768/mcp   (streamable-http)
+duckduckgo  → http://127.0.0.1:8769/mcp   (streamable-http)
+brave       → http://127.0.0.1:8770/mcp   (streamable-http)
+proxy       → http://127.0.0.1:8767/mcp   (streamable-http)
 ```
 
-Les outils du proxy apparaissent préfixés : `bench__echo`, `weather__get_weather`, etc.
+Via le proxy, les outils apparaissent préfixés : `bench__echo`, `web__fetch_url`,
+`duckduckgo__ddg_search`, `brave__brave_search`, etc.
 
 ## Options CLI
 
@@ -82,17 +91,21 @@ Le proxy accepte en plus :
   "port": 8767,
   "host": "127.0.0.1",
   "mcpServers": {
-    "bench": {
+    "bench":      { "type": "inprocess", "module": "mcp_bench" },
+    "web":        { "type": "inprocess", "module": "mcp_web" },
+    "duckduckgo": { "type": "inprocess", "module": "mcp_ddg" },
+    "brave": {
       "type": "inprocess",
-      "module": "mcp_bench"
-    },
-    "weather": {
-      "type": "inprocess",
-      "module": "mcp_weather"
+      "module": "mcp_brave",
+      "env": { "BRAVE_API_KEY": "your-key-here" }
     }
   }
 }
 ```
+
+`type` absent → `stdio`. `port` est obligatoire, `host` optionnel.
+`"_disabled": true` sur une entrée → upstream ignoré au démarrage.
+`env` sur une entrée inprocess → variables d'environnement injectées avant l'import.
 
 Pour un serveur externe (subprocess stdio) :
 ```json
@@ -104,17 +117,17 @@ Pour un serveur externe (subprocess stdio) :
 }
 ```
 
-`type` absent → `stdio`. `port` est obligatoire, `host` optionnel.
-
 ## Tests
 
 ```bash
 # Avec uv
-uv run --with pytest --with pytest-asyncio pytest tests/ -v
+uv run --with pytest --with pytest-asyncio --with html2text pytest tests/ -v
 
 # Avec pip (après pip install -r requirements.txt)
 pytest tests/ -v
 ```
+
+Tous les tests sont unitaires et mockent les appels réseau — aucune clef API requise.
 
 ## Structure
 
@@ -122,12 +135,18 @@ pytest tests/ -v
 miaou-mcp-servers/
 ├── mcp_proxy.py          # proxy (point d'entrée principal)
 ├── servers/
-│   ├── mcp_base.py       # classe de base partagée
-│   ├── mcp_bench.py      # implémentation bench
-│   └── mcp_weather.py    # implémentation weather
+│   ├── mcp_base.py       # classe de base + make_opener() proxy-aware
+│   ├── mcp_bench.py      # banc d'essai (port 8765)
+│   ├── mcp_weather.py    # météo wttr.in (port 8766)
+│   ├── mcp_web.py      # fetch URL (port 8768)
+│   ├── mcp_ddg.py        # recherche DDG (port 8769)
+│   └── mcp_brave.py      # recherche Brave (port 8770)
 ├── tests/
 │   ├── test_bench.py
 │   ├── test_weather.py
+│   ├── test_web.py
+│   ├── test_ddg.py
+│   ├── test_brave.py
 │   └── test_proxy.py
 ├── config.sample.json
 └── requirements.txt

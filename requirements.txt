@@ -6,6 +6,7 @@ mcp>=1.2
 uvicorn
 starlette
 anyio
+html2text
 
 # Dépendances de test
 pytest

@@ -193,6 +193,54 @@ async def test_proxy_call_tool_routes_correctly():
     mock_upstream.call_tool.assert_awaited_once_with("echo", {"text": "hello"})
 
 
+# ---------------------------------------------------------------------------
+# InProcessUpstream — support env
+# ---------------------------------------------------------------------------
+
+def test_build_upstreams_inprocess_env_stored():
+    """L'entrée env de config.json est transmise à InProcessUpstream."""
+    cfg = {
+        "port": 8767,
+        "mcpServers": {
+            "brave": {
+                "type": "inprocess",
+                "module": "mcp_bench",
+                "env": {"MY_SECRET": "value"},
+            }
+        },
+    }
+    upstreams = build_upstreams(cfg)
+    assert upstreams["brave"]._env == {"MY_SECRET": "value"}
+
+
+@pytest.mark.asyncio
+async def test_inprocess_upstream_env_applied_before_import():
+    """os.environ.setdefault est appelé avant importlib.import_module."""
+    sentinel_key = "MIAOU_TEST_SENTINEL_KEY_XYZ"
+    import os
+    os.environ.pop(sentinel_key, None)
+
+    upstream = InProcessUpstream("mcp_bench", env={sentinel_key: "sentinel-value"})
+    await upstream.start()
+
+    assert os.environ.get(sentinel_key) == "sentinel-value"
+    del os.environ[sentinel_key]
+
+
+@pytest.mark.asyncio
+async def test_inprocess_upstream_env_does_not_override_existing():
+    """setdefault ne doit pas écraser une variable déjà présente."""
+    import os
+    key = "MIAOU_TEST_EXISTING_KEY_XYZ"
+    os.environ[key] = "original"
+
+    upstream = InProcessUpstream("mcp_bench", env={key: "should-not-override"})
+    await upstream.start()
+
+    assert os.environ[key] == "original"
+    del os.environ[key]
+
+
 @pytest.mark.asyncio
 async def test_proxy_call_unknown_tool_returns_error():
     """Un outil inconnu doit lever McpError (propagé ou capturé par le SDK en isError)."""

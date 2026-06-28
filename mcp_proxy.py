@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2", "uvicorn", "starlette", "anyio"]
+# dependencies = ["mcp>=1.2", "uvicorn", "starlette", "anyio", "html2text"]
 # ///
 """
 Serveur MCP proxy pour MIAOU — agrège plusieurs serveurs MCP upstream.
@@ -74,11 +74,16 @@ class Upstream(ABC):
 class InProcessUpstream(Upstream):
     """Appelle un FastMCP dans le même processus Python, sans subprocess."""
 
-    def __init__(self, module_name: str) -> None:
+    def __init__(self, module_name: str, env: dict[str, str] | None = None) -> None:
         self._module_name = module_name
+        self._env = env
         self._tool_manager: Any = None
 
     async def start(self) -> None:
+        if self._env:
+            import os
+            for key, value in self._env.items():
+                os.environ.setdefault(key, value)
         module = importlib.import_module(self._module_name)
         fastmcp = getattr(module, "mcp", None)
         if fastmcp is None:
@@ -170,7 +175,7 @@ def build_upstreams(cfg: dict[str, Any]) -> dict[str, Upstream]:
             module = srv.get("module")
             if not module:
                 raise ValueError(f"Serveur '{name}' inprocess sans clé 'module'.")
-            upstreams[name] = InProcessUpstream(module)
+            upstreams[name] = InProcessUpstream(module, env=srv.get("env"))
         elif srv_type == "stdio":
             command = srv.get("command")
             if not command:
@@ -219,8 +224,8 @@ def build_proxy_server(
     ) -> list[Any]:
         if name not in tool_map:
             from mcp.shared.exceptions import McpError
-            from mcp.types import ErrorCode
-            raise McpError(ErrorCode.InvalidParams, f"Outil inconnu : '{name}'")
+            from mcp.types import ErrorCode # type: ignore
+            raise McpError(ErrorCode.InvalidParams, f"Outil inconnu : '{name}'") # type: ignore
         upstream_name, orig_name = tool_map[name]
         return await upstreams[upstream_name].call_tool(orig_name, arguments or {})
 

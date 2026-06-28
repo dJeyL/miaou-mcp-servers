@@ -6,11 +6,23 @@ whose own PEP 723 blocks declare the shared dependencies.
 """
 
 import argparse
+import os
 import sys
+import urllib.request
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.cors import CORSMiddleware
+
+
+def make_opener() -> urllib.request.OpenerDirector:
+    """Construit un opener urllib proxy-aware (lit http_proxy / HTTP_PROXY)."""
+    proxy_url = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+    if proxy_url:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+    return urllib.request.build_opener()
 
 
 class MiaouMCPBase:

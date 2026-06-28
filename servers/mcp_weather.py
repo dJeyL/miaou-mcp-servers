@@ -27,14 +27,12 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 """
 
 import json
-import os
 import urllib.parse
-import urllib.request
 from typing import Optional
 
 from mcp import types
 
-from mcp_base import MiaouMCPBase
+from mcp_base import MiaouMCPBase, make_opener
 
 
 class WeatherServer(MiaouMCPBase):
@@ -57,15 +55,7 @@ class WeatherServer(MiaouMCPBase):
 
             url = f"http://wttr.in/{urllib.parse.quote(location)}?format=j1"
 
-            proxy_url = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
-            if proxy_url:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-                )
-            else:
-                opener = urllib.request.build_opener()
-
-            with opener.open(url, timeout=10) as resp:
+            with make_opener().open(url, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
 
             for day in data.get("weather", []):
