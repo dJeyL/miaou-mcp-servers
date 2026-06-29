@@ -58,7 +58,7 @@ class WebServer(MiaouMCPBase):
             url: str,
             max_bytes: int = _DEFAULT_MAX_BYTES,
         ) -> str | types.EmbeddedResource:
-            """Télécharge une URL et renvoie son contenu : HTML converti en texte (html2text), text/* renvoyé tel quel, binaire encodé en base64. Taille limitée à max_bytes (défaut 5 Mo)."""
+            """Télécharge une URL et renvoie son contenu : HTML converti en texte (html2text), text/* renvoyé tel quel, binaire (image, etc.) encodé en base64. Taille limitée à max_bytes (défaut 5 Mo)."""
             opener = make_opener()
             req = urllib.request.Request(url, headers={"User-Agent": _UA})
             try:

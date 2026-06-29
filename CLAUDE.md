@@ -84,10 +84,16 @@ Un seul outil `ddg_search(query, max_results=5)`. POST sur l'endpoint HTML de DD
 
 ### `servers/mcp_brave.py` — recherche Brave Search (port 8770)
 
-Un seul outil `brave_search(query, count=5)`. Requiert `BRAVE_API_KEY` dans
-l'environnement (ou via `env` dans `config.json` pour le mode inprocess).
-Renvoie `TextResourceContents` `application/json` — tableau `[{title, url, description}]`.
-Clef absente ou invalide → message d'erreur clair sans stack trace.
+Deux outils. Requièrent `BRAVE_API_KEY` dans l'environnement (ou via `env` dans
+`config.json` pour le mode inprocess). Clef absente ou invalide → message d'erreur
+clair sans stack trace.
+
+- `brave_search(query, count=5)` : recherche web. Renvoie `TextResourceContents`
+  `application/json` — tableau `[{title, url, description}]`.
+- `brave_image_search(query, count=5)` : recherche d'images. `count` plafonné à 20.
+  Renvoie `TextResourceContents` `application/json` — tableau
+  `[{title, page_url, image_url, thumbnail_url, source}]`. Les entrées sans
+  `properties.url` sont écartées. URI : `miaou://brave-images/{query}`.
 
 ### `mcp_proxy.py` — proxy MCP (configurable via config.json)
 
