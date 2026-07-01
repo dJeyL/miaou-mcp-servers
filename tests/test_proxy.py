@@ -16,6 +16,7 @@ import mcp_proxy
 from mcp_proxy import (
     InProcessUpstream,
     StdioUpstream,
+    build_app,
     build_proxy_server,
     build_upstreams,
     load_config,
@@ -262,3 +263,55 @@ async def test_proxy_call_unknown_tool_returns_error():
         assert result.root.isError, "Attendu isError=True pour un outil inconnu"
     except McpError:
         pass  # comportement attendu si le SDK propage l'exception
+
+
+# ---------------------------------------------------------------------------
+# build_app — /mcp sans slash final ne doit pas rediriger (307)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_build_app_mcp_without_trailing_slash_no_redirect():
+    """POST /mcp doit être servi directement, sans 307 vers /mcp/.
+
+    Mount("/mcp", ...) redirige par défaut en 307 ; certains clients MCP ne
+    suivent pas les redirections sur POST/DELETE, d'où l'intérêt du test.
+    On appelle directement l'app ASGI (sans lifespan ni vrai handshake MCP,
+    déjà couverts par d'autres tests) et on inspecte le scope reçu en aval.
+    """
+    server = build_proxy_server({}, {})
+    app = build_app(server, {})
+
+    received_paths = []
+
+    async def fake_session_manager_handle_request(self, scope, receive, send):
+        received_paths.append(scope["path"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    with patch.object(
+        mcp_proxy.StreamableHTTPSessionManager,
+        "handle_request",
+        new=fake_session_manager_handle_request,
+    ):
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/mcp",
+            "raw_path": b"/mcp",
+            "headers": [],
+            "query_string": b"",
+        }
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        await app(scope, receive, send)
+
+    assert received_paths == ["/mcp/"]
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    assert status == 200

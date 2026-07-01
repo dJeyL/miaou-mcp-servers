@@ -239,7 +239,7 @@ def build_proxy_server(
 def build_app(
     mcp_server: Server,
     upstreams: dict[str, Upstream],
-) -> Starlette:
+) -> Any:
     from contextlib import asynccontextmanager
 
     session_manager = StreamableHTTPSessionManager(
@@ -273,7 +273,21 @@ def build_app(
         allow_headers=["*"],
         expose_headers=["Mcp-Session-Id"],
     )
-    return app
+
+    # Mount("/mcp", ...) traite /mcp comme un préfixe et redirige en 307 vers
+    # /mcp/ (strict-slash Starlette). Beaucoup de clients MCP tapent /mcp sans
+    # slash final et ne suivent pas la redirection sur les requêtes POST/DELETE.
+    # On réécrit le path en amont du routeur pour éviter la redirection.
+    inner_app = app
+
+    async def strip_trailing_slash_redirect(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope["path"] == "/mcp":
+            scope = dict(scope)
+            scope["path"] = "/mcp/"
+            scope["raw_path"] = b"/mcp/"
+        await inner_app(scope, receive, send)
+
+    return strip_trailing_slash_redirect
 
 
 # ---------------------------------------------------------------------------

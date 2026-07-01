@@ -178,6 +178,12 @@ mcp_proxy.py (racine)
     └── lifespan : start/stop de chaque upstream
 ```
 
+`build_app()` ne retourne pas directement le `Starlette` mais une fonction ASGI qui l'enveloppe :
+`Mount("/mcp", ...)` redirige `/mcp` → `/mcp/` en 307 par défaut (strict-slash Starlette), et
+certains clients MCP ne suivent pas les redirections sur POST/DELETE. Le wrapper réécrit
+`scope["path"]` de `/mcp` vers `/mcp/` avant le routeur pour servir la requête directement,
+sans redirection.
+
 ## Configuration du proxy (`config.json`)
 
 ```json
