@@ -9,3 +9,4 @@ untracked/
 .venv-*/
 *.egg-info/
 dist/
+/miaou-docs/

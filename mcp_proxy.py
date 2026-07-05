@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2", "uvicorn", "starlette", "anyio", "html2text"]
+# dependencies = ["mcp>=1.2", "uvicorn", "starlette", "anyio", "html2text", "pymupdf", "python-docx", "openpyxl", "python-pptx"]
 # ///
 """
 Serveur MCP proxy pour MIAOU — agrège plusieurs serveurs MCP upstream.
@@ -229,7 +229,51 @@ def build_proxy_server(
         upstream_name, orig_name = tool_map[name]
         return await upstreams[upstream_name].call_tool(orig_name, arguments or {})
 
+    _wrap_ref_unknown_sentinel(server)
     return server
+
+
+def _wrap_ref_unknown_sentinel(server: Server) -> None:
+    """Convertit le sentinel REF_UNKNOWN (texte isError) en erreur JSON-RPC.
+
+    Le SDK MCP (@server.call_tool(), voir mcp/server/lowlevel/server.py) avale
+    toute exception levée par l'outil appelé — y compris McpError — et la
+    transforme en CallToolResult(isError=True). C'est incompatible avec le
+    contrat client (brief A, D6) qui attend une vraie erreur JSON-RPC
+    data.code == 'REF_UNKNOWN' pour déclencher le rejeu avec contenu inliné.
+
+    Seule voie compatible SDK : remplacer le handler déjà enregistré sous
+    types.CallToolRequest (server.request_handlers), inspecter son résultat, et
+    lever McpError quand le sentinel est détecté — _handle_request (L777)
+    convertit alors l'exception en erreur JSON-RPC (`response = err.error`).
+    """
+    from mcp.shared.exceptions import McpError
+    from mcp.types import ErrorData
+
+    from mcp_docs import REF_UNKNOWN_ERROR_CODE, REF_UNKNOWN_SENTINEL
+
+    original_handler = server.request_handlers[types.CallToolRequest]
+
+    async def handler(req: types.CallToolRequest):
+        result = await original_handler(req)
+        call_result = result.root
+        if call_result.isError and call_result.content:
+            first = call_result.content[0]
+            text = getattr(first, "text", "")
+            # FastMCP préfixe le message d'exception ("Error executing tool
+            # <name>: ...") avant qu'il n'atteigne isError — le sentinel n'est
+            # donc pas forcément en tête du texte final, juste présent dedans.
+            if REF_UNKNOWN_SENTINEL in text:
+                raise McpError(
+                    ErrorData(
+                        code=REF_UNKNOWN_ERROR_CODE,
+                        message=text,
+                        data={"code": "REF_UNKNOWN"},
+                    )
+                )
+        return result
+
+    server.request_handlers[types.CallToolRequest] = handler
 
 
 # ---------------------------------------------------------------------------

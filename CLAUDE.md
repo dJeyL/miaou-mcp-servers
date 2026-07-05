@@ -4,8 +4,8 @@ Instructions pour travailler dans ce dépôt.
 
 ## Ce qu'est le projet
 
-Cinq serveurs MCP de développement (bench, weather, fetch, ddg, brave) et un serveur proxy
-qui les agrège, extraits du dépôt [MIAOU](https://github.com/dJeyL/miaou), un client de
+Six serveurs MCP de développement (bench, weather, fetch, ddg, brave, docs) et un serveur
+proxy qui les agrège, extraits du dépôt [MIAOU](https://github.com/dJeyL/miaou), un client de
 chat web pour API OpenAI-compatible (single-file HTML). Ils servent à tester l'agrégation
 MCP de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 
@@ -23,13 +23,15 @@ miaou-mcp-servers/
 │   ├── mcp_weather.py    # météo réelle via wttr.in (port 8766)
 │   ├── mcp_web.py      # téléchargement d'URL (port 8768)
 │   ├── mcp_ddg.py        # recherche DuckDuckGo HTML (port 8769)
-│   └── mcp_brave.py      # recherche Brave Search API (port 8770)
+│   ├── mcp_brave.py      # recherche Brave Search API (port 8770)
+│   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package (voir plus bas)
 ├── tests/
 │   ├── test_bench.py
 │   ├── test_weather.py
 │   ├── test_web.py
 │   ├── test_ddg.py
 │   ├── test_brave.py
+│   ├── test_docs.py
 │   └── test_proxy.py
 ├── config.sample.json    # template de config pour le proxy
 ├── config.json           # (gitignored) config active du proxy
@@ -95,6 +97,88 @@ clair sans stack trace.
   `[{title, page_url, image_url, thumbnail_url, source}]`. Les entrées sans
   `properties.url` sont écartées. URI : `miaou://brave-images/{query}`.
 
+### `servers/mcp_docs/` — extraction de documents (port 8771)
+
+Serveur d'extraction (lecture seule, pas de génération/modification) pour PDF, Office
+(docx/xlsx/pptx) et Zip. Conçu autour d'un cache de session côté serveur (répertoire
+`<workdir>/<session_id>/`, `session_id` = id de conversation MIAOU) et de lectures
+paginées : jamais le document entier en un seul appel.
+
+Seul serveur du dépôt organisé en package plutôt qu'en fichier plat (module trop
+volumineux sinon) :
+
+```
+servers/mcp_docs/
+├── __init__.py    # serveur FastMCP + définition des outils (docs__*)
+├── __main__.py     # point d'entrée `python -m mcp_docs` / `uv run servers/mcp_docs`
+├── session.py      # sessions, sanitization, matérialisation, contrat REF_UNKNOWN
+└── formats.py      # détection de type + parsers pdf/docx/xlsx/pptx/zip
+```
+
+Trois outils exposés (préfixés `docs__` par le proxy) :
+
+| Outil | Rôle |
+|---|---|
+| `drop_session(session_id)` | Supprime le cache d'une session (nettoyage sur suppression de conversation MIAOU) |
+| `list(ref, session_id?, content_b64?, filename?)` | Structure du document sans contenu (pages/feuilles/slides/entrées zip) |
+| `read(ref, path?, selector?, session_id?, content_b64?, filename?)` | Extrait borné (plage de pages/lignes/slides), plafonné par `MIAOU_DOCS_READ_CAP` |
+
+Signature commune inflatable : `ref: str, content_b64: str | None = None, session_id: str
+| None = None` sur `list`/`read` — obligatoire pour la détection de capability du
+dispatcher MIAOU (voir « Contrat docs » ci-dessous). `drop_session` n'a volontairement
+pas `ref` : le hook client reste inerte dessus.
+
+Détection de type : le contrat client ne transmet pas le nom de fichier d'origine à ce
+jour, donc `filename` (optionnel, pour extension) retombe sur les magic bytes en son
+absence (`%PDF`, `PK\x03\x04` puis sniff des dossiers internes `word/`/`xl/`/`ppt/` pour
+distinguer docx/xlsx/pptx d'un zip brut). `path` sur `read` adresse un membre de zip par
+chemin (texte brut uniquement en v1 — un membre lui-même document structuré, ex. un docx
+dans un zip, n'est pas encore extractible comme document imbriqué : reste à faire si le
+besoin se présente). Un PDF sans texte extractible (scan) renvoie une note explicite, pas
+d'OCR en v1.
+
+**Sécurité archives (zip)** — non négociable même en contexte mono-utilisateur (coût
+trivial, échec = dommage filesystem) :
+
+- Zip-slip : tout chemin de membre absolu ou contenant `..` est rejeté avant extraction
+  (`read`), mais reste visible dans `list` avec l'annotation « chemin suspect ».
+- Taille : garde sur `ZipInfo.file_size` (en-tête) puis contrôle réel en flux (les
+  en-têtes peuvent mentir) — `zipfile` lève aussi nativement `BadZipFile` sur incohérence
+  CRC, convertie en erreur claire plutôt que de fuiter l'exception stdlib. `list` signale
+  en plus si la taille décompressée totale déclarée dépasse `MIAOU_DOCS_MAX_UNZIP_MB`.
+- Chiffrement : détecté via `ZipInfo.flag_bits & 0x1`, rejeté avant toute tentative de
+  lecture (message clair, pas de `RuntimeError` stdlib brute).
+- Archives imbriquées : un membre dont le contenu commence par la signature zip
+  (`PK\x03\x04`) est signalé mais jamais extrait ; `list` pré-signale aussi les entrées
+  dont l'extension suggère une archive (`.zip`/`.docx`/`.xlsx`/`.pptx`) avant même lecture.
+
+Variables d'environnement (toutes optionnelles, défauts constants) :
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `MIAOU_DOCS_WORKDIR` | `./miaou-docs` (relatif au répertoire de travail) | Racine du cache de sessions |
+| `MIAOU_DOCS_TTL_H` | `24` | TTL avant sweep d'une session inactive |
+| `MIAOU_DOCS_MAX_FILE_MB` | `20` | Taille max d'un fichier matérialisé (avant décodage b64) |
+| `MIAOU_DOCS_MAX_SESSION_MB` | `200` | Quota disque total par session |
+| `MIAOU_DOCS_MAX_UNZIP_MB` | `100` | Taille décompressée max d'une archive (garde header + flux) |
+| `MIAOU_DOCS_READ_CAP` | `20000` | Cap de caractères par réponse `read` |
+
+**Procédure manuelle (banc d'essai MIAOU, brief A)** — vérification réelle via l'UI MIAOU,
+à exécuter uniquement sur demande explicite, pas automatisée ici :
+
+1. Lancer le proxy (`uv run mcp_proxy.py`) avec `docs` activé dans `config.json`.
+2. Dans MIAOU, joindre un PDF/docx/xlsx/pptx/zip à un message, demander au modèle de lister
+   sa structure (`docs__list`) puis de lire un extrait (`docs__read`).
+3. Vérifier le rejeu REF_UNKNOWN : recharger la page MIAOU en cours de conversation, puis
+   redemander une lecture du même attachement — le contenu doit être ré-injecté sans erreur
+   visible côté utilisateur (le rejeu est interne au dispatcher).
+4. Joindre un zip contenant une entrée `../evil.txt` ou un membre chiffré (fixture de test
+   possible : réutiliser les archives forgées de `tests/test_docs.py`) et vérifier que
+   `list` les signale sans planter, et que `read` dessus renvoie une erreur claire.
+
+Le sweep TTL est **opportuniste** (en tête de chaque appel d'outil, pas de tâche
+périodique) — ni le proxy ni le mode standalone n'ont de machinerie de fond existante.
+
 ### `mcp_proxy.py` — proxy MCP (configurable via config.json)
 
 Agrège plusieurs serveurs MCP upstream et expose leurs outils préfixés :
@@ -115,11 +199,11 @@ réponses JSON ou SSE `event:message`/`data:`). C'est le transport implémenté 
 
 Pour connecter les serveurs depuis MIAOU → Paramètres → Serveurs MCP :
 
-| Champ | bench | weather | fetch | ddg | brave | proxy |
-|---|---|---|---|---|---|---|
-| Nom | `bench` | `weather` | `web` | `duckduckgo` | `brave` | `proxy` |
-| URL | `:8765/mcp` | `:8766/mcp` | `:8768/mcp` | `:8769/mcp` | `:8770/mcp` | `:8767/mcp` |
-| Transport | `streamable-http` | idem | idem | idem | idem | idem |
+| Champ | bench | weather | fetch | ddg | brave | docs | proxy |
+|---|---|---|---|---|---|---|---|
+| Nom | `bench` | `weather` | `web` | `duckduckgo` | `brave` | `docs` | `proxy` |
+| URL | `:8765/mcp` | `:8766/mcp` | `:8768/mcp` | `:8769/mcp` | `:8770/mcp` | `:8771/mcp` | `:8767/mcp` |
+| Transport | `streamable-http` | idem | idem | idem | idem | idem | idem |
 
 (préfixe `http://127.0.0.1` pour toutes les URLs)
 
@@ -144,6 +228,9 @@ uv run servers/mcp_web.py                          # HTTP 127.0.0.1:8768
 uv run servers/mcp_ddg.py                            # HTTP 127.0.0.1:8769
 BRAVE_API_KEY=<key> uv run servers/mcp_brave.py      # HTTP 127.0.0.1:8770
 
+# mcp_docs est un package (pas un script plat) — lancement différent :
+uv run --directory servers python -m mcp_docs        # HTTP 127.0.0.1:8771
+
 # Proxy (agrège tout sur un seul port)
 cp config.sample.json config.json     # puis éditer config.json (BRAVE_API_KEY, etc.)
 uv run mcp_proxy.py                   # port défini dans config.json
@@ -160,6 +247,7 @@ python servers/mcp_weather.py [options]
 python servers/mcp_web.py [options]
 python servers/mcp_ddg.py [options]
 BRAVE_API_KEY=<key> python servers/mcp_brave.py [options]
+python -m mcp_docs [options]    # depuis servers/ (package, pas un script plat)
 python mcp_proxy.py [options]
 ```
 
@@ -199,6 +287,7 @@ sans redirection.
       "module": "mcp_brave",
       "env": { "BRAVE_API_KEY": "your-key-here" }
     },
+    "docs": { "type": "inprocess", "module": "mcp_docs" },
     "_example_stdio": {
       "_disabled": true,
       "command": "uv",
@@ -243,7 +332,8 @@ Deux points à ne pas toucher sans bonne raison :
 
 ```bash
 # Avec uv
-uv run --with pytest --with pytest-asyncio pytest tests/
+uv run --with pytest --with pytest-asyncio --with html2text --with pymupdf \
+  --with python-docx --with openpyxl --with python-pptx pytest tests/
 
 # Avec pip (après pip install -r requirements.txt)
 pytest tests/
@@ -253,6 +343,41 @@ Les tests de bench mockent `asyncio.sleep` pour éviter les délais de 2 s.
 Les tests de weather, fetch, ddg et brave mockent `urllib.request.OpenerDirector.open`.
 Les tests de brave mockent aussi `os.environ` — aucun appel réseau réel, aucune clef requise.
 Les tests du proxy mockent les upstreams ou utilisent InProcessUpstream sur mcp_bench réel.
+Les tests de docs monkeypatchent `mcp_docs.session.WORKDIR` (fixture `tmp_path`) pour
+isoler le filesystem par test, exercent chaque format (fixtures PDF/xlsx/docx/pptx/zip
+générées à la volée par les libs elles-mêmes) via `formats.py` directement, et vérifient
+REF_UNKNOWN à travers le stack proxy réel (InProcessUpstream sur mcp_docs + build_proxy_server),
+pas seulement l'appel direct à l'outil.
+
+## Contrat partagé `mcp_docs` ↔ MIAOU (dispatcher, lot A/D6)
+
+Contrat entre le dispatcher client MIAOU et `mcp_docs` (et tout futur outil inflatable) —
+mirror de `docs/mcp.md` §12 côté MIAOU, à tenir synchronisé si l'un des deux évolue.
+
+- **Détection de capability** : le dispatcher n'active son hook que si l'outil déclare
+  `ref` ET `content_b64` dans `inputSchema.properties` (cache `tools/list`). Tout outil
+  inflatable doit donc avoir exactement les paramètres `ref: str, content_b64: str | None
+  = None, session_id: str | None = None` (+ paramètres propres à l'outil).
+- **`session_id`** : injecté par MIAOU sur chaque appel capable (id de conversation).
+  Absent → erreur claire (appel hors MIAOU), jamais silencieusement ignoré.
+- **`content_b64`** : injecté seulement au premier appel par (conversation, ref) ; un
+  rechargement de page re-pousse le même contenu → la matérialisation doit être
+  **idempotente** (réécriture silencieuse d'un ref déjà connu, jamais une erreur).
+- **REF_UNKNOWN** : un `ref` inconnu sans `content_b64` doit produire une vraie **erreur
+  JSON-RPC** avec `err.data.code === 'REF_UNKNOWN'` — le dispatcher la détecte et rejoue
+  l'appel une fois avec le contenu inliné. Un `isError` textuel ne déclenche PAS le rejeu.
+  Mécanisme : l'outil lève `ToolError(f"{REF_UNKNOWN_SENTINEL}: ...")` (constante
+  `mcp_docs.REF_UNKNOWN_SENTINEL`) ; le proxy (`mcp_proxy._wrap_ref_unknown_sentinel`)
+  détecte ce sentinel dans le résultat `isError` (le SDK MCP avale toute exception de
+  l'outil en `CallToolResult(isError=True)`, y compris `McpError` — voir le commentaire
+  du post-wrapper dans `mcp_proxy.py`) et lève `McpError(data={'code': 'REF_UNKNOWN'})`,
+  que `_handle_request` du SDK convertit en erreur JSON-RPC. **Ce rejeu ne fonctionne que
+  derrière le proxy** : en standalone (FastMCP pur, port 8771 direct), l'appel échoue en
+  isError textuel sans déclencher le rejeu — documenté ici, pas une régression à corriger.
+- **Adressage de membres d'archive** : paramètre `path` séparé (pas de suffixe `ref#path`)
+  — `ref` reste `att-N`, `path` adresse un membre déjà listé par `list`. Écart assumé par
+  rapport au brief original : la syntaxe `ref#path` ne matche pas la regex ancrée
+  `^att-\d+$` du dispatcher déjà livré.
 
 ## Posture sécurité
 

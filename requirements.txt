@@ -7,6 +7,10 @@ uvicorn
 starlette
 anyio
 html2text
+pymupdf
+python-docx
+openpyxl
+python-pptx
 
 # Dépendances de test
 pytest

@@ -33,6 +33,12 @@
       },
       "_comment": "Recherche Brave Search. Remplacer BRAVE_API_KEY puis retirer _disabled."
     },
+    "docs": {
+      "_disabled": false,
+      "type": "inprocess",
+      "module": "mcp_docs",
+      "_comment": "Extraction PDF/Office/Zip. Cache sur disque dans ./miaou-docs (sous-dossier du répertoire de travail)."
+    },
     "_example_stdio": {
       "_disabled": true,
       "_comment": "Exemple de serveur externe lancé en subprocess via stdio.",

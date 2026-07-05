@@ -13,6 +13,7 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 | `servers/mcp_web.py` | 8768 | Téléchargement d'URL (HTML→texte, text/*, binaire base64) |
 | `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API |
 | `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) |
+| `servers/mcp_docs/` | 8771 | Extraction PDF/Office/Zip, paginée, sessions par conversation |
 | `mcp_proxy.py` | configurable | Proxy qui agrège les serveurs ci-dessus |
 
 ## Prérequis
@@ -38,6 +39,9 @@ uv run servers/mcp_web.py                   # HTTP 127.0.0.1:8768
 uv run servers/mcp_ddg.py                     # HTTP 127.0.0.1:8769
 BRAVE_API_KEY=<key> uv run servers/mcp_brave.py  # HTTP 127.0.0.1:8770
 
+# mcp_docs est un package (pas un script plat) — lancement différent :
+uv run --directory servers python -m mcp_docs # HTTP 127.0.0.1:8771
+
 uv run servers/mcp_bench.py --transport stdio # mode stdio
 ```
 
@@ -49,8 +53,8 @@ cp config.sample.json config.json
 uv run mcp_proxy.py
 ```
 
-`config.sample.json` active bench, weather, fetch et duckduckgo par défaut en inprocess.
-brave est désactivé jusqu'à ce que `BRAVE_API_KEY` soit renseigné.
+`config.sample.json` active bench, weather, fetch, duckduckgo et docs par défaut en
+inprocess. brave est désactivé jusqu'à ce que `BRAVE_API_KEY` soit renseigné.
 
 ## Configuration MIAOU
 
@@ -62,11 +66,12 @@ weather     → http://127.0.0.1:8766/mcp   (streamable-http)
 fetch       → http://127.0.0.1:8768/mcp   (streamable-http)
 duckduckgo  → http://127.0.0.1:8769/mcp   (streamable-http)
 brave       → http://127.0.0.1:8770/mcp   (streamable-http)
+docs        → http://127.0.0.1:8771/mcp   (streamable-http)
 proxy       → http://127.0.0.1:8767/mcp   (streamable-http)
 ```
 
 Via le proxy, les outils apparaissent préfixés : `bench__echo`, `web__fetch_url`,
-`duckduckgo__ddg_search`, `brave__brave_search`, etc.
+`duckduckgo__ddg_search`, `brave__brave_search`, `docs__list`, `docs__read`, etc.
 
 ## Options CLI
 
@@ -98,7 +103,8 @@ Le proxy accepte en plus :
       "type": "inprocess",
       "module": "mcp_brave",
       "env": { "BRAVE_API_KEY": "your-key-here" }
-    }
+    },
+    "docs": { "type": "inprocess", "module": "mcp_docs" }
   }
 }
 ```
@@ -121,7 +127,8 @@ Pour un serveur externe (subprocess stdio) :
 
 ```bash
 # Avec uv
-uv run --with pytest --with pytest-asyncio --with html2text pytest tests/ -v
+uv run --with pytest --with pytest-asyncio --with html2text --with pymupdf \
+  --with python-docx --with openpyxl --with python-pptx pytest tests/ -v
 
 # Avec pip (après pip install -r requirements.txt)
 pytest tests/ -v
@@ -140,13 +147,15 @@ miaou-mcp-servers/
 │   ├── mcp_weather.py    # météo wttr.in (port 8766)
 │   ├── mcp_web.py      # fetch URL (port 8768)
 │   ├── mcp_ddg.py        # recherche DDG (port 8769)
-│   └── mcp_brave.py      # recherche Brave (port 8770)
+│   ├── mcp_brave.py      # recherche Brave (port 8770)
+│   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package
 ├── tests/
 │   ├── test_bench.py
 │   ├── test_weather.py
 │   ├── test_web.py
 │   ├── test_ddg.py
 │   ├── test_brave.py
+│   ├── test_docs.py
 │   └── test_proxy.py
 ├── config.sample.json
 └── requirements.txt
@@ -156,3 +165,7 @@ miaou-mcp-servers/
 
 CORS ouvert, pas d'authentification — usage local uniquement. En production, placer
 derrière un reverse proxy (Caddy, nginx) avec authentification côté serveur.
+
+`mcp_docs` applique en plus des gardes propres à l'extraction d'archives (zip-slip,
+tailles, chiffrement, imbrication) et un contrat d'erreur `REF_UNKNOWN` partagé avec le
+dispatcher MIAOU — détails dans `CLAUDE.md`.
