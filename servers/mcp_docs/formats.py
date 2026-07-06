@@ -233,7 +233,7 @@ def docx_list(path: Path) -> str:
     lines = ["DOCX — sections :"]
     found = False
     for para in d.paragraphs:
-        m = _HEADING_RE.match(para.style.name or "")
+        m = _HEADING_RE.match(para.style.name or "" if para.style else "")
         if m and para.text.strip():
             level = int(m.group(1))
             lines.append(f"{'  ' * (level - 1)}- {para.text.strip()}")
@@ -263,7 +263,7 @@ def docx_read(path: Path, selector: str | None) -> str:
         start_idx = None
         start_level = None
         for i, para in enumerate(paragraphs):
-            m = _HEADING_RE.match(para.style.name or "")
+            m = _HEADING_RE.match(para.style.name or "" if para.style else "")
             if m and para.text.strip() == selector:
                 start_idx = i
                 start_level = int(m.group(1))
@@ -273,7 +273,8 @@ def docx_read(path: Path, selector: str | None) -> str:
 
         end_idx = len(paragraphs)
         for i in range(start_idx + 1, len(paragraphs)):
-            m = _HEADING_RE.match(paragraphs[i].style.name or "")
+            style = paragraphs[i].style
+            m = _HEADING_RE.match(style.name or "" if style else "")
             if m and int(m.group(1)) <= start_level:
                 end_idx = i
                 break
