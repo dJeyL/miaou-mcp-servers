@@ -79,6 +79,20 @@ def test_validate_ref_accepts_att_n():
     assert validate_ref("att-42") == "att-42"
 
 
+def test_validate_ref_accepts_file_id():
+    """file-<id> : fichier de bibliothèque d'espace (MIAOU lot Cbis,
+    libraryRefFromId) — même statut que att-N, pas une forme dégradée."""
+    assert validate_ref("file-2rhku6t4") == "file-2rhku6t4"
+    assert validate_ref("file-a1b2c3") == "file-a1b2c3"
+
+
+def test_validate_ref_rejects_file_id_uppercase_or_empty_suffix():
+    with pytest.raises(ToolError):
+        validate_ref("file-ABC123")
+    with pytest.raises(ToolError):
+        validate_ref("file-")
+
+
 def test_validate_ref_rejects_nested_path():
     """La syntaxe ref#path du brief est explicitement écartée (audit §2) —
     l'adressage de membre d'archive passe par le paramètre `path` séparé."""
@@ -139,6 +153,27 @@ def test_materialize_rejects_bad_session_id(workdir):
     content = base64.b64encode(b"data").decode()
     with pytest.raises(ToolError):
         materialize("../escape", "att-1", content)
+
+
+def test_materialize_writes_file_for_library_ref(workdir):
+    """file-<id> (fichier de bibliothèque d'espace, MIAOU lot Cbis) suit
+    exactement le même chemin que att-N — pas un cas particulier."""
+    content = base64.b64encode(b"library content").decode()
+    path = materialize("conv-1", "file-2rhku6t4", content)
+    assert path.exists()
+    assert path.read_bytes() == b"library content"
+
+
+def test_materialize_att_and_file_refs_do_not_collide(workdir):
+    """Un att-N et un file-<id> dans la même session matérialisent des fichiers
+    distincts (préfixes différents dans ref_path) — jamais un écrasement croisé."""
+    att_content = base64.b64encode(b"attachment bytes").decode()
+    file_content = base64.b64encode(b"library bytes").decode()
+    att_path = materialize("conv-1", "att-1", att_content)
+    file_path = materialize("conv-1", "file-1", file_content)
+    assert att_path != file_path
+    assert att_path.read_bytes() == b"attachment bytes"
+    assert file_path.read_bytes() == b"library bytes"
 
 
 # ---------------------------------------------------------------------------

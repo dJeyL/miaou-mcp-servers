@@ -2,9 +2,12 @@
 
 Session (docs server) : répertoire de travail côté serveur, keyé par
 `session_id` = id de conversation MIAOU. C'est un **cache** — la source de
-vérité reste toujours le navigateur (IndexedDB). Un `ref` (`att-N`) est
-matérialisé au premier appel portant `content_b64`, puis réutilisable par
-`ref` seul tant que la session n'a pas expiré (TTL, sweep opportuniste).
+vérité reste toujours le navigateur (IndexedDB). Un `ref` (`att-N`, pièce
+jointe de message ; ou `file-<id>`, fichier de bibliothèque d'espace, cf.
+MIAOU lot Cbis) est matérialisé au premier appel portant `content_b64`, puis
+réutilisable par `ref` seul tant que la session n'a pas expiré (TTL, sweep
+opportuniste). Les deux familles de ref ne collisionnent jamais sur le disque
+(préfixes distincts dans le nom de fichier matérialisé, cf. `ref_path`).
 """
 
 from __future__ import annotations
@@ -28,7 +31,10 @@ REF_UNKNOWN_SENTINEL = "REF_UNKNOWN"
 # ne dépend que de err.data.code == "REF_UNKNOWN" (string), pas de cet entier.
 REF_UNKNOWN_ERROR_CODE = -31999
 
-_REF_RE = re.compile(r"^att-\d+$")
+# att-N : pièce jointe de message (conversation-scopée, cf. MIAOU allocateAttId).
+# file-<id> : fichier de bibliothèque d'espace (Space-scopé, cf. MIAOU lot Cbis,
+# libraryRefFromId — id en base36 minuscules/chiffres).
+_REF_RE = re.compile(r"^(att-\d+|file-[a-z0-9]+)$")
 _SESSION_ID_FORBIDDEN = re.compile(r"[\\/]|\.\.")
 
 
@@ -61,7 +67,7 @@ def validate_session_id(session_id: str) -> str:
 
 def validate_ref(ref: str) -> str:
     if not _REF_RE.match(ref):
-        raise ToolError(f"ref invalide : {ref!r} (attendu att-<N>)")
+        raise ToolError(f"ref invalide : {ref!r} (attendu att-<N> ou file-<id>)")
     return ref
 
 
