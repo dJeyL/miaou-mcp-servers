@@ -11,8 +11,17 @@ import sys
 import urllib.request
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.cors import CORSMiddleware
+
+# Par défaut, ArgModelBase (mcp>=1.28.1) laisse Pydantic ignorer silencieusement
+# tout argument d'outil non déclaré dans la signature de la fonction (extra="ignore"
+# implicite) : un appelant qui hallucine un nom de paramètre (ex. `page` au lieu de
+# `selector`) voit son argument avalé sans erreur, et l'outil retombe sur son défaut
+# sans jamais signaler l'anomalie. Passage en extra="forbid" pour transformer ça en
+# erreur de validation explicite, avant même l'exécution de l'outil.
+ArgModelBase.model_config["extra"] = "forbid"
 
 
 def make_opener() -> urllib.request.OpenerDirector:

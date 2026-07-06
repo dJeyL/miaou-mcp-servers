@@ -148,16 +148,23 @@ MAX_XLSX_ROWS_DEFAULT = 200
 def xlsx_list(path: Path) -> str:
     import openpyxl
 
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    try:
-        lines = ["XLSX — feuilles :"]
-        for name in wb.sheetnames:
-            ws = wb[name]
-            dim = ws.calculate_dimension()
-            lines.append(f"- {name} ({dim}, {ws.max_row} ligne(s) x {ws.max_column} colonne(s))")
-        return "\n".join(lines)
-    finally:
-        wb.close()
+    # Fichier ouvert et passé en objet binaire, pas en chemin : openpyxl valide
+    # l'extension du *chemin* (rejette tout sauf .xlsx/.xlsm/...), alors que le
+    # fichier matérialisé par mcp_docs garde un nom stable `att-N.bin` (type
+    # réel détecté par magic bytes, cf. session.ref_path). En mode read_only,
+    # les feuilles restent en lecture différée : tout accès doit rester dans
+    # le bloc `with`, sinon le fichier sous-jacent est déjà refermé.
+    with open(path, "rb") as f:
+        wb = openpyxl.load_workbook(f, read_only=True, data_only=True)
+        try:
+            lines = ["XLSX — feuilles :"]
+            for name in wb.sheetnames:
+                ws = wb[name]
+                dim = ws.calculate_dimension()
+                lines.append(f"- {name} ({dim}, {ws.max_row} ligne(s) x {ws.max_column} colonne(s))")
+            return "\n".join(lines)
+        finally:
+            wb.close()
 
 
 def xlsx_read(path: Path, selector: str | None) -> str:
@@ -165,49 +172,50 @@ def xlsx_read(path: Path, selector: str | None) -> str:
     MAX_XLSX_ROWS_DEFAULT lignes depuis le début de la feuille."""
     import openpyxl
 
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    try:
-        if not selector:
-            sheet_name = wb.sheetnames[0]
-            cell_range = None
-        elif "!" in selector:
-            sheet_name, cell_range = selector.split("!", 1)
-        else:
-            sheet_name, cell_range = selector, None
+    with open(path, "rb") as f:
+        wb = openpyxl.load_workbook(f, read_only=True, data_only=True)
+        try:
+            if not selector:
+                sheet_name = wb.sheetnames[0]
+                cell_range = None
+            elif "!" in selector:
+                sheet_name, cell_range = selector.split("!", 1)
+            else:
+                sheet_name, cell_range = selector, None
 
-        if sheet_name not in wb.sheetnames:
-            raise ToolError(f"Feuille inconnue : '{sheet_name}' (disponibles : {wb.sheetnames})")
-        ws = wb[sheet_name]
+            if sheet_name not in wb.sheetnames:
+                raise ToolError(f"Feuille inconnue : '{sheet_name}' (disponibles : {wb.sheetnames})")
+            ws = wb[sheet_name]
 
-        truncated_rows = False
-        if cell_range:
-            rows = list(ws[cell_range])
-        else:
-            rows = []
-            for i, row in enumerate(ws.iter_rows(), start=1):
-                if i > MAX_XLSX_ROWS_DEFAULT:
-                    truncated_rows = True
-                    break
-                rows.append(row)
+            truncated_rows = False
+            if cell_range:
+                rows = list(ws[cell_range])
+            else:
+                rows = []
+                for i, row in enumerate(ws.iter_rows(), start=1):
+                    if i > MAX_XLSX_ROWS_DEFAULT:
+                        truncated_rows = True
+                        break
+                    rows.append(row)
 
-        lines = [f"Feuille '{sheet_name}' :"]
-        for row in rows:
-            values = [str(c.value) if c.value is not None else "" for c in row]
-            lines.append(" | ".join(values))
-        body = "\n".join(lines)
+            lines = [f"Feuille '{sheet_name}' :"]
+            for row in rows:
+                values = [str(c.value) if c.value is not None else "" for c in row]
+                lines.append(" | ".join(values))
+            body = "\n".join(lines)
 
-        notice = ""
-        if truncated_rows:
-            notice = (
-                f"\n\n[Tronqué à {MAX_XLSX_ROWS_DEFAULT} lignes — préciser un "
-                f"selector '{sheet_name}!A1:...' pour la suite]"
-            )
-        capped, capped_flag = _cap_text(body, READ_CAP)
-        if capped_flag and not notice:
-            notice = _truncation_notice("relire avec un selector plus étroit")
-        return capped + notice
-    finally:
-        wb.close()
+            notice = ""
+            if truncated_rows:
+                notice = (
+                    f"\n\n[Tronqué à {MAX_XLSX_ROWS_DEFAULT} lignes — préciser un "
+                    f"selector '{sheet_name}!A1:...' pour la suite]"
+                )
+            capped, capped_flag = _cap_text(body, READ_CAP)
+            if capped_flag and not notice:
+                notice = _truncation_notice("relire avec un selector plus étroit")
+            return capped + notice
+        finally:
+            wb.close()
 
 
 # ---------------------------------------------------------------------------
