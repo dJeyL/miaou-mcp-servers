@@ -112,30 +112,53 @@ servers/mcp_docs/
 ├── __init__.py    # serveur FastMCP + définition des outils (docs__*)
 ├── __main__.py     # point d'entrée `python -m mcp_docs` / `uv run servers/mcp_docs`
 ├── session.py      # sessions, sanitization, matérialisation, contrat REF_UNKNOWN
-└── formats.py      # détection de type + parsers pdf/docx/xlsx/pptx/zip
+├── formats.py      # détection de type + parsers pdf/docx/xlsx/pptx/zip
+└── search.py       # logique pure de recherche (fold, parse_query, match_unit, make_snippet,
+                     # render_results) — aucune dépendance à une lib de parsing de document,
+                     # testable en isolation sans fixture binaire
 ```
 
-Trois outils exposés (préfixés `docs__` par le proxy) :
+Quatre outils exposés (préfixés `docs__` par le proxy) :
 
 | Outil | Rôle |
 |---|---|
 | `drop_session(session_id)` | Supprime le cache d'une session (nettoyage sur suppression de conversation MIAOU) |
-| `list(ref, session_id?, content_b64?, filename?)` | Structure du document sans contenu (pages/feuilles/slides/entrées zip) |
+| `list(ref, path?, session_id?, content_b64?, filename?)` | Structure du document sans contenu (pages/feuilles/slides/entrées zip) |
 | `read(ref, path?, selector?, session_id?, content_b64?, filename?)` | Extrait borné (plage de pages/lignes/slides), plafonné par `MIAOU_DOCS_READ_CAP` |
+| `search(ref, query, path?, session_id?, content_b64?, filename?)` | Recherche de texte groupée par unité (page/feuille/slide/membre zip), plafonnée par `MIAOU_DOCS_SEARCH_CAP` |
 
 Signature commune inflatable : `ref: str, content_b64: str | None = None, session_id: str
-| None = None` sur `list`/`read` — obligatoire pour la détection de capability du
+| None = None` sur `list`/`read`/`search` — obligatoire pour la détection de capability du
 dispatcher MIAOU (voir « Contrat docs » ci-dessous). `drop_session` n'a volontairement
 pas `ref` : le hook client reste inerte dessus.
+
+`search` : requête en ET implicite (termes espacés) + `"phrase exacte"` entre guillemets,
+insensible casse/accents (fold Unicode NFKD + mapping manuel des ligatures œ/æ, non
+décomposées par NFKD seul). Pas d'opérateurs OU/NON/parenthèses (YAGNI, le modèle compose
+plusieurs appels). Un guillemet non fermé n'est pas une erreur : le reste de la requête
+retombe en termes normaux. Une phrase exacte ne matche pas à cheval sur deux unités.
+Granularité par format : page (pdf), slide (pptx), cellule `Feuille!Coord` (xlsx — balaie
+toutes les lignes, n'hérite pas du cap de lignes de `read`), section heading (docx — texte
+hors-section et docs sans heading utilisent les labels spéciaux `(préambule)`/`(corps)`,
+tables sous `(tableaux)`, round-trip partiel assumé), membre de zip (texte brut
+uniquement — un membre reconnu comme document structuré, chiffré ou binaire est ignoré et
+listé en note finale des zones aveugles, pas de dispatch récursif contrairement à `read`).
+Chaque label de résultat est réutilisable tel quel comme selector `read` (ou `path` pour
+un membre de zip). Sans `path` sur une archive, `search` balaie tous ses membres texte ;
+avec `path`, restreint à ce seul membre.
 
 Détection de type : le contrat client ne transmet pas le nom de fichier d'origine à ce
 jour, donc `filename` (optionnel, pour extension) retombe sur les magic bytes en son
 absence (`%PDF`, `PK\x03\x04` puis sniff des dossiers internes `word/`/`xl/`/`ppt/` pour
-distinguer docx/xlsx/pptx d'un zip brut). `path` sur `read` adresse un membre de zip par
-chemin (texte brut uniquement en v1 — un membre lui-même document structuré, ex. un docx
-dans un zip, n'est pas encore extractible comme document imbriqué : reste à faire si le
-besoin se présente). Un PDF sans texte extractible (scan) renvoie une note explicite, pas
-d'OCR en v1.
+distinguer docx/xlsx/pptx d'un zip brut). `path` (sur `read` et `list`) adresse un membre
+de zip par chemin : texte brut si le membre n'est pas reconnu comme document structuré,
+sinon dispatch récursif (`read`/`list` du format détecté sur les octets extraits en
+mémoire, sans matérialisation disque) — un membre docx/xlsx/pptx/pdf dans un zip est donc
+lisible/listable comme un document imbriqué, borné à **un seul niveau** d'imbrication
+(un zip contenant un zip contenant un docx reste signalé, non extrait, pour borner la
+récursion et le coût de parsing cumulé). Un membre imbriqué reconnu est en plus soumis à
+`MIAOU_DOCS_MAX_FILE_MB` (pas seulement `MAX_UNZIP_MB`) avant parsing par une lib lourde.
+Un PDF sans texte extractible (scan) renvoie une note explicite, pas d'OCR en v1.
 
 **Sécurité archives (zip)** — non négociable même en contexte mono-utilisateur (coût
 trivial, échec = dommage filesystem) :
@@ -148,9 +171,11 @@ trivial, échec = dommage filesystem) :
   en plus si la taille décompressée totale déclarée dépasse `MIAOU_DOCS_MAX_UNZIP_MB`.
 - Chiffrement : détecté via `ZipInfo.flag_bits & 0x1`, rejeté avant toute tentative de
   lecture (message clair, pas de `RuntimeError` stdlib brute).
-- Archives imbriquées : un membre dont le contenu commence par la signature zip
-  (`PK\x03\x04`) est signalé mais jamais extrait ; `list` pré-signale aussi les entrées
-  dont l'extension suggère une archive (`.zip`/`.docx`/`.xlsx`/`.pptx`) avant même lecture.
+- Archives imbriquées : un membre reconnu comme document structuré (pdf/docx/xlsx/pptx/zip)
+  est extractible/listable via `path`, mais borné à **un seul niveau** — un membre zip qui
+  contiendrait lui-même un zip reste signalé, jamais extrait au-delà (D-bis). `list`
+  pré-signale aussi les entrées dont l'extension suggère une archive (`.zip`/`.docx`/
+  `.xlsx`/`.pptx`) avant même lecture.
 
 Variables d'environnement (toutes optionnelles, défauts constants) :
 
@@ -162,6 +187,7 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
 | `MIAOU_DOCS_MAX_SESSION_MB` | `200` | Quota disque total par session |
 | `MIAOU_DOCS_MAX_UNZIP_MB` | `100` | Taille décompressée max d'une archive (garde header + flux) |
 | `MIAOU_DOCS_READ_CAP` | `20000` | Cap de caractères par réponse `read` |
+| `MIAOU_DOCS_SEARCH_CAP` | `50` | Cap du nombre de snippets par réponse `search` |
 
 **Procédure manuelle (banc d'essai MIAOU, brief A)** — vérification réelle via l'UI MIAOU,
 à exécuter uniquement sur demande explicite, pas automatisée ici :

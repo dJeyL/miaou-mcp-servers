@@ -23,7 +23,14 @@ for p in (_ROOT, _SERVERS):
 import mcp_docs
 from mcp_docs import REF_UNKNOWN_ERROR_CODE, REF_UNKNOWN_SENTINEL, ToolError
 from mcp_docs import session as docs_session
-from mcp_docs.formats import detect_kind, list_document, read_document, zip_read_member
+from mcp_docs.formats import (
+    detect_kind,
+    list_document,
+    read_document,
+    zip_list_member,
+    zip_read_member,
+)
+from mcp_docs.search import Query, fold, make_snippet, match_unit, parse_query
 from mcp_docs.session import (
     materialize,
     resolve_ref,
@@ -383,6 +390,35 @@ def test_pdf_read_scanned_page_reports_no_ocr_note(tmp_path):
     assert "OCR" in result
 
 
+def test_pdf_search_finds_match_and_labels_by_page(tmp_path):
+    from mcp_docs.formats import pdf_search
+    from mcp_docs.search import parse_query
+
+    path = _make_pdf(tmp_path, ["Le chat noir dort", "Rien ici"])
+    results = pdf_search(path, parse_query("chat noir"))
+    assert len(results) == 1
+    assert results[0].label == "1"
+    assert results[0].hit_count == 2
+
+
+def test_pdf_search_multi_page_hits(tmp_path):
+    from mcp_docs.formats import pdf_search
+    from mcp_docs.search import parse_query
+
+    path = _make_pdf(tmp_path, ["chat noir", "chat blanc", "chien"])
+    results = pdf_search(path, parse_query("chat"))
+    assert [r.label for r in results] == ["1", "2"]
+
+
+def test_pdf_search_no_match_returns_empty(tmp_path):
+    from mcp_docs.formats import pdf_search
+    from mcp_docs.search import parse_query
+
+    path = _make_pdf(tmp_path, ["Rien de pertinent ici"])
+    results = pdf_search(path, parse_query("introuvable"))
+    assert results == []
+
+
 # ---------------------------------------------------------------------------
 # XLSX (openpyxl)
 # ---------------------------------------------------------------------------
@@ -426,6 +462,72 @@ def test_xlsx_read_unknown_sheet_raises(tmp_path):
     path = _make_xlsx(tmp_path, {"S1": [["a"]]})
     with pytest.raises(ToolError, match="Feuille inconnue"):
         read_document("xlsx", path, "Nope!A1:B2")
+
+
+def test_xlsx_search_finds_match_with_cell_label(tmp_path):
+    from mcp_docs.formats import xlsx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_xlsx(tmp_path, {"Data": [["chat noir", "autre"], ["rien", "ici"]]})
+    results = xlsx_search(path, parse_query("chat noir"))
+    assert len(results) == 1
+    assert results[0].label == "Data"
+    assert any("Data!A1" in s for s in results[0].snippets)
+
+
+def test_xlsx_search_round_trip_label_to_read_selector(tmp_path):
+    from mcp_docs.formats import xlsx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_xlsx(tmp_path, {"Data": [["x", "chat noir"]]})
+    results = xlsx_search(path, parse_query("chat noir"))
+    snippet = results[0].snippets[0]
+    coord = snippet.split(" : ")[0]  # ex. "Data!B1"
+    result = read_document("xlsx", path, coord)
+    assert "chat noir" in result
+
+
+def test_xlsx_search_multi_sheet_hits(tmp_path):
+    from mcp_docs.formats import xlsx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_xlsx(tmp_path, {"S1": [["chat"]], "S2": [["chat"]], "S3": [["chien"]]})
+    results = xlsx_search(path, parse_query("chat"))
+    assert {r.label for r in results} == {"S1", "S2"}
+
+
+def test_xlsx_search_beyond_read_row_cap_still_found(tmp_path):
+    """Régression : search ne doit PAS hériter de MAX_XLSX_ROWS_DEFAULT (200) —
+    un match à la ligne 300 doit rester trouvable, contrairement à read sans
+    selector explicite sur toute la plage."""
+    from mcp_docs.formats import xlsx_search
+    from mcp_docs.search import parse_query
+
+    rows = [["rien"] for _ in range(299)] + [["chat noir"]]
+    path = _make_xlsx(tmp_path, {"Big": rows})
+    results = xlsx_search(path, parse_query("chat noir"))
+    assert len(results) == 1
+    assert any("Big!A300" in s for s in results[0].snippets)
+
+
+def test_xlsx_search_does_not_match_formula_text_with_data_only(tmp_path):
+    """data_only=True lit la valeur calculée en cache, pas la formule — une
+    requête sur le texte de la formule elle-même ne peut pas matcher (même
+    limitation documentée que xlsx_read)."""
+    import openpyxl
+
+    from mcp_docs.formats import xlsx_search
+    from mcp_docs.search import parse_query
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Calc"
+    ws["A1"] = "=SUM(1,2)"
+    path = tmp_path / "formula.xlsx"
+    wb.save(str(path))
+
+    results = xlsx_search(path, parse_query("SUM"))
+    assert results == []
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +638,87 @@ def test_docx_read_by_heading_selector_ignores_tables(tmp_path):
     assert "unrelated" not in result
 
 
+def test_docx_search_finds_match_in_named_section(tmp_path):
+    from mcp_docs.formats import docx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_docx(
+        tmp_path,
+        [
+            (1, "Intro"),
+            (None, "Rien ici"),
+            (1, "Chats"),
+            (None, "Le chat noir dort"),
+        ],
+    )
+    results = docx_search(path, parse_query("chat noir"))
+    assert len(results) == 1
+    assert results[0].label == "Chats"
+
+
+def test_docx_search_round_trip_title_to_selector(tmp_path):
+    from mcp_docs.formats import docx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_docx(tmp_path, [(1, "Chats"), (None, "Le chat noir dort")])
+    results = docx_search(path, parse_query("chat noir"))
+    label = results[0].label
+    result = read_document("docx", path, label)
+    assert "chat noir" in result.lower()
+
+
+def test_docx_search_matches_preamble_before_first_heading(tmp_path):
+    from mcp_docs.formats import docx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_docx(tmp_path, [(None, "Chat noir avant tout heading"), (1, "Suite"), (None, "Rien")])
+    results = docx_search(path, parse_query("chat noir"))
+    assert len(results) == 1
+    assert results[0].label == "(préambule)"
+
+
+def test_docx_search_document_without_heading_uses_corps_label(tmp_path):
+    from mcp_docs.formats import docx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_docx(tmp_path, [(None, "Chat noir sans structure de titres")])
+    results = docx_search(path, parse_query("chat noir"))
+    assert len(results) == 1
+    assert results[0].label == "(corps)"
+
+
+def test_docx_search_matches_table_content(tmp_path):
+    from mcp_docs.formats import docx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_docx(tmp_path, [(1, "Titre")], tables=[[["chat noir", "autre"]]])
+    results = docx_search(path, parse_query("chat noir"))
+    assert any(r.label == "(tableaux)" for r in results)
+
+
+def test_docx_search_multiple_terms_in_same_section(tmp_path):
+    """hit_count reflète le nombre de termes de la requête matchés dans
+    l'unité (un snippet par terme), pas le nombre brut d'occurrences."""
+    from mcp_docs.formats import docx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_docx(tmp_path, [(1, "Chats"), (None, "chat noir"), (None, "chat blanc")])
+    results = docx_search(path, parse_query("noir blanc"))
+    assert len(results) == 1
+    assert results[0].hit_count == 2
+
+
+def test_docx_sections_factorization_does_not_break_docx_read(tmp_path):
+    """La factorisation potentielle de docx_search via _docx_sections ne doit
+    pas régresser docx_read : contrôle croisé sur un document mixte."""
+    path = _make_docx(
+        tmp_path,
+        [(1, "Intro"), (None, "Intro text"), (1, "Body"), (None, "Body text")],
+    )
+    assert "Body text" in read_document("docx", path, "Body")
+    assert "Intro text" not in read_document("docx", path, "Body")
+
+
 # ---------------------------------------------------------------------------
 # PPTX (python-pptx)
 # ---------------------------------------------------------------------------
@@ -574,6 +757,34 @@ def test_pptx_read_with_range(tmp_path):
     assert "Two" in result
     assert "Three" in result
     assert "One" not in result
+
+
+def test_pptx_search_finds_match_and_labels_by_slide(tmp_path):
+    from mcp_docs.formats import pptx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_pptx(tmp_path, ["Chat noir", "Autre slide"])
+    results = pptx_search(path, parse_query("chat"))
+    assert len(results) == 1
+    assert results[0].label == "1"
+
+
+def test_pptx_search_multi_slide_hits(tmp_path):
+    from mcp_docs.formats import pptx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_pptx(tmp_path, ["Chat noir", "Chat blanc", "Chien"])
+    results = pptx_search(path, parse_query("chat"))
+    assert [r.label for r in results] == ["1", "2"]
+
+
+def test_pptx_search_no_match_returns_empty(tmp_path):
+    from mcp_docs.formats import pptx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_pptx(tmp_path, ["Rien de pertinent"])
+    results = pptx_search(path, parse_query("introuvable"))
+    assert results == []
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +833,90 @@ def test_zip_read_binary_member_reports_note_instead_of_garbage(tmp_path):
 def test_read_document_zip_without_path_raises():
     with pytest.raises(ToolError, match="path"):
         read_document("zip", Path("/nonexistent"), None)
+
+
+# ---------------------------------------------------------------------------
+# zip_search — membres texte uniquement
+# ---------------------------------------------------------------------------
+
+def test_zip_search_finds_match_in_text_member(tmp_path):
+    from mcp_docs.formats import zip_search
+    from mcp_docs.search import parse_query
+
+    path = _make_zip(tmp_path, {"a.txt": "Le chat noir dort", "b.txt": "rien ici"})
+    results = zip_search(path, parse_query("chat noir"))
+    labeled = [r for r in results if r.label == "a.txt"]
+    assert len(labeled) == 1
+
+
+def test_zip_search_round_trip_label_to_read_path(tmp_path):
+    from mcp_docs.formats import zip_search
+    from mcp_docs.search import parse_query
+
+    path = _make_zip(tmp_path, {"a.txt": "Le chat noir dort"})
+    results = zip_search(path, parse_query("chat noir"))
+    label = next(r.label for r in results if r.label != "(note)")
+    result = zip_read_member(path, label)
+    assert "chat noir" in result.lower()
+
+
+def test_zip_search_targeted_member_via_path(tmp_path):
+    from mcp_docs.formats import zip_search
+    from mcp_docs.search import parse_query
+
+    path = _make_zip(tmp_path, {"a.txt": "chat", "b.txt": "chat"})
+    results = zip_search(path, parse_query("chat"), member_path="a.txt")
+    assert [r.label for r in results] == ["a.txt"]
+
+
+def test_zip_search_structured_and_binary_members_ignored_and_noted(tmp_path):
+    from mcp_docs.formats import zip_search
+    from mcp_docs.search import parse_query
+
+    path = _make_zip(tmp_path, {"a.txt": "chat noir"})
+    import zipfile
+
+    with zipfile.ZipFile(path, "a") as z:
+        z.writestr("blob.bin", b"\xff\xfe\x00\x01binary")
+
+    inner_docx = _make_docx(tmp_path, [(None, "chat noir dans un docx imbriqué")])
+    with zipfile.ZipFile(path, "a") as z:
+        z.writestr("nested.docx", inner_docx.read_bytes())
+
+    results = zip_search(path, parse_query("chat noir"))
+    note = next(r for r in results if r.label == "(note)")
+    assert "blob.bin" in note.snippets[0]
+    assert "nested.docx" in note.snippets[0]
+    # Le membre docx imbriqué n'est pas cherché malgré son contenu matchable.
+    assert not any(r.label == "nested.docx" for r in results)
+
+
+def test_zip_search_no_match_returns_empty_without_note(tmp_path):
+    from mcp_docs.formats import zip_search
+    from mcp_docs.search import parse_query
+
+    path = _make_zip(tmp_path, {"a.txt": "rien de pertinent"})
+    results = zip_search(path, parse_query("introuvable"))
+    assert results == []
+
+
+def test_zip_search_rejects_traversal_member_when_targeted(tmp_path):
+    from mcp_docs.formats import zip_search
+    from mcp_docs.search import parse_query
+
+    path = _make_raw_zip(tmp_path, {"../evil.txt": "chat noir"})
+    with pytest.raises(ToolError, match="traversal"):
+        zip_search(path, parse_query("chat"), member_path="../evil.txt")
+
+
+def test_zip_search_skips_traversal_member_in_full_scan(tmp_path):
+    from mcp_docs.formats import zip_search
+    from mcp_docs.search import parse_query
+
+    path = _make_raw_zip(tmp_path, {"../evil.txt": "chat noir", "safe.txt": "chat noir"})
+    results = zip_search(path, parse_query("chat noir"))
+    assert any(r.label == "safe.txt" for r in results)
+    assert not any(r.label == "../evil.txt" for r in results)
 
 
 # ---------------------------------------------------------------------------
@@ -799,3 +1094,341 @@ def test_zip_list_reports_total_declared_size_over_limit(tmp_path):
     with patch("mcp_docs.formats.MAX_UNZIP_MB", 0):
         result = list_document("zip", path)
     assert "Taille décompressée totale" in result
+
+
+# ---------------------------------------------------------------------------
+# D-bis — extraction de documents imbriqués dans une archive (un seul niveau)
+# ---------------------------------------------------------------------------
+
+def _zip_with_member_bytes(tmp_path, member_name, member_bytes, name="outer.zip"):
+    import zipfile
+
+    path = tmp_path / name
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(member_name, member_bytes)
+    return path
+
+
+def test_zip_read_member_docx_nested_returns_structured_content(tmp_path):
+    inner = _make_docx(tmp_path, [(1, "Intro"), (None, "Nested body text")])
+    outer = _zip_with_member_bytes(tmp_path, "membre.docx", inner.read_bytes())
+
+    result = zip_read_member(outer, "membre.docx")
+    assert "Nested body text" in result
+
+
+def test_zip_read_member_xlsx_nested_returns_structured_content(tmp_path):
+    inner = _make_xlsx(tmp_path, {"S1": [["h1", "h2"], ["v1", "v2"]]})
+    outer = _zip_with_member_bytes(tmp_path, "membre.xlsx", inner.read_bytes())
+
+    result = zip_read_member(outer, "membre.xlsx")
+    assert "v1" in result
+
+
+def test_zip_read_member_pptx_nested_returns_structured_content(tmp_path):
+    inner = _make_pptx(tmp_path, ["Nested Slide"])
+    outer = _zip_with_member_bytes(tmp_path, "membre.pptx", inner.read_bytes())
+
+    result = zip_read_member(outer, "membre.pptx")
+    assert "Nested Slide" in result
+
+
+def test_zip_read_member_pdf_nested_returns_structured_content(tmp_path):
+    inner = _make_pdf(tmp_path, ["Nested PDF text"])
+    outer = _zip_with_member_bytes(tmp_path, "membre.pdf", inner.read_bytes())
+
+    result = zip_read_member(outer, "membre.pdf")
+    assert "Nested PDF text" in result
+
+
+def test_zip_read_member_docx_nested_with_selector(tmp_path):
+    inner = _make_docx(
+        tmp_path,
+        [(1, "Intro"), (None, "Intro text"), (1, "Body"), (None, "Body text")],
+    )
+    outer = _zip_with_member_bytes(tmp_path, "membre.docx", inner.read_bytes())
+
+    result = zip_read_member(outer, "membre.docx", selector="Body")
+    assert "Body text" in result
+    assert "Intro text" not in result
+
+
+def test_zip_list_member_docx_nested_reports_structure(tmp_path):
+    inner = _make_docx(tmp_path, [(1, "Nested Title")])
+    outer = _zip_with_member_bytes(tmp_path, "membre.docx", inner.read_bytes())
+
+    result = zip_list_member(outer, "membre.docx")
+    assert "Nested Title" in result
+
+
+def test_zip_read_member_double_nested_zip_stays_one_level_max(tmp_path):
+    """Un zip contenant un zip contenant un docx : le premier niveau (zip) doit
+    rester signalé, pas de récursion au-delà d'un niveau."""
+    import zipfile
+
+    inner_docx = _make_docx(tmp_path, [(None, "should not surface")])
+    inner_zip = tmp_path / "inner.zip"
+    with zipfile.ZipFile(inner_zip, "w") as z:
+        z.writestr("nested.docx", inner_docx.read_bytes())
+
+    outer = _zip_with_member_bytes(tmp_path, "inner.zip", inner_zip.read_bytes())
+
+    result = zip_read_member(outer, "inner.zip")
+    assert "un seul niveau d'imbrication" in result
+    assert "should not surface" not in result
+
+
+def test_zip_list_member_double_nested_zip_stays_one_level_max(tmp_path):
+    import zipfile
+
+    inner_docx = _make_docx(tmp_path, [(None, "should not surface")])
+    inner_zip = tmp_path / "inner.zip"
+    with zipfile.ZipFile(inner_zip, "w") as z:
+        z.writestr("nested.docx", inner_docx.read_bytes())
+
+    outer = _zip_with_member_bytes(tmp_path, "inner.zip", inner_zip.read_bytes())
+
+    result = zip_list_member(outer, "inner.zip")
+    assert "un seul niveau d'imbrication" in result
+
+
+def test_zip_read_member_nested_oversized_raises_clear_error(tmp_path):
+    """Un membre imbriqué reconnu comme docx mais dépassant MAX_FILE_MB doit
+    lever une ToolError claire, pas planter dans la lib de parsing."""
+    inner = _make_docx(tmp_path, [(None, "x" * 1000)])
+    outer = _zip_with_member_bytes(tmp_path, "membre.docx", inner.read_bytes())
+
+    with patch("mcp_docs.formats.MAX_FILE_MB", 0):
+        with pytest.raises(ToolError, match="volumineux"):
+            zip_read_member(outer, "membre.docx")
+
+
+def test_zip_read_member_nested_corrupted_docx_raises_clear_error(tmp_path):
+    """Un membre dont l'extension/signature suggère un docx mais dont le
+    contenu est tronqué/corrompu doit lever une ToolError, pas fuiter
+    l'exception de python-docx."""
+    inner = _make_docx(tmp_path, [(None, "valid docx content")])
+    truncated_bytes = inner.read_bytes()[:20]  # signature zip présente, contenu invalide
+    outer = _zip_with_member_bytes(tmp_path, "membre.docx", truncated_bytes)
+
+    with pytest.raises(ToolError):
+        zip_read_member(outer, "membre.docx")
+
+
+@pytest.mark.asyncio
+async def test_list_tool_path_on_nested_docx_member(workdir):
+    """docs__list avec path pointant vers un membre docx imbriqué renvoie sa
+    structure, pas la note générique 'pas un document structuré'."""
+    from mcp_docs import server as docs_server
+
+    inner_doc = _make_docx(workdir, [(1, "Nested Title")])
+    outer = _zip_with_member_bytes(workdir, "membre.docx", inner_doc.read_bytes())
+    dest = session_dir("conv-1") / "att-1.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(outer.read_bytes())
+
+    tm = docs_server.mcp._tool_manager
+    result = await tm.call_tool(
+        "list", {"ref": "att-1", "session_id": "conv-1", "path": "membre.docx"}
+    )
+    assert "Nested Title" in result
+
+
+@pytest.mark.asyncio
+async def test_read_tool_path_on_nested_docx_member(workdir):
+    """docs__read avec path pointant vers un membre docx imbriqué renvoie son
+    contenu structuré."""
+    from mcp_docs import server as docs_server
+
+    inner_doc = _make_docx(workdir, [(None, "Nested body via tool")])
+    outer = _zip_with_member_bytes(workdir, "membre.docx", inner_doc.read_bytes())
+    dest = session_dir("conv-1") / "att-1.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(outer.read_bytes())
+
+    tm = docs_server.mcp._tool_manager
+    result = await tm.call_tool(
+        "read", {"ref": "att-1", "session_id": "conv-1", "path": "membre.docx"}
+    )
+    assert "Nested body via tool" in result
+
+
+@pytest.mark.asyncio
+async def test_list_tool_path_on_non_zip_raises(workdir):
+    from mcp.server.fastmcp.exceptions import ToolError as FastMCPToolError
+
+    from mcp_docs import server as docs_server
+
+    path = _make_pdf(workdir, ["irrelevant"])
+    dest = session_dir("conv-1") / "att-1.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(path.read_bytes())
+
+    tm = docs_server.mcp._tool_manager
+    with pytest.raises(FastMCPToolError, match="archive"):
+        await tm.call_tool("list", {"ref": "att-1", "session_id": "conv-1", "path": "x.docx"})
+
+
+@pytest.mark.asyncio
+async def test_search_tool_end_to_end_pdf(workdir):
+    from mcp_docs import server as docs_server
+
+    path = _make_pdf(workdir, ["Le chat noir dort", "Rien ici"])
+    dest = session_dir("conv-1") / "att-1.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(path.read_bytes())
+
+    tm = docs_server.mcp._tool_manager
+    result = await tm.call_tool(
+        "search", {"ref": "att-1", "session_id": "conv-1", "query": "chat noir"}
+    )
+    assert "1" in result
+    assert "chat noir" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_tool_end_to_end_zip(workdir):
+    from mcp_docs import server as docs_server
+
+    path = _make_zip(workdir, {"a.txt": "Le chat noir dort", "b.txt": "rien"})
+    dest = session_dir("conv-1") / "att-1.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(path.read_bytes())
+
+    tm = docs_server.mcp._tool_manager
+    result = await tm.call_tool(
+        "search", {"ref": "att-1", "session_id": "conv-1", "query": "chat noir"}
+    )
+    assert "a.txt" in result
+    assert "chat noir" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_ref_unknown_through_proxy_raises_jsonrpc_error(workdir):
+    """search est inflatable (ref+content_b64) : REF_UNKNOWN doit aussi passer
+    par le chemin JSON-RPC du proxy, pas seulement list/read."""
+    import mcp.types as types
+    from mcp.shared.exceptions import McpError
+
+    from mcp_proxy import InProcessUpstream, build_proxy_server
+
+    upstream = InProcessUpstream("mcp_docs")
+    await upstream.start()
+
+    upstreams = {"docs": upstream}
+    tool_map: dict = {}
+    server = build_proxy_server(upstreams, tool_map)
+
+    list_handler = server.request_handlers[types.ListToolsRequest]
+    await list_handler(types.ListToolsRequest(method="tools/list", params=None))
+
+    call_handler = server.request_handlers[types.CallToolRequest]
+    request = types.CallToolRequest(
+        method="tools/call",
+        params=types.CallToolRequestParams(
+            name="docs__search",
+            arguments={"ref": "att-99", "session_id": "conv-1", "query": "chat"},
+        ),
+    )
+
+    with pytest.raises(McpError) as exc_info:
+        await call_handler(request)
+
+    assert exc_info.value.error.data["code"] == "REF_UNKNOWN"
+    assert exc_info.value.error.code == REF_UNKNOWN_ERROR_CODE
+
+
+# ---------------------------------------------------------------------------
+# search.py — logique pure (fold, parse_query, match_unit, make_snippet)
+# Aucune fixture binaire ici : ces tests n'importent aucune lib de doc.
+# ---------------------------------------------------------------------------
+
+def test_fold_lowercases_and_strips_accents():
+    assert fold("Été") == "ete"
+    assert fold("ÀÉÈÊÇÙÎÔ") == "aeeecuio"
+
+
+def test_fold_ligatures_oe_ae():
+    assert fold("sœur") == "soeur"
+    assert fold("nœud") == "noeud"
+    assert fold("Œuvre") == "oeuvre"
+    assert fold("Æquo") == "aequo"
+
+
+def test_fold_case_insensitive_equivalence():
+    assert fold("Café") == fold("CAFÉ") == fold("cafe")
+
+
+def test_parse_query_rejects_empty():
+    with pytest.raises(ToolError):
+        parse_query("")
+    with pytest.raises(ToolError):
+        parse_query("   ")
+
+
+def test_parse_query_whitespace_terms():
+    q = parse_query("chat noir")
+    assert q.terms == ["chat", "noir"]
+
+
+def test_parse_query_quoted_phrase():
+    q = parse_query('"chat noir" hiver')
+    assert q.terms == ["chat noir", "hiver"]
+
+
+def test_parse_query_unclosed_quote_falls_back_to_terms():
+    q = parse_query('foo "bar baz')
+    assert q.terms == ["foo", "bar", "baz"]
+
+
+def test_match_unit_all_terms_present():
+    q = parse_query("chat noir")
+    hits = match_unit("Le chat noir dort.", q)
+    assert len(hits) == 2
+
+
+def test_match_unit_partial_terms_absent_yields_no_hits():
+    q = parse_query("chat souris")
+    hits = match_unit("Le chat noir dort.", q)
+    assert hits == []
+
+
+def test_match_unit_case_and_accent_insensitive():
+    q = parse_query("ete")
+    hits = match_unit("Il fait chaud cet Été.", q)
+    assert len(hits) == 1
+
+
+def test_match_unit_quoted_phrase_exact():
+    q = parse_query('"chat noir"')
+    hits = match_unit("Le chat noir dort, le chien blanc aussi.", q)
+    assert len(hits) == 1
+    hits_absent = match_unit("Le chat blanc et le chien noir.", q)
+    assert hits_absent == []
+
+
+def test_make_snippet_middle_of_text():
+    text = "a" * 200 + "MATCH" + "b" * 200
+    snippet = make_snippet(text, offset=200, length=5, radius=10)
+    assert snippet.startswith("…")
+    assert snippet.endswith("…")
+    assert "MATCH" in snippet
+
+
+def test_make_snippet_at_start_no_leading_ellipsis():
+    text = "MATCH" + "b" * 200
+    snippet = make_snippet(text, offset=0, length=5, radius=10)
+    assert not snippet.startswith("…")
+    assert snippet.endswith("…")
+
+
+def test_make_snippet_at_end_no_trailing_ellipsis():
+    text = "a" * 200 + "MATCH"
+    snippet = make_snippet(text, offset=200, length=5, radius=10)
+    assert snippet.startswith("…")
+    assert not snippet.endswith("…")
+
+
+def test_make_snippet_short_text_no_ellipsis():
+    snippet = make_snippet("MATCH", offset=0, length=5, radius=10)
+    assert snippet == "MATCH"

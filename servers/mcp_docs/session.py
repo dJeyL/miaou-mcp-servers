@@ -49,6 +49,7 @@ MAX_FILE_MB = _env_int("MIAOU_DOCS_MAX_FILE_MB", 20)
 MAX_SESSION_MB = _env_int("MIAOU_DOCS_MAX_SESSION_MB", 200)
 MAX_UNZIP_MB = _env_int("MIAOU_DOCS_MAX_UNZIP_MB", 100)
 READ_CAP = _env_int("MIAOU_DOCS_READ_CAP", 20000)
+SEARCH_CAP = _env_int("MIAOU_DOCS_SEARCH_CAP", 50)
 
 
 def validate_session_id(session_id: str) -> str:

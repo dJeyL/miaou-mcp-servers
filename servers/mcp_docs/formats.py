@@ -7,11 +7,17 @@ Aucun format ne renvoie jamais le document entier en un seul appel.
 
 from __future__ import annotations
 
+import io
 import re
 import zipfile
 from pathlib import Path
 
-from .session import MAX_UNZIP_MB, READ_CAP, ToolError
+from .search import Query, UnitResult, make_snippet, match_unit, snippets_for_unit
+from .session import MAX_FILE_MB, MAX_UNZIP_MB, READ_CAP, ToolError
+
+# Un membre de zip extrait en mémoire, quand il est lui-même un document
+# structuré (docx/xlsx/pptx/pdf) — jamais un chemin disque.
+DocSource = Path | io.BytesIO
 
 # ---------------------------------------------------------------------------
 # Détection de type — extension du nom d'origine si fourni, sinon magic bytes
@@ -24,17 +30,21 @@ _OFFICE_ZIP_SIGNATURES = {
 }
 
 
-def _sniff_zip_kind(path: Path) -> str:
+def _sniff_zip_kind(source: Path | io.BytesIO) -> str:
     """Distingue docx/xlsx/pptx d'un zip brut par ses dossiers internes caractéristiques."""
     try:
-        with zipfile.ZipFile(path) as z:
-            names = z.namelist()
-    except zipfile.BadZipFile:
+        try:
+            with zipfile.ZipFile(source) as z:
+                names = z.namelist()
+        except zipfile.BadZipFile:
+            return "zip"
+        for prefix, kind in _OFFICE_ZIP_SIGNATURES.items():
+            if any(n.startswith(prefix) for n in names):
+                return kind
         return "zip"
-    for prefix, kind in _OFFICE_ZIP_SIGNATURES.items():
-        if any(n.startswith(prefix) for n in names):
-            return kind
-    return "zip"
+    finally:
+        if isinstance(source, io.BytesIO):
+            source.seek(0)
 
 
 def detect_kind(path: Path, filename: str | None = None) -> str:
@@ -55,6 +65,22 @@ def detect_kind(path: Path, filename: str | None = None) -> str:
         return "pdf"
     if head.startswith(b"PK\x03\x04"):
         return _sniff_zip_kind(path)
+    return "inconnu"
+
+
+def detect_kind_from_bytes(data: bytes, filename: str | None = None) -> str:
+    """Équivalent de `detect_kind` pour un contenu déjà en mémoire (membre de
+    zip extrait) — même logique magic bytes / sniff zip interne, sans fichier."""
+    if filename:
+        ext = Path(filename).suffix.lower().lstrip(".")
+        if ext in ("pdf", "docx", "xlsx", "pptx", "zip"):
+            return ext
+
+    head = data[:8]
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    if head.startswith(b"PK\x03\x04"):
+        return _sniff_zip_kind(io.BytesIO(data))
     return "inconnu"
 
 
@@ -90,10 +116,16 @@ def _parse_range(selector: str, total: int) -> tuple[int, int]:
 # PDF (pymupdf)
 # ---------------------------------------------------------------------------
 
-def pdf_list(path: Path) -> str:
+def _fitz_open(source: DocSource):
     import fitz
 
-    with fitz.open(path) as doc:
+    if isinstance(source, io.BytesIO):
+        return fitz.open(stream=source.getvalue(), filetype="pdf")
+    return fitz.open(source)
+
+
+def pdf_list(path: DocSource) -> str:
+    with _fitz_open(path) as doc:
         toc = doc.get_toc()
         lines = [f"PDF — {doc.page_count} page(s)"]
         if toc:
@@ -105,10 +137,8 @@ def pdf_list(path: Path) -> str:
         return "\n".join(lines)
 
 
-def pdf_read(path: Path, selector: str | None) -> str:
-    import fitz
-
-    with fitz.open(path) as doc:
+def pdf_read(path: DocSource, selector: str | None) -> str:
+    with _fitz_open(path) as doc:
         if selector:
             start, end = _parse_range(selector, doc.page_count)
         else:
@@ -138,6 +168,18 @@ def pdf_read(path: Path, selector: str | None) -> str:
         return capped + notice
 
 
+def pdf_search(path: DocSource, query: Query) -> list[UnitResult]:
+    """Unité = page (label = numéro, round-trippable comme selector `read`)."""
+    results = []
+    with _fitz_open(path) as doc:
+        for page_num in range(1, doc.page_count + 1):
+            text = doc[page_num - 1].get_text()
+            snippets = snippets_for_unit(text, query)
+            if snippets:
+                results.append(UnitResult(label=str(page_num), hit_count=len(snippets), snippets=snippets))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # XLSX (openpyxl)
 # ---------------------------------------------------------------------------
@@ -145,16 +187,24 @@ def pdf_read(path: Path, selector: str | None) -> str:
 MAX_XLSX_ROWS_DEFAULT = 200
 
 
-def xlsx_list(path: Path) -> str:
+def _open_binary(source: DocSource):
+    """Fichier ouvert et passé en objet binaire, pas en chemin : openpyxl valide
+    l'extension du *chemin* (rejette tout sauf .xlsx/.xlsm/...), alors que le
+    fichier matérialisé par mcp_docs garde un nom stable `att-N.bin` (type
+    réel détecté par magic bytes, cf. session.ref_path). Un membre de zip
+    imbriqué arrive déjà en BytesIO, réutilisé tel quel."""
+    if isinstance(source, io.BytesIO):
+        source.seek(0)
+        return source
+    return open(source, "rb")
+
+
+def xlsx_list(path: DocSource) -> str:
     import openpyxl
 
-    # Fichier ouvert et passé en objet binaire, pas en chemin : openpyxl valide
-    # l'extension du *chemin* (rejette tout sauf .xlsx/.xlsm/...), alors que le
-    # fichier matérialisé par mcp_docs garde un nom stable `att-N.bin` (type
-    # réel détecté par magic bytes, cf. session.ref_path). En mode read_only,
-    # les feuilles restent en lecture différée : tout accès doit rester dans
-    # le bloc `with`, sinon le fichier sous-jacent est déjà refermé.
-    with open(path, "rb") as f:
+    is_owned_file = not isinstance(path, io.BytesIO)
+    f = _open_binary(path)
+    try:
         wb = openpyxl.load_workbook(f, read_only=True, data_only=True)
         try:
             lines = ["XLSX — feuilles :"]
@@ -165,14 +215,19 @@ def xlsx_list(path: Path) -> str:
             return "\n".join(lines)
         finally:
             wb.close()
+    finally:
+        if is_owned_file:
+            f.close()
 
 
-def xlsx_read(path: Path, selector: str | None) -> str:
+def xlsx_read(path: DocSource, selector: str | None) -> str:
     """selector : 'NomFeuille' ou 'NomFeuille!A1:C10'. Sans plage, cap à
     MAX_XLSX_ROWS_DEFAULT lignes depuis le début de la feuille."""
     import openpyxl
 
-    with open(path, "rb") as f:
+    is_owned_file = not isinstance(path, io.BytesIO)
+    f = _open_binary(path)
+    try:
         wb = openpyxl.load_workbook(f, read_only=True, data_only=True)
         try:
             if not selector:
@@ -189,7 +244,11 @@ def xlsx_read(path: Path, selector: str | None) -> str:
 
             truncated_rows = False
             if cell_range:
-                rows = list(ws[cell_range])
+                selected = ws[cell_range]
+                # ws["B1"] renvoie une Cell unique (pas une plage) ; ws["A1:C10"]
+                # renvoie un tuple de tuples de lignes. Normaliser au 2e cas pour
+                # que le rendu ligne par ligne ci-dessous fonctionne dans les deux.
+                rows = [(selected,)] if not isinstance(selected, tuple) else list(selected)
             else:
                 rows = []
                 for i, row in enumerate(ws.iter_rows(), start=1):
@@ -216,6 +275,47 @@ def xlsx_read(path: Path, selector: str | None) -> str:
             return capped + notice
         finally:
             wb.close()
+    finally:
+        if is_owned_file:
+            f.close()
+
+
+def xlsx_search(path: DocSource, query: Query) -> list[UnitResult]:
+    """Unité de résultat = feuille, mais chaque hit est une **cellule** dont le
+    label (`Feuille!Coord`) est un selector `read` exact — granularité plus
+    utile au modèle qu'une ligne entière. Balaie **toutes** les lignes, sans
+    hériter de MAX_XLSX_ROWS_DEFAULT (sinon un match après la ligne 200 serait
+    invisible, cf. AUDIT §3). Chaque cellule est matchée individuellement :
+    une requête multi-termes doit avoir tous ses termes dans la MÊME cellule
+    (pas de match cross-cellules)."""
+    import openpyxl
+
+    is_owned_file = not isinstance(path, io.BytesIO)
+    f = _open_binary(path)
+    try:
+        wb = openpyxl.load_workbook(f, read_only=True, data_only=True)
+        try:
+            results = []
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                snippets = []
+                for row in ws.iter_rows():
+                    for cell in row:
+                        if cell.value is None:
+                            continue
+                        text = str(cell.value)
+                        hits = match_unit(text, query)
+                        if hits:
+                            snippet = make_snippet(text, hits[0].offset, hits[0].length)
+                            snippets.append(f"{sheet_name}!{cell.coordinate} : {snippet}")
+                if snippets:
+                    results.append(UnitResult(label=sheet_name, hit_count=len(snippets), snippets=snippets))
+            return results
+        finally:
+            wb.close()
+    finally:
+        if is_owned_file:
+            f.close()
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +334,10 @@ def _table_text(table) -> str:
     return "\n".join(lines)
 
 
-def docx_list(path: Path) -> str:
+def docx_list(path: DocSource) -> str:
     import docx
 
-    d = docx.Document(str(path))
+    d = docx.Document(path if isinstance(path, io.BytesIO) else str(path))
     lines = ["DOCX — sections :"]
     found = False
     for para in d.paragraphs:
@@ -255,7 +355,7 @@ def docx_list(path: Path) -> str:
     return "\n".join(lines)
 
 
-def docx_read(path: Path, selector: str | None) -> str:
+def docx_read(path: DocSource, selector: str | None) -> str:
     """selector : titre exact d'un heading (lit jusqu'au prochain heading de
     même niveau ou supérieur, paragraphes uniquement) ; sans selector, les N
     premiers paragraphes PUIS le texte de toutes les tables (un document
@@ -264,7 +364,7 @@ def docx_read(path: Path, selector: str | None) -> str:
     chaîne vide alors que `list` a bien signalé leur présence)."""
     import docx
 
-    d = docx.Document(str(path))
+    d = docx.Document(path if isinstance(path, io.BytesIO) else str(path))
     paragraphs = d.paragraphs
 
     if selector:
@@ -305,14 +405,84 @@ def docx_read(path: Path, selector: str | None) -> str:
     return capped + notice
 
 
+_PREAMBLE_LABEL = "(préambule)"
+_BODY_LABEL = "(corps)"
+_TABLES_LABEL = "(tableaux)"
+
+
+def _docx_sections(d) -> list[tuple[str, str]]:
+    """Découpe un document docx en unités `(label, texte)` réutilisables pour
+    `docx_search`. Une section = un heading et tout le texte jusqu'au prochain
+    heading de même niveau ou supérieur (même règle de bornage que
+    `docx_read`, dupliquée ici plutôt que factorisée pour ne pas risquer de
+    régression sur `docx_read`, déjà couvert par ses propres tests).
+
+    Le texte avant le premier heading (ou tout le document s'il n'y a aucun
+    heading) n'a pas de label round-trippable naturel : il retombe sur
+    `(préambule)` s'il précède un heading existant, ou `(corps)` si le
+    document n'a aucun heading — `read` sans selector renvoie ce même
+    contenu dans les deux cas, donc le round-trip reste valide (round-trip
+    partiel assumé, cf. PLAN décision #2). Les tables n'appartiennent à aucun
+    heading : regroupées sous `(tableaux)`, round-trippable de la même façon
+    (read sans selector les inclut aussi)."""
+    paragraphs = d.paragraphs
+    headings = []  # (idx, level, title)
+    for i, para in enumerate(paragraphs):
+        m = _HEADING_RE.match(para.style.name or "" if para.style else "")
+        if m and para.text.strip():
+            headings.append((i, int(m.group(1)), para.text.strip()))
+
+    sections: list[tuple[str, str]] = []
+
+    if not headings:
+        body = "\n".join(p.text for p in paragraphs)
+        sections.append((_BODY_LABEL, body))
+    else:
+        first_idx = headings[0][0]
+        if first_idx > 0:
+            preamble = "\n".join(p.text for p in paragraphs[:first_idx])
+            if preamble.strip():
+                sections.append((_PREAMBLE_LABEL, preamble))
+
+        for pos, (start_idx, level, title) in enumerate(headings):
+            end_idx = len(paragraphs)
+            for next_idx, next_level, _ in headings[pos + 1 :]:
+                if next_level <= level:
+                    end_idx = next_idx
+                    break
+            text = "\n".join(p.text for p in paragraphs[start_idx:end_idx])
+            sections.append((title, text))
+
+    if d.tables:
+        sections.append((_TABLES_LABEL, "\n".join(_table_text(t) for t in d.tables)))
+
+    return sections
+
+
+def docx_search(path: DocSource, query: Query) -> list[UnitResult]:
+    """Unité = section heading (label = titre exact, selector `read` valide) ;
+    texte hors-section et docs sans heading → labels spéciaux `(préambule)`/
+    `(corps)`, tables → `(tableaux)`. Round-trip partiel assumé pour ces
+    labels spéciaux (décision #2 : `read` sans selector les re-sert)."""
+    import docx
+
+    d = docx.Document(path if isinstance(path, io.BytesIO) else str(path))
+    results = []
+    for label, text in _docx_sections(d):
+        snippets = snippets_for_unit(text, query)
+        if snippets:
+            results.append(UnitResult(label=label, hit_count=len(snippets), snippets=snippets))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # PPTX (python-pptx)
 # ---------------------------------------------------------------------------
 
-def pptx_list(path: Path) -> str:
+def pptx_list(path: DocSource) -> str:
     from pptx import Presentation
 
-    prs = Presentation(str(path))
+    prs = Presentation(path if isinstance(path, io.BytesIO) else str(path))
     lines = [f"PPTX — {len(prs.slides)} slide(s) :"]
     for i, slide in enumerate(prs.slides, start=1):
         title = slide.shapes.title.text if slide.shapes.title else "(sans titre)"
@@ -320,10 +490,10 @@ def pptx_list(path: Path) -> str:
     return "\n".join(lines)
 
 
-def pptx_read(path: Path, selector: str | None) -> str:
+def pptx_read(path: DocSource, selector: str | None) -> str:
     from pptx import Presentation
 
-    prs = Presentation(str(path))
+    prs = Presentation(path if isinstance(path, io.BytesIO) else str(path))
     total = len(prs.slides)
 
     if selector:
@@ -347,14 +517,31 @@ def pptx_read(path: Path, selector: str | None) -> str:
     return capped + notice
 
 
+def pptx_search(path: DocSource, query: Query) -> list[UnitResult]:
+    """Unité = slide (label = numéro, round-trippable comme selector `read`)."""
+    from pptx import Presentation
+
+    prs = Presentation(path if isinstance(path, io.BytesIO) else str(path))
+    results = []
+    for slide_num, slide in enumerate(prs.slides, start=1):
+        texts = [shape.text_frame.text for shape in slide.shapes if shape.has_text_frame]
+        text = "\n".join(t for t in texts if t.strip())
+        snippets = snippets_for_unit(text, query)
+        if snippets:
+            results.append(UnitResult(label=str(slide_num), hit_count=len(snippets), snippets=snippets))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # ZIP (stdlib zipfile) — arbre d'entrées et lecture de membre
 #
-# Gardes de sécurité (brief D4) : zip-slip (chemin résolu, rejet absolu/`..`),
-# tailles totale/par-entrée contrôlées en flux (les headers mentent — on ne se
-# fie pas à ZipInfo.file_size seul), rejet des membres chiffrés et des archives
-# imbriquées (listées, jamais extraites). Menace : utilisateur unique, mais les
-# gardes restent non négociables (coût trivial, échec = dommage filesystem).
+# Gardes de sécurité : zip-slip (chemin résolu, rejet absolu/`..`), tailles
+# totale/par-entrée contrôlées en flux (les headers mentent — on ne se fie pas
+# à ZipInfo.file_size seul), rejet des membres chiffrés. Un membre qui est
+# lui-même un document structuré (pdf/docx/xlsx/pptx/zip) est extractible via
+# dispatch récursif borné à un seul niveau d'imbrication (read_nested_member /
+# list_nested_member). Menace : utilisateur unique, mais les gardes restent
+# non négociables (coût trivial, échec = dommage filesystem).
 # ---------------------------------------------------------------------------
 
 _ZIP_READ_CHUNK = 64 * 1024
@@ -376,7 +563,7 @@ def _is_nested_archive(head: bytes) -> bool:
     return head.startswith(b"PK\x03\x04")
 
 
-def zip_list(path: Path) -> str:
+def zip_list(path: DocSource) -> str:
     with zipfile.ZipFile(path) as z:
         infos = z.infolist()
         lines = ["ZIP — entrées :"]
@@ -388,10 +575,10 @@ def zip_list(path: Path) -> str:
                 flags.append("chemin suspect, non extractible")
             if not info.is_dir() and _is_encrypted(info):
                 flags.append("chiffré, non extractible")
-            if not info.is_dir() and info.filename.lower().endswith(
-                (".zip", ".docx", ".xlsx", ".pptx")
-            ):
-                flags.append("archive imbriquée potentielle, non extractible en v1")
+            if not info.is_dir() and info.filename.lower().endswith((".docx", ".xlsx", ".pptx", ".pdf")):
+                flags.append("document structuré, lisible via read(path=...)")
+            elif not info.is_dir() and info.filename.lower().endswith(".zip"):
+                flags.append("archive imbriquée potentielle, non extractible au-delà d'un niveau")
             flag_note = f" [{', '.join(flags)}]" if flags else ""
             lines.append(f"- {info.filename} ({info.file_size} octets, {kind}){flag_note}")
             total_declared += info.file_size
@@ -407,11 +594,11 @@ def zip_list(path: Path) -> str:
         return "\n".join(lines)
 
 
-def zip_read_member(path: Path, member_path: str) -> str:
+def _extract_zip_member_bytes(path: DocSource, member_path: str) -> bytes:
     """Extrait un membre du zip en mémoire, en flux et avec garde de taille
     cumulative (pas de confiance dans ZipInfo.file_size). Rejette zip-slip,
-    membres chiffrés et archives imbriquées (une archive dans l'archive reste
-    listée par zip_list mais n'est pas elle-même extractible en v1)."""
+    membres chiffrés et archive corrompue. Ne dit rien sur le *contenu* extrait
+    (archive imbriquée ou non) — c'est aux appelants de le déterminer."""
     if _is_zip_slip(member_path):
         raise ToolError(f"Chemin de membre invalide (traversal) : '{member_path}'")
 
@@ -450,13 +637,78 @@ def zip_read_member(path: Path, member_path: str) -> str:
                     chunks.append(chunk)
         except zipfile.BadZipFile as e:
             raise ToolError(f"Archive corrompue ou en-tête incohérent pour '{member_path}' : {e}")
-        data = b"".join(chunks)
+        return b"".join(chunks)
 
-    if _is_nested_archive(data[:4]):
-        return (
-            f"[Archive imbriquée détectée dans '{member_path}' — non extractible "
-            f"en v1, listée uniquement via zip_list]"
+
+def _check_nested_member_size(data: bytes, member_path: str) -> None:
+    """Un membre imbriqué reconnu comme docx/xlsx/pptx/pdf passe la garde zip
+    (MAX_UNZIP_MB, ex. 100 Mo) mais doit rester sous MAX_FILE_MB (ex. 20 Mo)
+    avant d'être parsé par une lib lourde — même borne que la matérialisation
+    initiale d'un attachement (session.materialize)."""
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb > MAX_FILE_MB:
+        raise ToolError(
+            f"Membre imbriqué trop volumineux pour être extrait comme document "
+            f"structuré ({size_mb:.1f} Mo, max {MAX_FILE_MB} Mo) : '{member_path}'"
         )
+
+
+def read_nested_member(member_path: str, data: bytes, selector: str | None) -> str:
+    """Dispatch récursif : le membre extrait d'un zip est lui-même un document
+    structuré. Un seul niveau d'imbrication est supporté (pas de zip-dans-zip-
+    dans-zip) — un membre qui est lui-même une archive contenant une archive
+    reste signalé mais non extrait, pour borner la récursion et le coût de
+    parsing (chaque niveau individuel pourrait respecter MAX_UNZIP_MB tout en
+    démultipliant le travail cumulé)."""
+    kind = detect_kind_from_bytes(data, filename=member_path)
+    if kind == "zip":
+        return (
+            f"[Archive imbriquée à plus d'un niveau détectée dans '{member_path}' "
+            f"— non extractible, un seul niveau d'imbrication est supporté]"
+        )
+    if kind == "inconnu":
+        return f"[Membre binaire non affichable en l'état : '{member_path}', {len(data)} octets]"
+
+    _check_nested_member_size(data, member_path)
+    try:
+        return read_document(kind, io.BytesIO(data), selector)
+    except zipfile.BadZipFile as e:
+        raise ToolError(f"Membre imbriqué corrompu, non extractible : '{member_path}' ({e})")
+
+
+def list_nested_member(member_path: str, data: bytes) -> str:
+    """Équivalent de `read_nested_member` pour `docs__list` — structure d'un
+    membre imbriqué sans en renvoyer le contenu."""
+    kind = detect_kind_from_bytes(data, filename=member_path)
+    if kind == "zip":
+        return (
+            f"[Archive imbriquée à plus d'un niveau détectée dans '{member_path}' "
+            f"— non listable, un seul niveau d'imbrication est supporté]"
+        )
+    if kind == "inconnu":
+        return f"[Membre binaire non reconnu : '{member_path}', {len(data)} octets]"
+
+    _check_nested_member_size(data, member_path)
+    try:
+        return list_document(kind, io.BytesIO(data))
+    except zipfile.BadZipFile as e:
+        raise ToolError(f"Membre imbriqué corrompu, non listable : '{member_path}' ({e})")
+
+
+def _is_structured_document(head: bytes) -> bool:
+    """PDF ou zip (brut/Office) — tout ce que `read_nested_member` sait dispatcher."""
+    return head.startswith(b"%PDF") or _is_nested_archive(head)
+
+
+def zip_read_member(path: DocSource, member_path: str, selector: str | None = None) -> str:
+    """Rejette zip-slip et membres chiffrés (via `_extract_zip_member_bytes`).
+    Si le membre est lui-même un document structuré (pdf/docx/xlsx/pptx/zip),
+    dispatch récursif borné à un niveau (`read_nested_member`, `selector`
+    transmis) ; sinon traité comme texte brut (`selector` alors sans effet)."""
+    data = _extract_zip_member_bytes(path, member_path)
+
+    if _is_structured_document(data[:8]):
+        return read_nested_member(member_path, data, selector)
 
     try:
         text = data.decode("utf-8")
@@ -466,6 +718,89 @@ def zip_read_member(path: Path, member_path: str) -> str:
     capped, truncated = _cap_text(text, READ_CAP)
     notice = _truncation_notice("relire avec un selector plus étroit") if truncated else ""
     return capped + notice
+
+
+def zip_search(path: DocSource, query: Query, member_path: str | None = None) -> list[UnitResult]:
+    """Cherche dans les membres texte brut d'une archive zip. Sans
+    `member_path`, balaie tous les membres non ignorés ; avec `member_path`,
+    restreint la recherche à ce seul membre (décision #6). Un membre
+    reconnu comme document structuré (docx/xlsx/pptx/pdf), chiffré, une
+    archive imbriquée ou un fichier binaire non-utf8 est ignoré et listé en
+    note finale (décision #3) — pas de dispatch récursif ici, contrairement à
+    `zip_read_member` (limitation explicite du brief, zip = texte seul pour
+    la recherche). Label unité = chemin du membre (round-trip :
+    `read(path=member_path)`)."""
+    if member_path is not None:
+        # Ciblage explicite : erreur claire si le membre n'existe pas ou est
+        # inextractible, comme zip_read_member (pas un skip silencieux ici).
+        data = _extract_zip_member_bytes(path, member_path)
+        if _is_structured_document(data[:8]):
+            return []
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return []
+        snippets = snippets_for_unit(text, query)
+        if not snippets:
+            return []
+        return [UnitResult(label=member_path, hit_count=len(snippets), snippets=snippets)]
+
+    results = []
+    skipped: list[str] = []
+    with zipfile.ZipFile(path) as z:
+        infos = z.infolist()
+
+    for info in infos:
+        if info.is_dir():
+            continue
+        name = info.filename
+        if _is_zip_slip(name):
+            skipped.append(f"{name} (chemin suspect)")
+            continue
+        if _is_encrypted(info):
+            skipped.append(f"{name} (chiffré)")
+            continue
+        if info.file_size / (1024 * 1024) > MAX_UNZIP_MB:
+            skipped.append(f"{name} (trop volumineux)")
+            continue
+
+        try:
+            data = _extract_zip_member_bytes(path, name)
+        except ToolError:
+            skipped.append(f"{name} (illisible)")
+            continue
+
+        if _is_structured_document(data[:8]):
+            skipped.append(f"{name} (document structuré, non cherché)")
+            continue
+
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            skipped.append(f"{name} (binaire)")
+            continue
+
+        snippets = snippets_for_unit(text, query)
+        if snippets:
+            results.append(UnitResult(label=name, hit_count=len(snippets), snippets=snippets))
+
+    if skipped:
+        note = "[Membres non cherchés (zones aveugles) : " + ", ".join(skipped) + "]"
+        results.append(UnitResult(label="(note)", hit_count=0, snippets=[note]))
+
+    return results
+
+
+def zip_list_member(path: DocSource, member_path: str) -> str:
+    """Liste la structure d'un membre imbriqué (docx/xlsx/pptx/pdf) sans
+    matérialisation disque. Un membre non reconnu comme document structuré (ou
+    une archive imbriquée à plus d'un niveau) reste signalé, jamais planté."""
+    data = _extract_zip_member_bytes(path, member_path)
+
+    if _is_structured_document(data[:8]):
+        return list_nested_member(member_path, data)
+
+    return f"[Membre '{member_path}' : {len(data)} octets, pas un document structuré (docx/xlsx/pptx/pdf/zip)]"
 
 
 # ---------------------------------------------------------------------------
@@ -487,18 +822,32 @@ _READ_DISPATCH = {
     "pptx": pptx_read,
 }
 
+_SEARCH_DISPATCH = {
+    "pdf": pdf_search,
+    "xlsx": xlsx_search,
+    "docx": docx_search,
+    "pptx": pptx_search,
+}
 
-def list_document(kind: str, path: Path) -> str:
+
+def list_document(kind: str, path: DocSource) -> str:
     fn = _LIST_DISPATCH.get(kind)
     if fn is None:
         raise ToolError(f"Type de document non supporté ou non reconnu (détecté : '{kind}')")
     return fn(path)
 
 
-def read_document(kind: str, path: Path, selector: str | None) -> str:
+def read_document(kind: str, path: DocSource, selector: str | None) -> str:
     if kind == "zip":
         raise ToolError("Zip : préciser 'path' pour lire un membre (voir docs__list pour l'arbre)")
     fn = _READ_DISPATCH.get(kind)
     if fn is None:
         raise ToolError(f"Type de document non supporté ou non reconnu (détecté : '{kind}')")
     return fn(path, selector)
+
+
+def search_document(kind: str, path: DocSource, query: Query) -> list[UnitResult]:
+    fn = _SEARCH_DISPATCH.get(kind)
+    if fn is None:
+        raise ToolError(f"Recherche non encore supportée pour ce format (détecté : '{kind}')")
+    return fn(path, query)

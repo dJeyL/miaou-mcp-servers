@@ -11,7 +11,9 @@ pour permettre au navigateur de l'atteindre directement depuis dist/miaou.html.
 
 Extraction uniquement — aucune génération ni modification de document (non-goal
 explicite). Lecture paginée : `docs__list` renvoie la structure sans contenu,
-`docs__read` renvoie un extrait borné avec troncature signalée.
+`docs__read` renvoie un extrait borné avec troncature signalée, `docs__search`
+cherche du texte et renvoie les occurrences groupées par unité avec extraits
+de contexte.
 
 Cycle de vie des fichiers : chaque conversation MIAOU a une session
 (`session_id` = id de conversation), qui est un cache sur disque
@@ -31,10 +33,12 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
     MIAOU_DOCS_MAX_SESSION_MB  (défaut : 200)
     MIAOU_DOCS_MAX_UNZIP_MB    (défaut : 100)
     MIAOU_DOCS_READ_CAP        (défaut : 20000, en caractères)
+    MIAOU_DOCS_SEARCH_CAP      (défaut : 50, nombre de snippets)
 
 Module éclaté en package (servers/mcp_docs/) : session.py (sessions, sanitization,
 matérialisation, contrat REF_UNKNOWN), formats.py (détection de type + parsers
-PDF/docx/xlsx/pptx/zip). Ce fichier ne porte que le serveur FastMCP et ses outils.
+PDF/docx/xlsx/pptx/zip), search.py (logique pure de recherche : fold, parsing de
+requête, matching, snippets). Ce fichier ne porte que le serveur FastMCP et ses outils.
 
 Lancement (package, pas un script plat — `uv run servers/mcp_docs.py` ne s'applique
 pas ici, cd dans servers/ ou utiliser --directory) :
@@ -53,10 +57,20 @@ from __future__ import annotations
 
 from mcp_base import MiaouMCPBase
 
-from .formats import detect_kind, list_document, read_document, zip_read_member
+from .formats import (
+    detect_kind,
+    list_document,
+    read_document,
+    search_document,
+    zip_list_member,
+    zip_read_member,
+    zip_search,
+)
+from .search import parse_query, render_results
 from .session import (
     REF_UNKNOWN_ERROR_CODE,
     REF_UNKNOWN_SENTINEL,
+    SEARCH_CAP,
     ToolError,
     resolve_ref,
     session_dir,
@@ -93,18 +107,27 @@ class DocsServer(MiaouMCPBase):
             ref: str,
             session_id: str | None = None,
             content_b64: str | None = None,
+            path: str | None = None,
             filename: str | None = None,
         ) -> str:
             """Liste la structure d'un document (pages/feuilles/slides/entrées zip)
             sans en renvoyer le contenu. `ref` identifie l'attachement (att-N) ;
             `content_b64` matérialise le fichier au premier appel ; `filename`
             (optionnel) aide à la détection de type par extension, sinon magic
-            bytes. Un membre d'archive listé ici est lisible via `read(path=...)`
-            (extraction en tant que document imbriqué : D3)."""
+            bytes. `path` liste la structure d'un membre d'archive qui est
+            lui-même un document structuré (docx/xlsx/pptx/pdf), un seul niveau
+            d'imbrication supporté ; sans `path`, un membre d'archive listé ici
+            reste lisible tel quel via `read(path=...)`."""
             if session_id is None:
                 raise ToolError("session_id requis (appel hors MIAOU ?)")
             doc_path = resolve_ref(session_id, ref, content_b64)
             kind = detect_kind(doc_path, filename)
+
+            if path is not None:
+                if kind != "zip":
+                    raise ToolError(f"'{ref}' n'est pas une archive : path ne s'applique pas")
+                return zip_list_member(doc_path, path)
+
             return list_document(kind, doc_path)
 
         @self.mcp.tool(name="read")
@@ -121,8 +144,8 @@ class DocsServer(MiaouMCPBase):
             caractères, troncature signalée explicitement. Sans selector sur un
             document multi-unités, renvoie la première unité + notice — jamais
             le document entier. `path` lit un membre de zip par chemin (texte
-            brut uniquement en v1 ; un membre lui-même document structuré
-            (docx/xlsx/pptx/pdf imbriqué) sera extractible via ref+path en D3)."""
+            brut, ou extrait structuré via `selector` si le membre est lui-même
+            un docx/xlsx/pptx/pdf — un seul niveau d'imbrication supporté)."""
             if session_id is None:
                 raise ToolError("session_id requis (appel hors MIAOU ?)")
             doc_path = resolve_ref(session_id, ref, content_b64)
@@ -131,9 +154,55 @@ class DocsServer(MiaouMCPBase):
             if path is not None:
                 if kind != "zip":
                     raise ToolError(f"'{ref}' n'est pas une archive : path ne s'applique pas")
-                return zip_read_member(doc_path, path)
+                return zip_read_member(doc_path, path, selector)
 
             return read_document(kind, doc_path, selector)
+
+        @self.mcp.tool(name="search")
+        async def search(
+            ref: str,
+            query: str,
+            session_id: str | None = None,
+            content_b64: str | None = None,
+            path: str | None = None,
+            filename: str | None = None,
+        ) -> str:
+            """Cherche du texte dans un document et renvoie les occurrences
+            groupées par unité (page/feuille/slide/membre zip), avec un
+            extrait de contexte par occurrence. Chaque unité est étiquetée par
+            un label directement réutilisable comme selector de `read` (ou
+            comme `path` pour un membre de zip) — un hit peut être relu en
+            détail avec un second appel ciblé.
+
+            Syntaxe de la requête : des termes séparés par des espaces sont
+            tous requis (ET implicite) ; `"une phrase entre guillemets"`
+            cherche cette séquence exacte. Pas d'opérateurs OU/NON/parenthèses
+            — composer plusieurs appels ou filtrer les résultats soi-même si
+            besoin. Insensible à la casse et aux accents. Une phrase exacte ne
+            matche pas si elle est à cheval sur deux unités (page/section/…).
+
+            Réponse plafonnée à MIAOU_DOCS_SEARCH_CAP occurrences au total,
+            troncature signalée explicitement.
+
+            Dans une archive zip, seuls les membres texte brut sont cherchés ;
+            les membres reconnus comme documents structurés (docx/xlsx/pptx/pdf),
+            chiffrés ou binaires ne sont pas balayés (signalé en fin de
+            résultat). Sans `path`, tous les membres texte de l'archive sont
+            cherchés ; avec `path`, la recherche est restreinte à ce membre."""
+            if session_id is None:
+                raise ToolError("session_id requis (appel hors MIAOU ?)")
+            doc_path = resolve_ref(session_id, ref, content_b64)
+            kind = detect_kind(doc_path, filename)
+            parsed_query = parse_query(query)
+
+            if kind == "zip":
+                unit_results = zip_search(doc_path, parsed_query, member_path=path)
+            elif path is not None:
+                raise ToolError(f"'{ref}' n'est pas une archive : path ne s'applique pas")
+            else:
+                unit_results = search_document(kind, doc_path, parsed_query)
+
+            return render_results(kind, query, unit_results, SEARCH_CAP)
 
 
 server = DocsServer()
