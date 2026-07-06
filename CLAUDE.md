@@ -124,7 +124,7 @@ Quatre outils exposés (préfixés `docs__` par le proxy) :
 |---|---|
 | `drop_session(session_id)` | Supprime le cache d'une session (nettoyage sur suppression de conversation MIAOU) |
 | `list(ref, path?, session_id?, content_b64?, filename?)` | Structure du document sans contenu (pages/feuilles/slides/entrées zip) |
-| `read(ref, path?, selector?, session_id?, content_b64?, filename?)` | Extrait borné (plage de pages/lignes/slides), plafonné par `MIAOU_DOCS_READ_CAP` |
+| `read(ref, path?, selector?, char_start?, char_end?, line_start?, line_end?, session_id?, content_b64?, filename?)` | Extrait borné (plage de pages/lignes/slides), plafonné par `MIAOU_DOCS_READ_CAP` ; plage char/ligne pour paginer une unité au-delà du cap |
 | `search(ref, query, path?, session_id?, content_b64?, filename?)` | Recherche de texte groupée par unité (page/feuille/slide/membre zip), plafonnée par `MIAOU_DOCS_SEARCH_CAP` |
 
 Signature commune inflatable : `ref: str, content_b64: str | None = None, session_id: str
@@ -146,6 +146,19 @@ listé en note finale des zones aveugles, pas de dispatch récursif contrairemen
 Chaque label de résultat est réutilisable tel quel comme selector `read` (ou `path` pour
 un membre de zip). Sans `path` sur une archive, `search` balaie tous ses membres texte ;
 avec `path`, restreint à ce seul membre.
+
+`read` — plage char/ligne : `char_start`/`char_end` (offset caractère, `char_start`
+obligatoire) OU `line_start`/`line_end` (numéro de ligne 1-indexé inclusif, `line_start`
+obligatoire), les deux modes mutuellement exclusifs. La plage porte sur le **texte que
+`read` produit déjà** pour l'unité sélectionnée (donc combinable avec `selector` : « lignes
+500-800 de la page 3 ») — pas sur un flux global fabriqué, ce qui garde la sémantique
+déterministe. Chaque appel reste plafonné à `MIAOU_DOCS_READ_CAP` : la plage déplace une
+fenêtre glissante (la notice annonce l'offset suivant), elle ne lève pas le cap. Sert à lire
+une unité volumineuse (grande page/section) au-delà de 20k caractères en plusieurs appels.
+Formats concernés : pdf, docx, pptx, membre zip texte brut (et membre imbriqué structuré,
+plage transmise au dispatch récursif). **xlsx exclu** (grille sans flux texte naturel :
+rejet explicite, garder son selector `Feuille!A1:C10`). Sur un pdf/pptx la plage porte sur
+le body rendu, en-tête `--- Page N ---`/`--- Slide N ---` compris.
 
 Détection de type : le contrat client ne transmet pas le nom de fichier d'origine à ce
 jour, donc `filename` (optionnel, pour extension) retombe sur les magic bytes en son

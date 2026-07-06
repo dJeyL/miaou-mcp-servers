@@ -1339,6 +1339,190 @@ async def test_search_ref_unknown_through_proxy_raises_jsonrpc_error(workdir):
 
 
 # ---------------------------------------------------------------------------
+# read — plage char/ligne (fenêtre glissante au-delà du cap de READ_CAP)
+# ---------------------------------------------------------------------------
+
+def test_build_range_none_when_no_params():
+    from mcp_docs import _build_range
+
+    assert _build_range(None, None, None, None) is None
+
+
+def test_build_range_char_and_line_mutually_exclusive():
+    from mcp_docs import _build_range
+
+    with pytest.raises(ToolError, match="exclusifs"):
+        _build_range(0, None, 1, None)
+
+
+def test_build_range_char_end_without_start_rejected():
+    from mcp_docs import _build_range
+
+    with pytest.raises(ToolError, match="char_start"):
+        _build_range(None, 100, None, None)
+
+
+def test_build_range_line_end_without_start_rejected():
+    from mcp_docs import _build_range
+
+    with pytest.raises(ToolError, match="line_start"):
+        _build_range(None, None, None, 10)
+
+
+def test_build_range_line_start_must_be_one_indexed():
+    from mcp_docs import _build_range
+
+    with pytest.raises(ToolError, match="line_start"):
+        _build_range(None, None, 0, None)
+
+
+def test_build_range_char_start_negative_rejected():
+    from mcp_docs import _build_range
+
+    with pytest.raises(ToolError, match="char_start"):
+        _build_range(-1, None, None, None)
+
+
+def test_build_range_end_before_start_rejected():
+    from mcp_docs import _build_range
+
+    with pytest.raises(ToolError, match="char_end"):
+        _build_range(100, 50, None, None)
+    with pytest.raises(ToolError, match="line_end"):
+        _build_range(None, None, 10, 5)
+
+
+def test_apply_range_char_window_within_text():
+    from mcp_docs.formats import TextRange, _apply_range
+
+    body = "abcdefghij"
+    text, notice = _apply_range(body, TextRange(char_start=2, char_end=5))
+    assert text == "cde"
+
+
+def test_apply_range_char_start_only_caps_at_read_cap(monkeypatch):
+    import mcp_docs.formats as fmt
+
+    monkeypatch.setattr(fmt, "READ_CAP", 5)
+    body = "0123456789ABCDE"
+    text, notice = fmt._apply_range(body, fmt.TextRange(char_start=3))
+    assert text == "34567"
+    assert "char_start=8" in notice  # 3 + 5 servis
+
+
+def test_apply_range_char_start_beyond_end():
+    from mcp_docs.formats import TextRange, _apply_range
+
+    text, notice = _apply_range("short", TextRange(char_start=100))
+    assert text == ""
+    assert "au-delà" in notice
+
+
+def test_apply_range_line_window():
+    from mcp_docs.formats import TextRange, _apply_range
+
+    body = "L1\nL2\nL3\nL4\nL5"
+    text, notice = _apply_range(body, TextRange(line_start=2, line_end=4))
+    assert text == "L2\nL3\nL4"
+    assert "line_start=5" in notice  # end < total → suite
+
+
+def test_apply_range_line_start_only_to_end():
+    from mcp_docs.formats import TextRange, _apply_range
+
+    body = "L1\nL2\nL3"
+    text, notice = _apply_range(body, TextRange(line_start=2))
+    assert text == "L2\nL3"
+    assert notice == ""  # atteint la dernière ligne
+
+
+def test_apply_range_line_start_beyond_end():
+    from mcp_docs.formats import TextRange, _apply_range
+
+    body = "L1\nL2"
+    text, notice = _apply_range(body, TextRange(line_start=99))
+    assert text == ""
+    assert "au-delà" in notice
+
+
+def test_pdf_read_char_range_exceeds_cap_via_offset(tmp_path, monkeypatch):
+    """Une page unique dépassant READ_CAP devient lisible en entier via
+    plusieurs appels char_start décalés. La plage porte sur le body rendu
+    complet, en-tête '--- Page N ---' compris."""
+    import mcp_docs.formats as fmt
+
+    monkeypatch.setattr(fmt, "READ_CAP", 40)
+    big = "X" * 200
+    path = _make_pdf(tmp_path, [big])
+
+    # En-tête "--- Page 1 ---\n" = 15 caractères, puis les X. Un cap à 40 sert
+    # 40 caractères de fenêtre (en-tête + 25 X) et annonce l'offset suivant.
+    first = fmt.read_document("pdf", path, "1", fmt.TextRange(char_start=0))
+    assert first.count("X") == 25
+    assert "char_start=40" in first
+
+    second = fmt.read_document("pdf", path, "1", fmt.TextRange(char_start=40))
+    assert second.count("X") == 40
+    assert "char_start=80" in second
+
+
+def test_read_document_xlsx_rejects_range(tmp_path):
+    from mcp_docs.formats import TextRange, read_document
+
+    path = _make_xlsx(tmp_path, {"S1": [["a", "b"]]})
+    with pytest.raises(ToolError, match="xlsx"):
+        read_document("xlsx", path, None, TextRange(char_start=0))
+
+
+def test_zip_read_member_text_char_range(tmp_path):
+    from mcp_docs.formats import TextRange, zip_read_member
+
+    path = _make_zip(tmp_path, {"a.txt": "abcdefghij"})
+    result = zip_read_member(path, "a.txt", rng=TextRange(char_start=2, char_end=5))
+    assert result.startswith("cde")
+
+
+@pytest.mark.asyncio
+async def test_read_tool_char_range_end_to_end(workdir, monkeypatch):
+    import mcp_docs.formats as fmt
+
+    monkeypatch.setattr(fmt, "READ_CAP", 30)
+    from mcp_docs import server as docs_server
+
+    path = _make_pdf(workdir, ["Y" * 100])
+    dest = session_dir("conv-1") / "att-1.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(path.read_bytes())
+
+    tm = docs_server.mcp._tool_manager
+    result = await tm.call_tool(
+        "read",
+        {"ref": "att-1", "session_id": "conv-1", "selector": "1", "char_start": 50},
+    )
+    assert "Y" in result
+    assert "char_start" in result
+
+
+@pytest.mark.asyncio
+async def test_read_tool_rejects_mixed_range_modes(workdir):
+    from mcp.server.fastmcp.exceptions import ToolError as FastMCPToolError
+
+    from mcp_docs import server as docs_server
+
+    path = _make_pdf(workdir, ["text"])
+    dest = session_dir("conv-1") / "att-1.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(path.read_bytes())
+
+    tm = docs_server.mcp._tool_manager
+    with pytest.raises(FastMCPToolError, match="exclusif"):
+        await tm.call_tool(
+            "read",
+            {"ref": "att-1", "session_id": "conv-1", "char_start": 0, "line_start": 1},
+        )
+
+
+# ---------------------------------------------------------------------------
 # search.py — logique pure (fold, parse_query, match_unit, make_snippet)
 # Aucune fixture binaire ici : ces tests n'importent aucune lib de doc.
 # ---------------------------------------------------------------------------

@@ -10,10 +10,35 @@ from __future__ import annotations
 import io
 import re
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from .search import Query, UnitResult, make_snippet, match_unit, snippets_for_unit
 from .session import MAX_FILE_MB, MAX_UNZIP_MB, READ_CAP, ToolError
+
+
+# ---------------------------------------------------------------------------
+# Plage char/ligne relative au texte d'une unité (pdf/docx/pptx/zip texte)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TextRange:
+    """Fenêtre de découpe dans le texte déjà produit par read() pour une unité.
+
+    Exactement l'un des deux modes est actif (validé côté outil, pas ici) :
+    caractères (`char_start` obligatoire, `char_end` optionnel) ou lignes
+    (`line_start` obligatoire 1-indexé, `line_end` optionnel inclusif). La
+    fenêtre déplace le point de départ ; la sortie reste plafonnée à READ_CAP
+    (fenêtre glissante, pas un dump illimité, cf. décision de conception)."""
+
+    char_start: int | None = None
+    char_end: int | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+
+    @property
+    def is_line_mode(self) -> bool:
+        return self.line_start is not None
 
 # Un membre de zip extrait en mémoire, quand il est lui-même un document
 # structuré (docx/xlsx/pptx/pdf) — jamais un chemin disque.
@@ -98,6 +123,63 @@ def _truncation_notice(continue_hint: str) -> str:
     return f"\n\n[Tronqué à {READ_CAP} caractères — {continue_hint}]"
 
 
+def _apply_range(body: str, rng: TextRange) -> tuple[str, str]:
+    """Découpe `body` selon la fenêtre char/ligne, plafonne à READ_CAP, et
+    renvoie (texte, notice). La notice indique le prochain offset à demander
+    quand il reste du texte au-delà de la fenêtre servie.
+
+    Contrat de validation (assuré par l'appelant) : un seul mode actif,
+    `char_start`/`line_start` non nul dans son mode."""
+    if rng.is_line_mode:
+        lines = body.split("\n")
+        total = len(lines)
+        start = rng.line_start  # 1-indexé, garanti >= 1 par la validation
+        if start > total:
+            return "", f"\n\n[Ligne {start} au-delà de la fin ({total} ligne(s))]"
+        end = rng.line_end if rng.line_end is not None else total
+        end = min(end, total)
+        if end < start:
+            raise ToolError(f"Plage de lignes invalide : {start}-{rng.line_end}")
+        window = "\n".join(lines[start - 1 : end])
+        capped, truncated = _cap_text(window, READ_CAP)
+        if truncated:
+            # Le cap a coupé au milieu de la fenêtre de lignes demandée. Le
+            # nombre de lignes entières effectivement servies borne le prochain
+            # départ (la ligne partielle finale sera relue en entier).
+            served_lines = capped.count("\n")
+            next_line = start + served_lines
+            notice = _truncation_notice(
+                f"line_start={next_line} pour la suite (réduire la fenêtre si une "
+                f"ligne unique dépasse {READ_CAP} caractères)"
+            )
+        elif end < total:
+            notice = (
+                f"\n\n[Fenêtre lignes {start}-{end} sur {total} — "
+                f"line_start={end + 1} pour la suite]"
+            )
+        else:
+            notice = ""
+        return capped, notice
+
+    # Mode caractères.
+    total = len(body)
+    start = rng.char_start  # garanti >= 0 par la validation
+    if start >= total and total > 0:
+        return "", f"\n\n[Offset {start} au-delà de la fin ({total} caractères)]"
+    end = rng.char_end if rng.char_end is not None else total
+    end = min(end, total)
+    if end < start:
+        raise ToolError(f"Plage de caractères invalide : {start}-{rng.char_end}")
+    window = body[start:end]
+    capped, truncated = _cap_text(window, READ_CAP)
+    served_end = start + len(capped)
+    if truncated or served_end < total:
+        notice = _truncation_notice(f"char_start={served_end} pour la suite")
+    else:
+        notice = ""
+    return capped, notice
+
+
 def _parse_range(selector: str, total: int) -> tuple[int, int]:
     """Parse 'N' ou 'N-M' (1-indexé, inclusif), borné à [1, total]."""
     if "-" in selector:
@@ -137,7 +219,7 @@ def pdf_list(path: DocSource) -> str:
         return "\n".join(lines)
 
 
-def pdf_read(path: DocSource, selector: str | None) -> str:
+def pdf_read(path: DocSource, selector: str | None, rng: TextRange | None = None) -> str:
     with _fitz_open(path) as doc:
         if selector:
             start, end = _parse_range(selector, doc.page_count)
@@ -153,12 +235,18 @@ def pdf_read(path: DocSource, selector: str | None) -> str:
             parts.append(f"--- Page {page_num} ---\n{text}")
         body = "\n\n".join(parts)
 
-        notice = ""
+        empty_note = ""
         if empty_pages:
-            notice += (
+            empty_note = (
                 f"\n\n[Pages sans texte extractible (probablement scannées, "
                 f"pas d'OCR en v1) : {', '.join(map(str, empty_pages))}]"
             )
+
+        if rng is not None:
+            capped, notice = _apply_range(body, rng)
+            return capped + empty_note + notice
+
+        notice = empty_note
         if not selector and doc.page_count > 1:
             notice += _truncation_notice(f"selector='2-{doc.page_count}' pour la suite")
 
@@ -355,7 +443,7 @@ def docx_list(path: DocSource) -> str:
     return "\n".join(lines)
 
 
-def docx_read(path: DocSource, selector: str | None) -> str:
+def docx_read(path: DocSource, selector: str | None, rng: TextRange | None = None) -> str:
     """selector : titre exact d'un heading (lit jusqu'au prochain heading de
     même niveau ou supérieur, paragraphes uniquement) ; sans selector, les N
     premiers paragraphes PUIS le texte de toutes les tables (un document
@@ -398,6 +486,10 @@ def docx_read(path: DocSource, selector: str | None) -> str:
             parts.extend(_table_text(t) for t in d.tables)
         body = "\n".join(parts)
         notice = para_notice
+
+    if rng is not None:
+        capped, range_notice = _apply_range(body, rng)
+        return capped + range_notice
 
     capped, truncated = _cap_text(body, READ_CAP)
     if truncated and not notice:
@@ -490,7 +582,7 @@ def pptx_list(path: DocSource) -> str:
     return "\n".join(lines)
 
 
-def pptx_read(path: DocSource, selector: str | None) -> str:
+def pptx_read(path: DocSource, selector: str | None, rng: TextRange | None = None) -> str:
     from pptx import Presentation
 
     prs = Presentation(path if isinstance(path, io.BytesIO) else str(path))
@@ -507,6 +599,10 @@ def pptx_read(path: DocSource, selector: str | None) -> str:
         texts = [shape.text_frame.text for shape in slide.shapes if shape.has_text_frame]
         parts.append(f"--- Slide {slide_num} ---\n" + "\n".join(t for t in texts if t.strip()))
     body = "\n\n".join(parts)
+
+    if rng is not None:
+        capped, notice = _apply_range(body, rng)
+        return capped + notice
 
     notice = ""
     if not selector and total > 1:
@@ -653,7 +749,9 @@ def _check_nested_member_size(data: bytes, member_path: str) -> None:
         )
 
 
-def read_nested_member(member_path: str, data: bytes, selector: str | None) -> str:
+def read_nested_member(
+    member_path: str, data: bytes, selector: str | None, rng: TextRange | None = None
+) -> str:
     """Dispatch récursif : le membre extrait d'un zip est lui-même un document
     structuré. Un seul niveau d'imbrication est supporté (pas de zip-dans-zip-
     dans-zip) — un membre qui est lui-même une archive contenant une archive
@@ -671,7 +769,7 @@ def read_nested_member(member_path: str, data: bytes, selector: str | None) -> s
 
     _check_nested_member_size(data, member_path)
     try:
-        return read_document(kind, io.BytesIO(data), selector)
+        return read_document(kind, io.BytesIO(data), selector, rng)
     except zipfile.BadZipFile as e:
         raise ToolError(f"Membre imbriqué corrompu, non extractible : '{member_path}' ({e})")
 
@@ -700,20 +798,30 @@ def _is_structured_document(head: bytes) -> bool:
     return head.startswith(b"%PDF") or _is_nested_archive(head)
 
 
-def zip_read_member(path: DocSource, member_path: str, selector: str | None = None) -> str:
+def zip_read_member(
+    path: DocSource,
+    member_path: str,
+    selector: str | None = None,
+    rng: TextRange | None = None,
+) -> str:
     """Rejette zip-slip et membres chiffrés (via `_extract_zip_member_bytes`).
     Si le membre est lui-même un document structuré (pdf/docx/xlsx/pptx/zip),
-    dispatch récursif borné à un niveau (`read_nested_member`, `selector`
-    transmis) ; sinon traité comme texte brut (`selector` alors sans effet)."""
+    dispatch récursif borné à un niveau (`read_nested_member`, `selector` et
+    `rng` transmis) ; sinon traité comme texte brut (`selector` alors sans
+    effet, `rng` applique la fenêtre char/ligne sur le texte du membre)."""
     data = _extract_zip_member_bytes(path, member_path)
 
     if _is_structured_document(data[:8]):
-        return read_nested_member(member_path, data, selector)
+        return read_nested_member(member_path, data, selector, rng)
 
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return f"[Membre binaire non affichable en l'état : '{member_path}', {len(data)} octets]"
+
+    if rng is not None:
+        capped, notice = _apply_range(text, rng)
+        return capped + notice
 
     capped, truncated = _cap_text(text, READ_CAP)
     notice = _truncation_notice("relire avec un selector plus étroit") if truncated else ""
@@ -837,13 +945,21 @@ def list_document(kind: str, path: DocSource) -> str:
     return fn(path)
 
 
-def read_document(kind: str, path: DocSource, selector: str | None) -> str:
+def read_document(kind: str, path: DocSource, selector: str | None, rng: TextRange | None = None) -> str:
     if kind == "zip":
         raise ToolError("Zip : préciser 'path' pour lire un membre (voir docs__list pour l'arbre)")
+    if rng is not None and kind == "xlsx":
+        raise ToolError(
+            "Plage char/ligne non applicable à un xlsx (grille, pas de flux texte) — "
+            "utiliser un selector 'Feuille!A1:C10'"
+        )
     fn = _READ_DISPATCH.get(kind)
     if fn is None:
         raise ToolError(f"Type de document non supporté ou non reconnu (détecté : '{kind}')")
-    return fn(path, selector)
+    # xlsx_read n'accepte pas rng (rejeté ci-dessus) : appel à 2 arguments.
+    if kind == "xlsx":
+        return fn(path, selector)
+    return fn(path, selector, rng)
 
 
 def search_document(kind: str, path: DocSource, query: Query) -> list[UnitResult]:

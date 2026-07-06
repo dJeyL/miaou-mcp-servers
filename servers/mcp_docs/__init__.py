@@ -58,6 +58,7 @@ from __future__ import annotations
 from mcp_base import MiaouMCPBase
 
 from .formats import (
+    TextRange,
     detect_kind,
     list_document,
     read_document,
@@ -85,6 +86,45 @@ __all__ = [
     "mcp",
     "server",
 ]
+
+
+def _build_range(
+    char_start: int | None,
+    char_end: int | None,
+    line_start: int | None,
+    line_end: int | None,
+) -> TextRange | None:
+    """Valide les paramètres de plage de `read` et construit un TextRange, ou None
+    si aucune plage n'est demandée. Char et ligne sont mutuellement exclusifs ;
+    `*_end` sans `*_start` est une erreur (le début est obligatoire)."""
+    has_char = char_start is not None or char_end is not None
+    has_line = line_start is not None or line_end is not None
+
+    if not has_char and not has_line:
+        return None
+    if has_char and has_line:
+        raise ToolError(
+            "char_start/char_end et line_start/line_end sont exclusifs — "
+            "choisir un seul mode de plage"
+        )
+
+    if has_char:
+        if char_start is None:
+            raise ToolError("char_end fourni sans char_start (le début de plage est obligatoire)")
+        if char_start < 0:
+            raise ToolError(f"char_start doit être >= 0 (reçu {char_start})")
+        if char_end is not None and char_end < char_start:
+            raise ToolError(f"char_end ({char_end}) < char_start ({char_start})")
+        return TextRange(char_start=char_start, char_end=char_end)
+
+    # has_line
+    if line_start is None:
+        raise ToolError("line_end fourni sans line_start (le début de plage est obligatoire)")
+    if line_start < 1:
+        raise ToolError(f"line_start doit être >= 1 (1-indexé, reçu {line_start})")
+    if line_end is not None and line_end < line_start:
+        raise ToolError(f"line_end ({line_end}) < line_start ({line_start})")
+    return TextRange(line_start=line_start, line_end=line_end)
 
 
 class DocsServer(MiaouMCPBase):
@@ -137,19 +177,26 @@ class DocsServer(MiaouMCPBase):
             content_b64: str | None = None,
             path: str | None = None,
             selector: str | None = None,
+            char_start: int | None = None,
+            char_end: int | None = None,
+            line_start: int | None = None,
+            line_end: int | None = None,
             filename: str | None = None,
         ) -> str:
             if session_id is None:
                 raise ToolError("session_id requis (appel hors MIAOU ?)")
+
+            rng = _build_range(char_start, char_end, line_start, line_end)
+
             doc_path = resolve_ref(session_id, ref, content_b64)
             kind = detect_kind(doc_path, filename)
 
             if path is not None:
                 if kind != "zip":
                     raise ToolError(f"'{ref}' n'est pas une archive : path ne s'applique pas")
-                return zip_read_member(doc_path, path, selector)
+                return zip_read_member(doc_path, path, selector, rng)
 
-            return read_document(kind, doc_path, selector)
+            return read_document(kind, doc_path, selector, rng)
 
         read.__doc__ = f"""Lit un extrait borné d'un document (plage de pages/lignes/slides/
         paragraphes selon le format). Réponse plafonnée à {READ_CAP}
@@ -157,7 +204,19 @@ class DocsServer(MiaouMCPBase):
         document multi-unités, renvoie la première unité + notice — jamais
         le document entier. `path` lit un membre de zip par chemin (texte
         brut, ou extrait structuré via `selector` si le membre est lui-même
-        un docx/xlsx/pptx/pdf — un seul niveau d'imbrication supporté)."""
+        un docx/xlsx/pptx/pdf — un seul niveau d'imbrication supporté).
+
+        Pour dépasser la limite de {READ_CAP} caractères sur une unité
+        volumineuse, paginer avec une plage sur le texte extrait :
+        `char_start`/`char_end` (offset caractère, `char_start` obligatoire,
+        `char_end` optionnel) OU `line_start`/`line_end` (numéro de ligne
+        1-indexé, `line_start` obligatoire, `line_end` optionnel inclusif).
+        Les deux modes sont exclusifs entre eux. La plage porte sur le texte
+        que `read` produirait pour l'unité sélectionnée (donc combinable avec
+        `selector` : « lignes 500-800 de la page 3 »). Chaque appel reste
+        plafonné à {READ_CAP} caractères — la plage déplace la fenêtre, la
+        notice indique l'offset suivant à demander. Non applicable à un xlsx
+        (grille : utiliser un selector 'Feuille!A1:C10')."""
         self.mcp.tool(name="read")(read)
 
         async def search(
