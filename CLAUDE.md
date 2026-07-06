@@ -417,6 +417,27 @@ Décorer une fonction avec `@self.mcp.tool()` dans le `__init__` du serveur conc
 FastMCP génère le schéma JSON automatiquement depuis la signature Python et la docstring.
 Aucune déclaration manuelle dans un registre.
 
+### Faire apparaître une valeur d'environnement résolue dans une docstring d'outil
+
+Si la description d'un outil doit citer la valeur *active* d'une constante dérivée d'une
+variable d'environnement (ex. `MIAOU_DOCS_READ_CAP`) plutôt que le nom de la variable,
+`f"""..."""` en position de docstring ne fonctionne pas : Python n'assigne `__doc__`
+qu'à partir d'un littéral de chaîne reconnu syntaxiquement, jamais depuis une expression
+(f-string comprise) — la fonction se retrouve avec `__doc__ is None`, silencieusement.
+
+Pattern à appliquer : définir la fonction sans décorateur, assigner `func.__doc__ = f"""..."""`
+explicitement, puis appliquer le décorateur a posteriori en appel direct :
+
+```python
+async def read(...) -> str:
+    ...
+
+read.__doc__ = f"""Réponse plafonnée à {READ_CAP} caractères, ..."""
+self.mcp.tool(name="read")(read)
+```
+
+Voir `servers/mcp_docs/__init__.py` (outils `read`/`search`) pour l'exemple appliqué.
+
 ## Ce que MIAOU attend d'un serveur MCP
 
 1. `initialize` (handshake JSON-RPC) → capte `Mcp-Session-Id`

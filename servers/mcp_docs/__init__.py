@@ -68,6 +68,7 @@ from .formats import (
 )
 from .search import parse_query, render_results
 from .session import (
+    READ_CAP,
     REF_UNKNOWN_ERROR_CODE,
     REF_UNKNOWN_SENTINEL,
     SEARCH_CAP,
@@ -130,7 +131,6 @@ class DocsServer(MiaouMCPBase):
 
             return list_document(kind, doc_path)
 
-        @self.mcp.tool(name="read")
         async def read(
             ref: str,
             session_id: str | None = None,
@@ -139,13 +139,6 @@ class DocsServer(MiaouMCPBase):
             selector: str | None = None,
             filename: str | None = None,
         ) -> str:
-            """Lit un extrait borné d'un document (plage de pages/lignes/slides/
-            paragraphes selon le format). Réponse plafonnée à MIAOU_DOCS_READ_CAP
-            caractères, troncature signalée explicitement. Sans selector sur un
-            document multi-unités, renvoie la première unité + notice — jamais
-            le document entier. `path` lit un membre de zip par chemin (texte
-            brut, ou extrait structuré via `selector` si le membre est lui-même
-            un docx/xlsx/pptx/pdf — un seul niveau d'imbrication supporté)."""
             if session_id is None:
                 raise ToolError("session_id requis (appel hors MIAOU ?)")
             doc_path = resolve_ref(session_id, ref, content_b64)
@@ -158,7 +151,15 @@ class DocsServer(MiaouMCPBase):
 
             return read_document(kind, doc_path, selector)
 
-        @self.mcp.tool(name="search")
+        read.__doc__ = f"""Lit un extrait borné d'un document (plage de pages/lignes/slides/
+        paragraphes selon le format). Réponse plafonnée à {READ_CAP}
+        caractères, troncature signalée explicitement. Sans selector sur un
+        document multi-unités, renvoie la première unité + notice — jamais
+        le document entier. `path` lit un membre de zip par chemin (texte
+        brut, ou extrait structuré via `selector` si le membre est lui-même
+        un docx/xlsx/pptx/pdf — un seul niveau d'imbrication supporté)."""
+        self.mcp.tool(name="read")(read)
+
         async def search(
             ref: str,
             query: str,
@@ -167,28 +168,6 @@ class DocsServer(MiaouMCPBase):
             path: str | None = None,
             filename: str | None = None,
         ) -> str:
-            """Cherche du texte dans un document et renvoie les occurrences
-            groupées par unité (page/feuille/slide/membre zip), avec un
-            extrait de contexte par occurrence. Chaque unité est étiquetée par
-            un label directement réutilisable comme selector de `read` (ou
-            comme `path` pour un membre de zip) — un hit peut être relu en
-            détail avec un second appel ciblé.
-
-            Syntaxe de la requête : des termes séparés par des espaces sont
-            tous requis (ET implicite) ; `"une phrase entre guillemets"`
-            cherche cette séquence exacte. Pas d'opérateurs OU/NON/parenthèses
-            — composer plusieurs appels ou filtrer les résultats soi-même si
-            besoin. Insensible à la casse et aux accents. Une phrase exacte ne
-            matche pas si elle est à cheval sur deux unités (page/section/…).
-
-            Réponse plafonnée à MIAOU_DOCS_SEARCH_CAP occurrences au total,
-            troncature signalée explicitement.
-
-            Dans une archive zip, seuls les membres texte brut sont cherchés ;
-            les membres reconnus comme documents structurés (docx/xlsx/pptx/pdf),
-            chiffrés ou binaires ne sont pas balayés (signalé en fin de
-            résultat). Sans `path`, tous les membres texte de l'archive sont
-            cherchés ; avec `path`, la recherche est restreinte à ce membre."""
             if session_id is None:
                 raise ToolError("session_id requis (appel hors MIAOU ?)")
             doc_path = resolve_ref(session_id, ref, content_b64)
@@ -203,6 +182,30 @@ class DocsServer(MiaouMCPBase):
                 unit_results = search_document(kind, doc_path, parsed_query)
 
             return render_results(kind, query, unit_results, SEARCH_CAP)
+
+        search.__doc__ = f"""Cherche du texte dans un document et renvoie les occurrences
+        groupées par unité (page/feuille/slide/membre zip), avec un
+        extrait de contexte par occurrence. Chaque unité est étiquetée par
+        un label directement réutilisable comme selector de `read` (ou
+        comme `path` pour un membre de zip) — un hit peut être relu en
+        détail avec un second appel ciblé.
+
+        Syntaxe de la requête : des termes séparés par des espaces sont
+        tous requis (ET implicite) ; `"une phrase entre guillemets"`
+        cherche cette séquence exacte. Pas d'opérateurs OU/NON/parenthèses
+        — composer plusieurs appels ou filtrer les résultats soi-même si
+        besoin. Insensible à la casse et aux accents. Une phrase exacte ne
+        matche pas si elle est à cheval sur deux unités (page/section/…).
+
+        Réponse plafonnée à {SEARCH_CAP} occurrences au total,
+        troncature signalée explicitement.
+
+        Dans une archive zip, seuls les membres texte brut sont cherchés ;
+        les membres reconnus comme documents structurés (docx/xlsx/pptx/pdf),
+        chiffrés ou binaires ne sont pas balayés (signalé en fin de
+        résultat). Sans `path`, tous les membres texte de l'archive sont
+        cherchés ; avec `path`, la recherche est restreinte à ce membre."""
+        self.mcp.tool(name="search")(search)
 
 
 server = DocsServer()
