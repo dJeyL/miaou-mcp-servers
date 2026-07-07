@@ -10,3 +10,4 @@ untracked/
 *.egg-info/
 dist/
 /miaou-docs/
+/miaou-web/

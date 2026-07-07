@@ -21,7 +21,7 @@ miaou-mcp-servers/
 │   ├── mcp_base.py       # classe de base partagée (MiaouMCPBase + make_opener)
 │   ├── mcp_bench.py      # banc d'essai général (port 8765)
 │   ├── mcp_weather.py    # météo réelle via wttr.in (port 8766)
-│   ├── mcp_web.py      # téléchargement d'URL (port 8768)
+│   ├── mcp_web/          # téléchargement d'URL (port 8768), package (voir plus bas)
 │   ├── mcp_ddg.py        # recherche DuckDuckGo HTML (port 8769)
 │   ├── mcp_brave.py      # recherche Brave Search API (port 8770)
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package (voir plus bas)
@@ -29,6 +29,7 @@ miaou-mcp-servers/
 │   ├── test_bench.py
 │   ├── test_weather.py
 │   ├── test_web.py
+│   ├── test_web_structure.py
 │   ├── test_ddg.py
 │   ├── test_brave.py
 │   ├── test_docs.py
@@ -64,9 +65,20 @@ Un seul outil `get_weather(city, state?, country?)` qui interroge wttr.in et ren
 un `EmbeddedResource` texte JSON. Sert à tester un outil avec données réelles et
 paramètres optionnels, ainsi que le chemin resource inline (D8.2).
 
-### `servers/mcp_web.py` — téléchargement d'URL (port 8768)
+### `servers/mcp_web/` — téléchargement d'URL (port 8768)
 
-Un seul outil `fetch_url(url, max_bytes=5242880)`. Branch sur le `Content-Type` :
+Package (pas un fichier plat, même seuil que `mcp_docs` : plusieurs responsabilités
+distinctes — serveur, cache disque, extraction de structure) :
+
+```
+servers/mcp_web/
+├── __init__.py    # serveur FastMCP + définition des outils (fetch_url/fetch_read/fetch_list)
+├── __main__.py    # point d'entrée `python -m mcp_web` / `uv run servers/mcp_web`
+├── cache.py        # cache disque par checksum d'URL (texte, HTML brut, structure JSON)
+└── structure.py    # extraction stdlib (html.parser) des headings/liens, sans dépendance tierce
+```
+
+Trois outils. `fetch_url(url, max_bytes=5242880)` branch sur le `Content-Type` :
 
 | Content-Type | Traitement | Résultat |
 |---|---|---|
@@ -74,8 +86,50 @@ Un seul outil `fetch_url(url, max_bytes=5242880)`. Branch sur le `Content-Type` 
 | `text/*` | texte brut | `TextResourceContents` avec le vrai mime |
 | tout le reste | base64 | `BlobResourceContents` |
 
-Taille bornée à `max_bytes` (défaut 5 Mo), truncation notée dans le texte.
+Taille *téléchargée* bornée à `max_bytes` (défaut 5 Mo), troncature notée dans le texte.
 Erreurs réseau retournées comme chaînes (pas de stack trace).
+
+Le texte produit (HTML converti ou `text/*`) est en plus plafonné en sortie à
+`MIAOU_WEB_READ_CAP` caractères (défaut 20000, cf. `servers/mcp_web/cache.py`) — une page
+HTML de plusieurs Mo convertie par html2text peut sinon saturer la fenêtre de contexte de
+l'appelant malgré `max_bytes`. Le texte complet (et le HTML brut, si `text/html`) est écrit
+sur disque (`servers/mcp_web/cache.py`), clé = SHA256 de l'URL — pas de session_id ni de
+contrat REF_UNKNOWN comme mcp_docs : ce cache est indépendant de toute conversation MIAOU,
+une URL déjà récupérée reste paginable même depuis un autre client. Sweep TTL opportuniste
+(`MIAOU_WEB_CACHE_TTL_H`, défaut 24h), même pattern que le TTL de session de `mcp_docs`.
+
+`fetch_read(url, char_start=0, char_end=None)` relit le texte déjà mis en cache sans
+retélécharger, pour paginer au-delà du cap (offset caractère uniquement, pas de mode ligne —
+une page web n'a pas la structure en unités logiques d'un document). Chaque appel reste
+plafonné à `MIAOU_WEB_READ_CAP` caractères : `char_end` ne lève pas ce cap, il déplace juste
+la fenêtre (un `char_end` très éloigné de `char_start` est silencieusement ramené au cap) —
+sinon un seul appel `fetch_read` sur le reliquat d'une page volumineuse recrée exactement le
+problème de saturation de contexte que le cap sur `fetch_url` visait à éliminer. Erreur claire
+si l'URL n'a jamais été passée à `fetch_url`, ou si le cache a expiré. Le contenu binaire
+(image, etc.) n'est pas concerné par ce cache : déjà borné par `max_bytes`, ce n'est pas lui
+qui sature le contexte du modèle.
+
+`fetch_list(url, entry_start=0, entry_end=None)` extrait la structure de navigation (headings
+h1-h6 et liens `<a href>`, dans l'ordre d'apparition, un lien sans texte ou un heading vide
+étant ignoré) du HTML brut déjà mis en cache par `fetch_url` — sans retélécharger, et sans
+dépendance de parsing tierce (`servers/mcp_web/structure.py`, stdlib `html.parser`). La
+structure extraite est elle-même mise en cache (JSON) au premier appel, pour ne pas reparser
+le HTML à chaque page. Pagination par **index d'entrée** (`entry_start`/`entry_end`, 0-indexé,
+exclusif sur `entry_end`) plutôt que par ligne de texte ou par caractère : chaque heading ou
+lien est une unité atomique numérotée, une pagination par ligne serait ambiguë sur du texte
+rendu. Chaque appel reste plafonné à `MIAOU_WEB_LIST_CAP` entrées (défaut 100) — même logique
+que le cap de `fetch_read` : `entry_end` ne lève pas le cap, il déplace la fenêtre. N'a de sens
+que pour une URL dont `fetch_url` a renvoyé du HTML (`text/html`) ; erreur claire sinon, ou si
+l'URL n'a jamais été récupérée, ou si le cache a expiré.
+
+Variables d'environnement (toutes optionnelles, défauts constants) :
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `MIAOU_WEB_WORKDIR` | `./miaou-web` (relatif au répertoire de travail) | Racine du cache par checksum d'URL |
+| `MIAOU_WEB_CACHE_TTL_H` | `24` | TTL avant sweep d'une entrée de cache inactive |
+| `MIAOU_WEB_READ_CAP` | `20000` | Cap de caractères en sortie de `fetch_url`/`fetch_read` |
+| `MIAOU_WEB_LIST_CAP` | `100` | Cap du nombre d'entrées en sortie de `fetch_list` |
 
 ### `servers/mcp_ddg.py` — recherche DuckDuckGo (port 8769)
 
@@ -104,8 +158,8 @@ Serveur d'extraction (lecture seule, pas de génération/modification) pour PDF,
 `<workdir>/<session_id>/`, `session_id` = id de conversation MIAOU) et de lectures
 paginées : jamais le document entier en un seul appel.
 
-Seul serveur du dépôt organisé en package plutôt qu'en fichier plat (module trop
-volumineux sinon) :
+Organisé en package plutôt qu'en fichier plat (module trop volumineux sinon), comme
+`mcp_web/` :
 
 ```
 servers/mcp_docs/
@@ -263,11 +317,11 @@ uv run servers/mcp_bench.py --transport stdio        # mode stdio
 uv run servers/mcp_bench.py --host 0.0.0.0           # toutes interfaces
 
 uv run servers/mcp_weather.py                        # HTTP 127.0.0.1:8766
-uv run servers/mcp_web.py                          # HTTP 127.0.0.1:8768
 uv run servers/mcp_ddg.py                            # HTTP 127.0.0.1:8769
 BRAVE_API_KEY=<key> uv run servers/mcp_brave.py      # HTTP 127.0.0.1:8770
 
-# mcp_docs est un package (pas un script plat) — lancement différent :
+# mcp_web et mcp_docs sont des packages (pas des scripts plats) — lancement différent :
+uv run --directory servers python -m mcp_web         # HTTP 127.0.0.1:8768
 uv run --directory servers python -m mcp_docs        # HTTP 127.0.0.1:8771
 
 # Proxy (agrège tout sur un seul port)
@@ -283,9 +337,9 @@ uv run mcp_proxy.py --config autre.json
 pip install -r requirements.txt
 python servers/mcp_bench.py [options]
 python servers/mcp_weather.py [options]
-python servers/mcp_web.py [options]
 python servers/mcp_ddg.py [options]
 BRAVE_API_KEY=<key> python servers/mcp_brave.py [options]
+python -m mcp_web [options]     # depuis servers/ (package, pas un script plat)
 python -m mcp_docs [options]    # depuis servers/ (package, pas un script plat)
 python mcp_proxy.py [options]
 ```
@@ -387,6 +441,9 @@ isoler le filesystem par test, exercent chaque format (fixtures PDF/xlsx/docx/pp
 générées à la volée par les libs elles-mêmes) via `formats.py` directement, et vérifient
 REF_UNKNOWN à travers le stack proxy réel (InProcessUpstream sur mcp_docs + build_proxy_server),
 pas seulement l'appel direct à l'outil.
+Les tests de mcp_web monkeypatchent `mcp_web.cache.WORKDIR` (fixture `tmp_path`, autouse)
+pour la même raison ; `tests/test_web_structure.py` exerce `mcp_web.structure.extract_structure`
+en isolation (pas de HTTP, pas de cache) sur des fragments HTML construits à la main.
 
 ## Contrat partagé `mcp_docs` ↔ MIAOU (dispatcher, lot A/D6)
 
