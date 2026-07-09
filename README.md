@@ -10,7 +10,7 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 |---|---|---|
 | `servers/mcp_bench.py` | 8765 | Banc d'essai : echo, add, DNS, image PNG, resource JSON |
 | `servers/mcp_weather.py` | 8766 | Météo réelle via wttr.in (resource JSON) |
-| `servers/mcp_web.py` | 8768 | Téléchargement d'URL (HTML→texte, text/*, binaire base64) |
+| `servers/mcp_web.py` | 8768 | Téléchargement d'URL (HTML→texte, text/* et JSON/XML, binaire base64) |
 | `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API |
 | `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) |
 | `servers/mcp_docs/` | 8771 | Extraction PDF/Office/Zip, paginée, sessions par conversation |

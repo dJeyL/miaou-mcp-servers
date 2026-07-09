@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "servers"))
 from mcp import types
 from mcp_web import server as fetch_server
 from mcp_web import cache as mcp_web_cache
+from mcp_web import _is_textual_mime
 
 _TM = fetch_server.mcp._tool_manager
 
@@ -73,7 +74,59 @@ async def test_fetch_json_preserves_mime():
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         result = await _TM.call_tool("fetch_url", {"url": "http://api.example.com/data"})
     assert isinstance(result, types.EmbeddedResource)
+    assert isinstance(result.resource, types.TextResourceContents)
     assert result.resource.mimeType == "application/json"
+    assert '{"ok": true}' in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_json_suffix_mime_returns_text():
+    body = b'{"data": []}'
+    mock_resp = _make_mock_resp(body, "application/vnd.api+json")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_url", {"url": "http://api.example.com/vnd"})
+    assert isinstance(result.resource, types.TextResourceContents)
+    assert result.resource.mimeType == "application/vnd.api+json"
+    assert '{"data": []}' in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_xml_returns_text():
+    body = b"<root><item>1</item></root>"
+    mock_resp = _make_mock_resp(body, "application/xml")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_url", {"url": "http://example.com/data.xml"})
+    assert isinstance(result.resource, types.TextResourceContents)
+    assert result.resource.mimeType == "application/xml"
+    assert "<item>1</item>" in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_svg_xml_suffix_returns_text_not_blob():
+    body = b"<svg><circle r='5'/></svg>"
+    mock_resp = _make_mock_resp(body, "image/svg+xml")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_url", {"url": "http://example.com/icon.svg"})
+    assert isinstance(result.resource, types.TextResourceContents)
+    assert result.resource.mimeType == "image/svg+xml"
+    assert "<circle" in result.resource.text
+
+
+@pytest.mark.parametrize(
+    "mime,expected",
+    [
+        ("text/plain", True),
+        ("application/json", True),
+        ("application/ld+json", True),
+        ("application/vnd.api+json", True),
+        ("image/svg+xml", True),
+        ("image/png", False),
+        ("application/octet-stream", False),
+        ("application/pdf", False),
+    ],
+)
+def test_is_textual_mime(mime, expected):
+    assert _is_textual_mime(mime) is expected
 
 
 @pytest.mark.asyncio

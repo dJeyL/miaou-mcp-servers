@@ -11,10 +11,12 @@ pour permettre au navigateur de l'atteindre directement depuis dist/miaou.html.
 
 Outils exposés :
   - fetch_url(url, max_bytes=5242880) : télécharge une URL ; renvoie texte nettoyé
-    pour HTML, texte brut pour text/*, binaire base64 pour tout le reste. Le texte
-    renvoyé est plafonné à MIAOU_WEB_READ_CAP caractères ; le texte complet (et le
-    HTML brut si applicable) est mis en cache disque (clé = SHA256 de l'URL) pour
-    pagination via fetch_read / extraction de structure via fetch_list.
+    pour HTML, texte brut pour text/* et les mimes textuels structurés
+    (application/json, application/xml, application/javascript, suffixes +json/+xml),
+    binaire base64 pour tout le reste. Le texte renvoyé est plafonné à
+    MIAOU_WEB_READ_CAP caractères ; le texte complet (et le HTML brut si applicable)
+    est mis en cache disque (clé = SHA256 de l'URL) pour pagination via fetch_read /
+    extraction de structure via fetch_list.
   - fetch_read(url, char_start=0, char_end=None) : relit le texte déjà mis en cache
     par un appel fetch_url précédent, sans retélécharger, pour paginer au-delà du cap.
   - fetch_list(url, entry_start=0, entry_end=None) : extrait la structure de navigation
@@ -72,6 +74,26 @@ def _charset_from_content_type(content_type: str) -> str:
         if part.lower().startswith("charset="):
             return part[8:].strip().strip('"')
     return "utf-8"
+
+
+_TEXTUAL_APPLICATION_MIMES = frozenset({
+    "application/json",
+    "application/xml",
+    "application/javascript",
+    "application/ld+json",
+})
+
+
+def _is_textual_mime(mime: str) -> bool:
+    """True si le contenu doit être renvoyé en texte (TextResourceContents)
+    plutôt qu'en blob base64 : text/*, plus les mimes application/* qui sont
+    du texte structuré (JSON, XML, JS) et tout suffixe structuré +json / +xml."""
+    return (
+        mime.startswith("text/")
+        or mime in _TEXTUAL_APPLICATION_MIMES
+        or mime.endswith("+json")
+        or mime.endswith("+xml")
+    )
 
 
 def _cache_and_cap(url: str, full_text: str) -> str:
@@ -144,7 +166,7 @@ class WebServer(MiaouMCPBase):
                         text=_cache_and_cap(url, cleaned),
                     ),
                 )
-            elif mime.startswith("text/"):
+            elif _is_textual_mime(mime):
                 try:
                     text = raw.decode(charset, errors="replace")
                 except LookupError:
@@ -169,14 +191,17 @@ class WebServer(MiaouMCPBase):
                 )
 
         fetch_url.__doc__ = f"""Télécharge une URL et renvoie son contenu : HTML converti
-        en texte (html2text), text/* renvoyé tel quel, binaire (image, etc.)
-        encodé en base64. Téléchargement limité à max_bytes (défaut 5 Mo).
+        en texte (html2text), text/* renvoyé tel quel, mimes textuels structurés
+        (application/json, application/xml, application/javascript, et tout
+        suffixe +json/+xml comme application/vnd.api+json ou image/svg+xml)
+        renvoyés tels quels avec leur mime d'origine préservé, binaire (image,
+        etc.) encodé en base64. Téléchargement limité à max_bytes (défaut 5 Mo).
 
-        Le texte renvoyé (HTML converti ou text/*) est en plus plafonné à
-        {web_cache.READ_CAP} caractères ; le texte complet est conservé pour
-        être relu avec fetch_read(url, char_start=...) sans retélécharger. Pour
-        du HTML, la structure de navigation (headings/liens) est également
-        extractible sans retélécharger via fetch_list(url)."""
+        Le texte renvoyé (HTML converti, text/* ou mime textuel structuré) est
+        en plus plafonné à {web_cache.READ_CAP} caractères ; le texte complet
+        est conservé pour être relu avec fetch_read(url, char_start=...) sans
+        retélécharger. Pour du HTML, la structure de navigation (headings/liens)
+        est également extractible sans retélécharger via fetch_list(url)."""
         self.mcp.tool(name="fetch_url")(fetch_url)
 
         async def fetch_read(
