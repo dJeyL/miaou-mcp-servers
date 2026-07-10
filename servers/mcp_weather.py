@@ -93,6 +93,8 @@ class WeatherServer(MiaouMCPBase):
                 ),
             )
 
+        self.finalize_tools()
+
 
 server = WeatherServer()
 mcp = server.mcp  # exposé pour le proxy in-process

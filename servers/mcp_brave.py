@@ -163,6 +163,8 @@ class BraveServer(MiaouMCPBase):
                 ),
             )
 
+        self.finalize_tools()
+
 
 server = BraveServer()
 mcp = server.mcp  # exposé pour le proxy in-process

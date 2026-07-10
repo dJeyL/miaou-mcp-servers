@@ -503,6 +503,22 @@ Décorer une fonction avec `@self.mcp.tool()` dans le `__init__` du serveur conc
 FastMCP génère le schéma JSON automatiquement depuis la signature Python et la docstring.
 Aucune déclaration manuelle dans un registre.
 
+Chaque serveur appelle `self.finalize_tools()` (défini dans `mcp_base.py`) en dernière
+ligne de son `__init__`, après l'enregistrement de tous les outils — à conserver en
+ajoutant un outil ou un serveur. Cet appel normalise ce que `tools/list` expose :
+`inspect.cleandoc` sur les descriptions (une docstring assignée via
+`func.__doc__ = f"""..."""` partirait sinon sur le wire avec l'indentation source de
+chaque ligne de continuation), et suppression des clés `"title"` auto-générées par
+Pydantic dans les schémas de paramètres (bruit pur, le payload `tools/list` est renvoyé
+au modèle à chaque requête).
+
+Les descriptions d'outils sont volontairement compactes, mais chaque garantie
+comportementale qui y reste est contractuelle (valeurs de caps interpolées, « la plage
+déplace la fenêtre, ne lève pas le cap », exclusivité char/ligne, exclusion xlsx de la
+pagination, labels de `search` réutilisables comme selectors, niveau unique d'imbrication
+zip) : ne pas les couper pour gagner des tokens, le modèle appelant les prend au pied de
+la lettre.
+
 ### Faire apparaître une valeur d'environnement résolue dans une docstring d'outil
 
 Si la description d'un outil doit citer la valeur *active* d'une constante dérivée d'une

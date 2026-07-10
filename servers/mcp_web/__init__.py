@@ -206,17 +206,15 @@ class WebServer(MiaouMCPBase):
                 )
 
         fetch_url.__doc__ = f"""Télécharge une URL et renvoie son contenu : HTML converti
-        en texte (html2text), text/* renvoyé tel quel, mimes textuels structurés
-        (application/json, application/xml, application/javascript, et tout
-        suffixe +json/+xml comme application/vnd.api+json ou image/svg+xml)
-        renvoyés tels quels avec leur mime d'origine préservé, binaire (image,
-        etc.) encodé en base64. Téléchargement limité à max_bytes (défaut 5 Mo).
+        en texte, mimes textuels (text/*, JSON, XML, JavaScript, suffixes
+        +json/+xml) renvoyés tels quels avec leur mime d'origine, binaire
+        (image, etc.) encodé en base64. Téléchargement limité à max_bytes
+        (défaut 5 Mo).
 
-        Le texte renvoyé (HTML converti, text/* ou mime textuel structuré) est
-        en plus plafonné à {web_cache.READ_CAP} caractères ; le texte complet
-        est conservé pour être relu avec fetch_read(url, char_start=...) sans
-        retélécharger. Pour du HTML, la structure de navigation (headings/liens)
-        est également extractible sans retélécharger via fetch_list(url)."""
+        Le texte renvoyé est en plus plafonné à {web_cache.READ_CAP} caractères ;
+        le texte complet est conservé en cache — paginer avec
+        fetch_read(url, char_start=...) sans retélécharger, et pour du HTML,
+        extraire la structure de navigation (headings/liens) via fetch_list(url)."""
         self.mcp.tool(name="fetch_url")(fetch_url)
 
         async def fetch_read(
@@ -247,13 +245,12 @@ class WebServer(MiaouMCPBase):
                 )
             return excerpt + note
 
-        fetch_read.__doc__ = f"""Relit un extrait du texte déjà téléchargé par un appel
-        fetch_url précédent sur cette URL, sans retélécharger. char_start (offset
-        caractère, 0-indexé) et char_end (optionnel, exclusif) permettent de
-        paginer au-delà de la limite de fetch_url. Chaque appel reste plafonné à
-        {web_cache.READ_CAP} caractères — char_end ne lève pas ce cap, il déplace
-        la fenêtre ; la notice indique l'offset suivant à demander. Erreur si
-        l'URL n'a jamais été récupérée via fetch_url, ou si le cache a expiré."""
+        fetch_read.__doc__ = f"""Relit le texte déjà téléchargé par fetch_url sur cette URL,
+        sans retélécharger. char_start (offset caractère, 0-indexé) et char_end
+        (optionnel, exclusif) déplacent la fenêtre de lecture ; chaque appel
+        reste plafonné à {web_cache.READ_CAP} caractères (char_end ne lève pas
+        ce cap), la notice de fin indique l'offset suivant. Erreur si l'URL n'a
+        jamais été récupérée via fetch_url, ou si le cache a expiré."""
         self.mcp.tool(name="fetch_read")(fetch_read)
 
         async def fetch_list(
@@ -299,15 +296,16 @@ class WebServer(MiaouMCPBase):
             return "\n".join(lines) + note
 
         fetch_list.__doc__ = f"""Extrait la structure de navigation (headings h1-h6 et
-        liens, dans l'ordre d'apparition sur la page) du HTML déjà téléchargé par
-        un appel fetch_url précédent sur cette URL, sans retélécharger. Chaque
-        entrée est numérotée (index 0-indexé, stable d'un appel à l'autre) ;
-        entry_start/entry_end (exclusif) paginent au-delà du cap de
-        {web_cache.LIST_CAP} entrées par appel — entry_end ne lève pas ce cap, il
-        déplace la fenêtre. Uniquement pertinent pour une URL dont fetch_url a
-        renvoyé du HTML (text/html) ; erreur claire sinon, ou si l'URL n'a jamais
-        été récupérée, ou si le cache a expiré."""
+        liens, dans l'ordre de la page) du HTML déjà téléchargé par fetch_url
+        sur cette URL, sans retélécharger. Entrées numérotées (index 0-indexé,
+        stable) ; entry_start/entry_end (exclusif) déplacent la fenêtre, chaque
+        appel reste plafonné à {web_cache.LIST_CAP} entrées (entry_end ne lève
+        pas ce cap). Uniquement pour une URL dont fetch_url a renvoyé du HTML ;
+        erreur claire sinon, ou si l'URL n'a jamais été récupérée, ou si le
+        cache a expiré."""
         self.mcp.tool(name="fetch_list")(fetch_list)
+
+        self.finalize_tools()
 
 
 server = WebServer()

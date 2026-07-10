@@ -107,6 +107,8 @@ class BenchServer(MiaouMCPBase):
                 ),
             )
 
+        self.finalize_tools()
+
 
 server = BenchServer()
 mcp = server.mcp  # exposé pour le proxy in-process

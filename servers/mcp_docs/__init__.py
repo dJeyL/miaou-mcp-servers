@@ -199,25 +199,23 @@ class DocsServer(MiaouMCPBase):
 
             return await asyncio.to_thread(read_document, kind, doc_path, selector, rng)
 
-        read.__doc__ = f"""Lit un extrait borné d'un document (plage de pages/lignes/slides/
-        paragraphes selon le format). Réponse plafonnée à {READ_CAP}
-        caractères, troncature signalée explicitement. Sans selector sur un
-        document multi-unités, renvoie la première unité + notice — jamais
-        le document entier. `path` lit un membre de zip par chemin (texte
-        brut, ou extrait structuré via `selector` si le membre est lui-même
-        un docx/xlsx/pptx/pdf — un seul niveau d'imbrication supporté).
+        read.__doc__ = f"""Lit un extrait borné d'un document (page/feuille/slide/section
+        selon le format). Réponse plafonnée à {READ_CAP} caractères,
+        troncature signalée. Sans selector sur un document multi-unités,
+        renvoie la première unité + notice — jamais le document entier.
+        `path` lit un membre de zip par chemin (texte brut, ou via `selector`
+        si le membre est lui-même un docx/xlsx/pptx/pdf — un seul niveau
+        d'imbrication).
 
-        Pour dépasser la limite de {READ_CAP} caractères sur une unité
-        volumineuse, paginer avec une plage sur le texte extrait :
-        `char_start`/`char_end` (offset caractère, `char_start` obligatoire,
-        `char_end` optionnel) OU `line_start`/`line_end` (numéro de ligne
-        1-indexé, `line_start` obligatoire, `line_end` optionnel inclusif).
-        Les deux modes sont exclusifs entre eux. La plage porte sur le texte
-        que `read` produirait pour l'unité sélectionnée (donc combinable avec
-        `selector` : « lignes 500-800 de la page 3 »). Chaque appel reste
-        plafonné à {READ_CAP} caractères — la plage déplace la fenêtre, la
-        notice indique l'offset suivant à demander. Non applicable à un xlsx
-        (grille : utiliser un selector 'Feuille!A1:C10')."""
+        Pour lire une unité au-delà de {READ_CAP} caractères, paginer avec
+        `char_start`/`char_end` (offset caractère) OU `line_start`/`line_end`
+        (1-indexé, inclusif) — modes exclusifs, `*_start` obligatoire,
+        `*_end` optionnel. La plage porte sur le texte produit pour l'unité
+        sélectionnée (combinable avec `selector` : « lignes 500-800 de la
+        page 3 »). Chaque appel reste plafonné à {READ_CAP} caractères : la
+        plage déplace la fenêtre, la notice indique l'offset suivant. Non
+        applicable à un xlsx (grille : utiliser un selector
+        'Feuille!A1:C10')."""
         self.mcp.tool(name="read")(read)
 
         async def search(
@@ -245,29 +243,28 @@ class DocsServer(MiaouMCPBase):
 
             return render_results(kind, query, unit_results, SEARCH_CAP)
 
-        search.__doc__ = f"""Cherche du texte dans un document et renvoie les occurrences
-        groupées par unité (page/feuille/slide/membre zip), avec un
-        extrait de contexte par occurrence. Chaque unité est étiquetée par
-        un label directement réutilisable comme selector de `read` (ou
-        comme `path` pour un membre de zip) — un hit peut être relu en
-        détail avec un second appel ciblé.
+        search.__doc__ = f"""Cherche du texte dans un document, occurrences groupées par
+        unité (page/feuille/slide/membre zip) avec un extrait de contexte
+        par occurrence. Chaque label d'unité est réutilisable tel quel
+        comme selector de `read` (ou `path` pour un membre de zip) pour
+        relire un hit en détail.
 
-        Syntaxe de la requête : des termes séparés par des espaces sont
-        tous requis (ET implicite) ; `"une phrase entre guillemets"`
-        cherche cette séquence exacte. Pas d'opérateurs OU/NON/parenthèses
-        — composer plusieurs appels ou filtrer les résultats soi-même si
-        besoin. Insensible à la casse et aux accents. Une phrase exacte ne
-        matche pas si elle est à cheval sur deux unités (page/section/…).
+        Requête : des termes séparés par des espaces sont tous requis (ET
+        implicite) ; `"une phrase entre guillemets"` cherche cette séquence
+        exacte. Pas d'opérateurs OU/NON/parenthèses — composer plusieurs
+        appels. Insensible à la casse et aux accents. Une phrase exacte ne
+        matche pas à cheval sur deux unités.
 
-        Réponse plafonnée à {SEARCH_CAP} occurrences au total,
-        troncature signalée explicitement.
+        Réponse plafonnée à {SEARCH_CAP} occurrences au total, troncature
+        signalée.
 
-        Dans une archive zip, seuls les membres texte brut sont cherchés ;
-        les membres reconnus comme documents structurés (docx/xlsx/pptx/pdf),
-        chiffrés ou binaires ne sont pas balayés (signalé en fin de
-        résultat). Sans `path`, tous les membres texte de l'archive sont
-        cherchés ; avec `path`, la recherche est restreinte à ce membre."""
+        Dans un zip, seuls les membres texte brut sont cherchés ; les
+        membres docx/xlsx/pptx/pdf, chiffrés ou binaires ne sont pas
+        balayés (signalé en fin de résultat). Sans `path`, tous les membres
+        texte ; avec `path`, ce seul membre."""
         self.mcp.tool(name="search")(search)
+
+        self.finalize_tools()
 
 
 server = DocsServer()

@@ -147,6 +147,8 @@ class DDGServer(MiaouMCPBase):
                 ),
             )
 
+        self.finalize_tools()
+
 
 server = DDGServer()
 mcp = server.mcp  # exposé pour le proxy in-process

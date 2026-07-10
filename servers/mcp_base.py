@@ -6,6 +6,7 @@ whose own PEP 723 blocks declare the shared dependencies.
 """
 
 import argparse
+import inspect
 import os
 import sys
 import urllib.request
@@ -22,6 +23,28 @@ from starlette.middleware.cors import CORSMiddleware
 # sans jamais signaler l'anomalie. Passage en extra="forbid" pour transformer ça en
 # erreur de validation explicite, avant même l'exécution de l'outil.
 ArgModelBase.model_config["extra"] = "forbid"
+
+
+def _strip_schema_titles(schema: object) -> None:
+    """Supprime récursivement les clés "title" auto-générées par Pydantic dans un
+    schéma JSON de paramètres ("Char Start", "readArguments", ...) : elles ne portent
+    aucune information que le nom du paramètre ne donne déjà, et gonflent le payload
+    tools/list envoyé au modèle à chaque requête. Les dicts sous "properties" et
+    "$defs" sont des maps nom→sous-schéma : leurs clés sont des noms (un paramètre
+    peut s'appeler "title"), seules leurs valeurs sont des schémas à nettoyer."""
+    if isinstance(schema, list):
+        for item in schema:
+            _strip_schema_titles(item)
+        return
+    if not isinstance(schema, dict):
+        return
+    schema.pop("title", None)
+    for key, value in schema.items():
+        if key in ("properties", "$defs") and isinstance(value, dict):
+            for sub_schema in value.values():
+                _strip_schema_titles(sub_schema)
+        else:
+            _strip_schema_titles(value)
 
 
 def make_opener() -> urllib.request.OpenerDirector:
@@ -50,6 +73,8 @@ class MiaouMCPBase:
                 @self.mcp.tool()
                 async def my_tool(...): ...
 
+                self.finalize_tools()  # dernier appel du __init__
+
         server = MyServer()
         mcp = server.mcp  # expose for in-process proxy use
 
@@ -61,6 +86,22 @@ class MiaouMCPBase:
         self.default_port = default_port
         _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
         self.mcp = FastMCP(name, transport_security=_security)
+
+    def finalize_tools(self) -> None:
+        """Normalise ce que tools/list expose, pour réduire le payload envoyé au
+        modèle à chaque requête. À appeler en dernière ligne du __init__ de chaque
+        serveur, après l'enregistrement de tous les outils. Idempotent.
+
+        - Descriptions : inspect.cleandoc — une docstring assignée à la main
+          (`func.__doc__ = f\"\"\"...\"\"\"`, pattern des caps interpolés) part sinon
+          sur le wire avec l'indentation source de chaque ligne de continuation.
+        - Schémas de paramètres : suppression des "title" auto-générés par Pydantic
+          (voir _strip_schema_titles).
+        """
+        for tool in self.mcp._tool_manager._tools.values():
+            if tool.description:
+                tool.description = inspect.cleandoc(tool.description)
+            _strip_schema_titles(tool.parameters)
 
     def _make_app(self):
         """Build the Starlette ASGI app with CORS middleware."""
