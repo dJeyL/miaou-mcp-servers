@@ -10,7 +10,7 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 |---|---|---|
 | `servers/mcp_bench.py` | 8765 | Banc d'essai : echo, add, DNS, image PNG, resource JSON |
 | `servers/mcp_weather.py` | 8766 | Météo réelle via wttr.in (resource JSON) |
-| `servers/mcp_web.py` | 8768 | Téléchargement d'URL (HTML→texte, text/* et JSON/XML, binaire base64) |
+| `servers/mcp_web/` | 8768 | Téléchargement d'URL (HTML→texte, text/* et JSON/XML, binaire base64), package |
 | `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API |
 | `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) |
 | `servers/mcp_docs/` | 8771 | Extraction PDF/Office/Zip, paginée, sessions par conversation |
@@ -35,11 +35,11 @@ pip install -r requirements.txt
 ```bash
 uv run servers/mcp_bench.py                   # HTTP 127.0.0.1:8765
 uv run servers/mcp_weather.py                 # HTTP 127.0.0.1:8766
-uv run servers/mcp_web.py                   # HTTP 127.0.0.1:8768
 uv run servers/mcp_ddg.py                     # HTTP 127.0.0.1:8769
 BRAVE_API_KEY=<key> uv run servers/mcp_brave.py  # HTTP 127.0.0.1:8770
 
-# mcp_docs est un package (pas un script plat) — lancement différent :
+# mcp_web et mcp_docs sont des packages (pas des scripts plats) — lancement différent :
+uv run --directory servers python -m mcp_web  # HTTP 127.0.0.1:8768
 uv run --directory servers python -m mcp_docs # HTTP 127.0.0.1:8771
 
 uv run servers/mcp_bench.py --transport stdio # mode stdio
@@ -145,14 +145,16 @@ miaou-mcp-servers/
 │   ├── mcp_base.py       # classe de base + make_opener() proxy-aware
 │   ├── mcp_bench.py      # banc d'essai (port 8765)
 │   ├── mcp_weather.py    # météo wttr.in (port 8766)
-│   ├── mcp_web.py      # fetch URL (port 8768)
+│   ├── mcp_web/          # fetch URL (port 8768), package
 │   ├── mcp_ddg.py        # recherche DDG (port 8769)
 │   ├── mcp_brave.py      # recherche Brave (port 8770)
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package
 ├── tests/
+│   ├── __init__.py
 │   ├── test_bench.py
 │   ├── test_weather.py
 │   ├── test_web.py
+│   ├── test_web_structure.py
 │   ├── test_ddg.py
 │   ├── test_brave.py
 │   ├── test_docs.py

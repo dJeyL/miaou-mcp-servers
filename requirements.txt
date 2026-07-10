@@ -1,4 +1,4 @@
-# Dépendances runtime — suffisantes pour lancer les trois serveurs.
+# Dépendances runtime — suffisantes pour lancer tous les serveurs.
 # Avec uv : uv run <script> installe automatiquement depuis le bloc PEP 723.
 # Avec pip : pip install -r requirements.txt
 

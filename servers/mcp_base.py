@@ -25,12 +25,17 @@ ArgModelBase.model_config["extra"] = "forbid"
 
 
 def make_opener() -> urllib.request.OpenerDirector:
-    """Construit un opener urllib proxy-aware (lit http_proxy / HTTP_PROXY)."""
-    proxy_url = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
-    if proxy_url:
-        return urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-        )
+    """Construit un opener urllib proxy-aware (lit http_proxy/https_proxy, en
+    majuscules ou minuscules, chaque variable mappée sur son propre scheme)."""
+    http_proxy = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+    https_proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+    proxies = {}
+    if http_proxy:
+        proxies["http"] = http_proxy
+    if https_proxy:
+        proxies["https"] = https_proxy
+    if proxies:
+        return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
     return urllib.request.build_opener()
 
 
@@ -92,7 +97,14 @@ class MiaouMCPBase:
 
         if positional:
             host = args_raw[0] if len(args_raw) > 0 else "127.0.0.1"
-            port = int(args_raw[1]) if len(args_raw) > 1 else self.default_port
+            if len(args_raw) > 1:
+                try:
+                    port = int(args_raw[1])
+                except ValueError:
+                    print(f"Erreur : port invalide '{args_raw[1]}' (entier attendu)", file=sys.stderr)
+                    sys.exit(1)
+            else:
+                port = self.default_port
             self.run_http(host, port)
             return
 

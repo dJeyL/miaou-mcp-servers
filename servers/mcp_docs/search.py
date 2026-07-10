@@ -82,6 +82,10 @@ class Hit:
 def match_unit(raw_text: str, query: Query) -> list[Hit]:
     """AND implicite : tous les termes de `query` doivent apparaître dans
     `raw_text` (folded pour la comparaison), sinon aucun hit n'est renvoyé.
+    Chaque terme est compté par **toutes** ses occurrences (pas seulement la
+    première) : la liste renvoyée est le vrai décompte d'occurrences de l'unité,
+    trié par offset croissant pour que les snippets sortent dans l'ordre du texte
+    (plusieurs occurrences d'un même terme forment plusieurs Hit distincts).
     Les offsets renvoyés pointent dans `raw_text` non foldé (folding préserve
     la longueur caractère à caractère à l'exception des ligatures/diacritiques
     composés, donc on refolde terme par terme pour retrouver la position brute
@@ -94,10 +98,16 @@ def match_unit(raw_text: str, query: Query) -> list[Hit]:
         folded_term = fold(term)
         if not folded_term:
             continue
+        term_len = len(folded_term)
         pos = folded_text.find(folded_term)
         if pos == -1:
+            # AND-gate : un terme absent invalide toute l'unité.
             return []
-        hits.append(Hit(term=term, offset=pos, length=len(folded_term)))
+        # Toutes les occurrences non chevauchantes de ce terme.
+        while pos != -1:
+            hits.append(Hit(term=term, offset=pos, length=term_len))
+            pos = folded_text.find(folded_term, pos + term_len)
+    hits.sort(key=lambda h: h.offset)
     return hits
 
 
@@ -131,7 +141,8 @@ class UnitResult:
 
 
 def snippets_for_unit(raw_text: str, query: Query, radius: int = 80) -> list[str]:
-    """Un snippet par terme/phrase matché, dans l'ordre de `query.terms`."""
+    """Un snippet par occurrence matchée, dans l'ordre d'apparition dans le texte
+    (toutes occurrences de tous les termes, cf. `match_unit`)."""
     hits = match_unit(raw_text, query)
     return [make_snippet(raw_text, h.offset, h.length, radius) for h in hits]
 

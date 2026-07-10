@@ -39,7 +39,9 @@ class _StructureParser(HTMLParser):
             self._heading_chunks = []
         elif tag == "a" and self._link_url is None:
             href = next((v for k, v in attrs if k == "href"), None)
-            if href:
+            # Bruit de navigation sans intérêt dans un sommaire (W11) : ancre
+            # de page (#section) et pseudo-URL non naviguable (javascript:).
+            if href and not href.startswith("#") and not href.lower().startswith("javascript:"):
                 self._link_url = href
                 self._link_chunks = []
 

@@ -134,6 +134,36 @@ def test_tool_list_contains_brave_search():
     assert "brave_search" in names
 
 
+@pytest.mark.asyncio
+async def test_brave_search_count_clamped_to_20():
+    """B12 : count doit être clampé symétriquement à web et images (l'API
+    Brave web plafonne aussi à 20, 422 au-delà)."""
+    captured = {}
+
+    def capturing_open(self, req, *args, **kwargs):
+        captured["url"] = req.full_url if hasattr(req, "full_url") else str(req)
+        return _make_mock_resp({"web": {"results": []}})
+
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
+         patch("urllib.request.OpenerDirector.open", capturing_open):
+        await _TM.call_tool("brave_search", {"query": "python", "count": 50})
+    assert "count=20" in captured["url"]
+
+
+@pytest.mark.asyncio
+async def test_brave_search_count_clamped_to_1():
+    captured = {}
+
+    def capturing_open(self, req, *args, **kwargs):
+        captured["url"] = req.full_url if hasattr(req, "full_url") else str(req)
+        return _make_mock_resp({"web": {"results": []}})
+
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
+         patch("urllib.request.OpenerDirector.open", capturing_open):
+        await _TM.call_tool("brave_search", {"query": "python", "count": 0})
+    assert "count=1" in captured["url"]
+
+
 # ── brave_image_search ────────────────────────────────────────────────────────
 
 _BRAVE_IMAGES_RESPONSE = {
@@ -263,3 +293,27 @@ async def test_image_search_url_error_returns_string():
 def test_tool_list_contains_brave_image_search():
     names = {t.name for t in _TM.list_tools()}
     assert "brave_image_search" in names
+
+
+@pytest.mark.asyncio
+async def test_image_search_handles_null_thumbnail():
+    """B13 : "thumbnail": null (pas absent, explicitement null) ne doit pas
+    lever AttributeError — .get() ne protège que l'absence de clé."""
+    response = {
+        "results": [
+            {
+                "title": "No thumbnail",
+                "url": "https://example.com/page",
+                "source": "example.com",
+                "thumbnail": None,
+                "properties": {"url": "https://example.com/img.png"},
+            }
+        ]
+    }
+    mock_resp = _make_mock_resp(response)
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
+         patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+    items = json.loads(result.resource.text)
+    assert len(items) == 1
+    assert items[0]["thumbnail_url"] == ""

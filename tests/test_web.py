@@ -1,6 +1,8 @@
 """Tests unitaires pour servers/mcp_web/ (package)."""
 import base64
+import os
 import sys
+import time
 import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -276,12 +278,17 @@ async def test_fetch_list_paginates_and_caches_structure(monkeypatch):
     first = await _TM.call_tool("fetch_list", {"url": "http://example.com/paged-list"})
     assert "entry_start=2" in first
 
-    # Reparse déjà mise en cache (structure.json) : on force le HTML en cache à une
-    # valeur incohérente pour prouver que fetch_list ne reparse pas au second appel.
-    mcp_web_cache.store_html("http://example.com/paged-list", "<html></html>")
-    second = await _TM.call_tool(
-        "fetch_list", {"url": "http://example.com/paged-list", "entry_start": 2}
-    )
+    # Le second appel doit relire la structure déjà mise en cache sans reparser
+    # le HTML (extract_structure non ré-invoqué) — le nom est importé localement
+    # dans mcp_web/__init__.py (from .structure import extract_structure), on
+    # patche donc la référence du module package, pas mcp_web.structure.
+    import mcp_web
+
+    with patch.object(mcp_web, "extract_structure") as mock_extract:
+        second = await _TM.call_tool(
+            "fetch_list", {"url": "http://example.com/paged-list", "entry_start": 2}
+        )
+    mock_extract.assert_not_called()
     assert "Sous-section" in second or "Lien" in second
 
 
@@ -290,6 +297,19 @@ async def test_fetch_list_unknown_url_returns_clear_message():
     result = await _TM.call_tool("fetch_list", {"url": "http://never-fetched.example.com"})
     assert isinstance(result, str)
     assert "fetch_url" in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_list_on_non_html_url_returns_distinct_message():
+    """W3 : une URL récupérée mais non-HTML doit produire un message distinct
+    de "jamais récupérée" — rappeler fetch_url ne changerait rien."""
+    mock_resp = _make_mock_resp(b"texte brut", "text/plain")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/plain.txt"})
+
+    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/plain.txt"})
+    assert isinstance(result, str)
+    assert "n'a pas renvoyé du HTML" in result
 
 
 @pytest.mark.asyncio
@@ -302,3 +322,81 @@ async def test_fetch_list_rejects_invalid_range():
         "fetch_list", {"url": "http://example.com/small-list", "entry_start": -1}
     )
     assert "entry_start" in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_rejects_file_scheme():
+    """W1 : file:// ne doit jamais être ouvert par l'opener (exfiltration
+    locale possible via navigateur, CORS ouvert + pas d'auth)."""
+    result = await _TM.call_tool("fetch_url", {"url": "file:///etc/hosts"})
+    assert isinstance(result, str)
+    assert "schéma" in result.lower() or "autorisé" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_rejects_ftp_scheme():
+    result = await _TM.call_tool("fetch_url", {"url": "ftp://example.com/file"})
+    assert isinstance(result, str)
+    assert "schéma" in result.lower() or "autorisé" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_rejects_non_positive_max_bytes():
+    result = await _TM.call_tool("fetch_url", {"url": "http://example.com", "max_bytes": 0})
+    assert isinstance(result, str)
+    assert "max_bytes" in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_read_touches_html_and_structure_mtime(monkeypatch):
+    """W6 : un accès via fetch_read doit aussi rafraîchir le mtime de .html et
+    .json de la même clé, pas seulement .txt — sinon ces fichiers expirent
+    pendant que le texte reste vivant, et fetch_list échoue ensuite à tort."""
+    mock_resp = _make_mock_resp(_STRUCTURED_HTML, "text/html; charset=utf-8")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/touch-all"})
+    await _TM.call_tool("fetch_list", {"url": "http://example.com/touch-all"})
+
+    old_time = time.time() - 1000
+    for path in (
+        mcp_web_cache.entry_path("http://example.com/touch-all"),
+        mcp_web_cache.html_path("http://example.com/touch-all"),
+        mcp_web_cache.structure_path("http://example.com/touch-all"),
+    ):
+        os.utime(path, (old_time, old_time))
+
+    await _TM.call_tool("fetch_read", {"url": "http://example.com/touch-all"})
+
+    for path in (
+        mcp_web_cache.html_path("http://example.com/touch-all"),
+        mcp_web_cache.structure_path("http://example.com/touch-all"),
+    ):
+        assert path.stat().st_mtime > old_time
+
+
+def test_env_int_invalid_value_raises_named_error(monkeypatch):
+    """W8/D2 : une variable d'environnement non numérique doit lever une
+    erreur nommant la variable, pas un ValueError anonyme à l'import."""
+    monkeypatch.setenv("MIAOU_WEB_READ_CAP", "not-a-number")
+    with pytest.raises(ValueError, match="MIAOU_WEB_READ_CAP"):
+        mcp_web_cache._env_int("MIAOU_WEB_READ_CAP", 20000)
+
+
+@pytest.mark.asyncio
+async def test_fetch_list_reflects_new_html_after_refetch():
+    """W2 : un re-fetch doit invalider la structure déjà extraite, sinon
+    fetch_list resservirait des headings/liens périmés."""
+    first_html = b"<html><body><h1>Ancien titre</h1></body></html>"
+    mock_resp_1 = _make_mock_resp(first_html, "text/html; charset=utf-8")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_1):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/refetch"})
+    await _TM.call_tool("fetch_list", {"url": "http://example.com/refetch"})
+
+    second_html = b"<html><body><h1>Nouveau titre</h1></body></html>"
+    mock_resp_2 = _make_mock_resp(second_html, "text/html; charset=utf-8")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_2):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/refetch"})
+
+    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/refetch"})
+    assert "Nouveau titre" in result
+    assert "Ancien titre" not in result

@@ -74,6 +74,12 @@ def test_validate_session_id_accepts_normal_id():
     assert validate_session_id("conv-123") == "conv-123"
 
 
+def test_validate_session_id_rejects_dot(workdir):
+    """D1 : "." == WORKDIR lui-même — sans ce rejet, drop_session(".") efface tout."""
+    with pytest.raises(ToolError):
+        validate_session_id(".")
+
+
 def test_validate_ref_accepts_att_n():
     assert validate_ref("att-1") == "att-1"
     assert validate_ref("att-42") == "att-42"
@@ -404,11 +410,14 @@ def test_pdf_list_no_outline(tmp_path):
 
 
 def test_pdf_read_without_selector_returns_first_page_only(tmp_path):
+    """F6 : la notice doit refléter une pagination par page, pas une
+    troncature de caractères (rien n'est tronqué ici)."""
     path = _make_pdf(tmp_path, ["First page text", "Second page text"])
     result = read_document("pdf", path, None)
     assert "First page text" in result
     assert "Second page text" not in result
-    assert "Tronqué" in result
+    assert "seule servie" in result
+    assert "selector='2-2'" in result
 
 
 def test_pdf_read_with_range_selector(tmp_path):
@@ -454,6 +463,33 @@ def test_pdf_search_no_match_returns_empty(tmp_path):
     assert results == []
 
 
+def test_pdf_read_non_numeric_selector_raises_clear_error(tmp_path):
+    """F1 : un selector non numérique (ex. un titre de heading docx envoyé par
+    erreur sur un pdf) doit lever ToolError, pas un ValueError brut."""
+    path = _make_pdf(tmp_path, ["Page one"])
+    with pytest.raises(ToolError, match="selector"):
+        read_document("pdf", path, "Introduction")
+
+
+def test_pdf_read_empty_document_reports_clear_message(tmp_path):
+    """F2 : un pdf sans page ne doit pas lever IndexError. pymupdf refuse de
+    sauvegarder un document à 0 page (ValueError "cannot save with zero
+    pages") — on exerce donc la garde directement via pdf_read plutôt que
+    via une fixture disque, en mockant doc.page_count à 0."""
+    from unittest.mock import MagicMock, patch
+
+    from mcp_docs.formats import pdf_read
+
+    fake_doc = MagicMock()
+    fake_doc.page_count = 0
+    fake_doc.__enter__ = lambda s: fake_doc
+    fake_doc.__exit__ = MagicMock(return_value=False)
+
+    with patch("fitz.open", return_value=fake_doc):
+        result = pdf_read(tmp_path / "empty.pdf", None)
+    assert "sans aucune page" in result
+
+
 # ---------------------------------------------------------------------------
 # XLSX (openpyxl)
 # ---------------------------------------------------------------------------
@@ -493,6 +529,14 @@ def test_xlsx_read_max_rows_default_truncates(tmp_path):
     assert "Tronqué à 200 lignes" in result
 
 
+def test_xlsx_read_invalid_cell_range_raises_clear_error(tmp_path):
+    """F4 : une plage de cellules invalide doit lever ToolError, pas un
+    ValueError openpyxl brut."""
+    path = _make_xlsx(tmp_path, {"Data": [["a", "b"]]})
+    with pytest.raises(ToolError, match="Plage de cellules"):
+        read_document("xlsx", path, "Data!ceci n'est pas une plage")
+
+
 def test_xlsx_read_unknown_sheet_raises(tmp_path):
     path = _make_xlsx(tmp_path, {"S1": [["a"]]})
     with pytest.raises(ToolError, match="Feuille inconnue"):
@@ -508,6 +552,20 @@ def test_xlsx_search_finds_match_with_cell_label(tmp_path):
     assert len(results) == 1
     assert results[0].label == "Data"
     assert any("Data!A1" in s for s in results[0].snippets)
+
+
+def test_xlsx_search_counts_occurrences_but_one_snippet_per_cell(tmp_path):
+    """D6 sur xlsx : hit_count somme les occurrences réelles (ici "chat" ×2
+    dans une même cellule + ×1 dans une autre = 3), mais on garde un snippet
+    par cellule matchée pour que le label reste un selector `read` atomique."""
+    from mcp_docs.formats import xlsx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_xlsx(tmp_path, {"Data": [["chat et chat", "chat"]]})
+    results = xlsx_search(path, parse_query("chat"))
+    assert len(results) == 1
+    assert results[0].hit_count == 3
+    assert len(results[0].snippets) == 2  # deux cellules matchées
 
 
 def test_xlsx_search_round_trip_label_to_read_selector(tmp_path):
@@ -591,6 +649,32 @@ def _make_docx(tmp_path, structure, tables=None):
     path = tmp_path / "doc.docx"
     d.save(str(path))
     return path
+
+
+def _make_docx_with_french_heading_style(tmp_path, title_text):
+    """F9 : simule un docx dont le style de heading est nommé 'Titre N'
+    (nom canonique parfois exposé par un Word francophone), plutôt que le
+    nom anglais 'Heading N' que add_heading() applique toujours."""
+    import docx
+    from docx.enum.style import WD_STYLE_TYPE
+
+    d = docx.Document()
+    styles = d.styles
+    if "Titre 1" not in [s.name for s in styles]:
+        french_style = styles.add_style("Titre 1", WD_STYLE_TYPE.PARAGRAPH)
+        french_style.base_style = styles["Heading 1"]
+    para = d.add_paragraph(title_text)
+    para.style = d.styles["Titre 1"]
+    path = tmp_path / "doc_fr.docx"
+    d.save(str(path))
+    return path
+
+
+def test_docx_list_reports_french_heading_style(tmp_path):
+    path = _make_docx_with_french_heading_style(tmp_path, "Introduction")
+    result = list_document("docx", path)
+    assert "Introduction" in result
+    assert "pas de heading" not in result
 
 
 def test_docx_list_reports_headings(tmp_path):
@@ -732,15 +816,32 @@ def test_docx_search_matches_table_content(tmp_path):
 
 
 def test_docx_search_multiple_terms_in_same_section(tmp_path):
-    """hit_count reflète le nombre de termes de la requête matchés dans
-    l'unité (un snippet par terme), pas le nombre brut d'occurrences."""
+    """hit_count compte toutes les occurrences des termes dans l'unité (un
+    snippet par occurrence), pas le nombre de termes distincts matchés."""
     from mcp_docs.formats import docx_search
     from mcp_docs.search import parse_query
 
     path = _make_docx(tmp_path, [(1, "Chats"), (None, "chat noir"), (None, "chat blanc")])
     results = docx_search(path, parse_query("noir blanc"))
     assert len(results) == 1
+    # "noir" ×1 + "blanc" ×1 = 2 occurrences (une section unique concaténant tout).
     assert results[0].hit_count == 2
+
+
+def test_docx_search_counts_repeated_occurrences(tmp_path):
+    """Un terme répété plusieurs fois dans la même unité compte pour autant
+    d'occurrences (régression D6 : avant, seule la première comptait)."""
+    from mcp_docs.formats import docx_search
+    from mcp_docs.search import parse_query
+
+    path = _make_docx(
+        tmp_path,
+        [(1, "Animaux"), (None, "chat noir"), (None, "chat blanc"), (None, "chat gris")],
+    )
+    results = docx_search(path, parse_query("chat"))
+    assert len(results) == 1
+    assert results[0].hit_count == 3
+    assert len(results[0].snippets) == 3
 
 
 def test_docx_sections_factorization_does_not_break_docx_read(tmp_path):
@@ -780,10 +881,12 @@ def test_pptx_list_reports_slide_count_and_titles(tmp_path):
 
 
 def test_pptx_read_without_selector_first_slide_only(tmp_path):
+    """F6 : idem pdf, notice de pagination par slide plutôt que "Tronqué"."""
     path = _make_pptx(tmp_path, ["Intro", "Details"])
     result = read_document("pptx", path, None)
     assert "Intro" in result
-    assert "Tronqué" in result
+    assert "seule servie" in result
+    assert "selector='2-2'" in result
 
 
 def test_pptx_read_with_range(tmp_path):
@@ -820,6 +923,25 @@ def test_pptx_search_no_match_returns_empty(tmp_path):
     path = _make_pptx(tmp_path, ["Rien de pertinent"])
     results = pptx_search(path, parse_query("introuvable"))
     assert results == []
+
+
+def test_pptx_read_non_numeric_selector_raises_clear_error(tmp_path):
+    """F1 : même garde que pdf_read pour un selector non numérique."""
+    path = _make_pptx(tmp_path, ["Intro"])
+    with pytest.raises(ToolError, match="selector"):
+        read_document("pptx", path, "Introduction")
+
+
+def test_pptx_read_empty_document_reports_clear_message(tmp_path):
+    """F2 : une pptx sans slide (le template par défaut en a zéro) ne doit
+    pas lever IndexError."""
+    from pptx import Presentation
+
+    prs = Presentation()
+    path = tmp_path / "empty.pptx"
+    prs.save(str(path))
+    result = read_document("pptx", path, None)
+    assert "sans aucune slide" in result
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +992,31 @@ def test_read_document_zip_without_path_raises():
         read_document("zip", Path("/nonexistent"), None)
 
 
+def _make_corrupt_zip(tmp_path):
+    """Magic bytes PK valides (détecté comme 'zip' par sniff), mais contenu
+    tronqué/corrompu — zipfile.ZipFile() doit lever BadZipFile à l'ouverture."""
+    path = tmp_path / "corrupt.zip"
+    path.write_bytes(b"PK\x03\x04" + b"\x00" * 20)
+    return path
+
+
+def test_zip_list_corrupt_archive_raises_clear_error(tmp_path):
+    """F3 : BadZipFile ne doit jamais fuiter brute — CLAUDE.md promet une
+    erreur claire pour toute incohérence de zip (R5)."""
+    path = _make_corrupt_zip(tmp_path)
+    with pytest.raises(ToolError, match="corrompue"):
+        list_document("zip", path)
+
+
+def test_zip_search_corrupt_archive_raises_clear_error(tmp_path):
+    from mcp_docs.formats import zip_search
+    from mcp_docs.search import parse_query
+
+    path = _make_corrupt_zip(tmp_path)
+    with pytest.raises(ToolError, match="corrompue"):
+        zip_search(path, parse_query("chat"))
+
+
 # ---------------------------------------------------------------------------
 # zip_search — membres texte uniquement
 # ---------------------------------------------------------------------------
@@ -902,6 +1049,43 @@ def test_zip_search_targeted_member_via_path(tmp_path):
     path = _make_zip(tmp_path, {"a.txt": "chat", "b.txt": "chat"})
     results = zip_search(path, parse_query("chat"), member_path="a.txt")
     assert [r.label for r in results] == ["a.txt"]
+
+
+def test_zip_search_targeted_binary_member_reports_note_not_empty(tmp_path):
+    """F5 : cibler explicitement un membre binaire via member_path doit
+    renvoyer une note explicite, pas un simple [] indiscernable d'un
+    'pas de match' silencieux."""
+    from mcp_docs.formats import zip_search
+    from mcp_docs.search import parse_query
+
+    path = _make_zip(tmp_path, {})
+    import zipfile
+
+    with zipfile.ZipFile(path, "a") as z:
+        z.writestr("blob.bin", b"\xff\xfe\x00\x01binary")
+
+    results = zip_search(path, parse_query("chat"), member_path="blob.bin")
+    assert len(results) == 1
+    assert results[0].label == "(note)"
+    assert "non cherché" in results[0].snippets[0]
+
+
+def test_zip_search_targeted_structured_member_reports_note(tmp_path):
+    """F5 : idem pour un membre reconnu comme document structuré (docx)."""
+    from mcp_docs.formats import zip_search
+    from mcp_docs.search import parse_query
+
+    inner_docx = _make_docx(tmp_path, [(None, "chat noir")])
+    path = _make_zip(tmp_path, {})
+    import zipfile
+
+    with zipfile.ZipFile(path, "a") as z:
+        z.write(inner_docx, "inner.docx")
+
+    results = zip_search(path, parse_query("chat"), member_path="inner.docx")
+    assert len(results) == 1
+    assert results[0].label == "(note)"
+    assert "non cherché" in results[0].snippets[0]
 
 
 def test_zip_search_structured_and_binary_members_ignored_and_noted(tmp_path):
@@ -1462,6 +1646,20 @@ def test_apply_range_line_window():
     assert "line_start=5" in notice  # end < total → suite
 
 
+def test_apply_range_line_window_single_line_exceeds_cap_suggests_char_mode(monkeypatch):
+    """F7 : quand le cap coupe avant la première fin de ligne (served_lines=0),
+    suggérer line_start=même valeur n'aiderait pas à progresser — le hint doit
+    pointer vers char_start."""
+    import mcp_docs.formats as fmt
+
+    monkeypatch.setattr(fmt, "READ_CAP", 5)
+    body = "0123456789ABCDE"  # une seule "ligne" de 15 caractères
+    text, notice = fmt._apply_range(body, fmt.TextRange(line_start=1))
+    assert text == "01234"
+    assert "char_start" in notice
+    assert "utiliser char_start" in notice
+
+
 def test_apply_range_line_start_only_to_end():
     from mcp_docs.formats import TextRange, _apply_range
 
@@ -1612,6 +1810,28 @@ def test_match_unit_partial_terms_absent_yields_no_hits():
     assert hits == []
 
 
+def test_match_unit_counts_all_occurrences_of_a_term():
+    q = parse_query("chat")
+    hits = match_unit("Le chat, le chat, encore le chat.", q)
+    assert len(hits) == 3
+    # Triés par offset croissant.
+    assert [h.offset for h in hits] == sorted(h.offset for h in hits)
+
+
+def test_match_unit_and_gate_still_holds_with_occurrences():
+    # "chat" présent 2×, "souris" absent → AND-gate invalide toute l'unité.
+    q = parse_query("chat souris")
+    hits = match_unit("Le chat et le chat.", q)
+    assert hits == []
+
+
+def test_match_unit_hits_ordered_across_terms():
+    q = parse_query("chat chien")
+    hits = match_unit("chien puis chat puis chien.", q)
+    # 1 "chat" + 2 "chien" = 3 hits, ordonnés par position dans le texte.
+    assert [h.term for h in hits] == ["chien", "chat", "chien"]
+
+
 def test_match_unit_case_and_accent_insensitive():
     q = parse_query("ete")
     hits = match_unit("Il fait chaud cet Été.", q)
@@ -1651,3 +1871,26 @@ def test_make_snippet_at_end_no_trailing_ellipsis():
 def test_make_snippet_short_text_no_ellipsis():
     snippet = make_snippet("MATCH", offset=0, length=5, radius=10)
     assert snippet == "MATCH"
+
+
+def test_render_results_total_reflects_real_occurrence_count():
+    """Le total annoncé par render_results est la somme des hit_count (vraies
+    occurrences), pas le nombre de snippets ni d'unités (D6)."""
+    from mcp_docs.search import UnitResult, render_results
+
+    units = [
+        UnitResult(label="1", hit_count=3, snippets=["s1", "s2", "s3"]),
+        UnitResult(label="2", hit_count=2, snippets=["s4", "s5"]),
+    ]
+    out = render_results("pdf", "chat", units, cap=50)
+    assert "5 occurrence(s) dans 2 unité(s)" in out
+    assert "--- 1 (3 occurrence(s)) ---" in out
+
+
+def test_render_results_truncates_at_cap():
+    from mcp_docs.search import UnitResult, render_results
+
+    units = [UnitResult(label="1", hit_count=4, snippets=["s1", "s2", "s3", "s4"])]
+    out = render_results("pdf", "chat", units, cap=2)
+    assert "Tronqué à 2 snippets" in out
+    assert "2 occurrence(s) supplémentaire(s)" in out

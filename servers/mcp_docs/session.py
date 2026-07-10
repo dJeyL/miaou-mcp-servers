@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 
@@ -36,6 +37,7 @@ REF_UNKNOWN_ERROR_CODE = -31999
 # libraryRefFromId — id en base36 minuscules/chiffres).
 _REF_RE = re.compile(r"^(att-\d+|file-[a-z0-9]+)$")
 _SESSION_ID_FORBIDDEN = re.compile(r"[\\/]|\.\.")
+_SESSION_ID_ALL_DOTS = re.compile(r"^\.+$")
 
 
 class ToolError(Exception):
@@ -59,8 +61,14 @@ SEARCH_CAP = _env_int("MIAOU_DOCS_SEARCH_CAP", 50)
 
 
 def validate_session_id(session_id: str) -> str:
-    """Rejette séparateurs de chemin, '..' et chaîne vide avant tout usage filesystem."""
-    if not session_id or _SESSION_ID_FORBIDDEN.search(session_id):
+    """Rejette séparateurs de chemin, '..', chaîne vide et id composé uniquement
+    de points (session_dir(".") == WORKDIR lui-même : sans ce rejet,
+    drop_session(".") efface toutes les sessions d'un coup)."""
+    if (
+        not session_id
+        or _SESSION_ID_FORBIDDEN.search(session_id)
+        or _SESSION_ID_ALL_DOTS.match(session_id)
+    ):
         raise ToolError(f"session_id invalide : {session_id!r}")
     return session_id
 
@@ -100,8 +108,6 @@ def sweep_expired_sessions() -> None:
             continue
         try:
             if entry.stat().st_mtime < cutoff:
-                import shutil
-
                 shutil.rmtree(entry, ignore_errors=True)
         except OSError:
             continue

@@ -55,6 +55,9 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 
 from __future__ import annotations
 
+import asyncio
+import shutil
+
 from mcp_base import MiaouMCPBase
 
 from .formats import (
@@ -138,8 +141,6 @@ class DocsServer(MiaouMCPBase):
             validate_session_id(session_id)
             d = session_dir(session_id)
             if d.exists():
-                import shutil
-
                 shutil.rmtree(d, ignore_errors=True)
             return f"Session '{session_id}' supprimée."
 
@@ -167,9 +168,9 @@ class DocsServer(MiaouMCPBase):
             if path is not None:
                 if kind != "zip":
                     raise ToolError(f"'{ref}' n'est pas une archive : path ne s'applique pas")
-                return zip_list_member(doc_path, path)
+                return await asyncio.to_thread(zip_list_member, doc_path, path)
 
-            return list_document(kind, doc_path)
+            return await asyncio.to_thread(list_document, kind, doc_path)
 
         async def read(
             ref: str,
@@ -194,9 +195,9 @@ class DocsServer(MiaouMCPBase):
             if path is not None:
                 if kind != "zip":
                     raise ToolError(f"'{ref}' n'est pas une archive : path ne s'applique pas")
-                return zip_read_member(doc_path, path, selector, rng)
+                return await asyncio.to_thread(zip_read_member, doc_path, path, selector, rng)
 
-            return read_document(kind, doc_path, selector, rng)
+            return await asyncio.to_thread(read_document, kind, doc_path, selector, rng)
 
         read.__doc__ = f"""Lit un extrait borné d'un document (plage de pages/lignes/slides/
         paragraphes selon le format). Réponse plafonnée à {READ_CAP}
@@ -234,11 +235,13 @@ class DocsServer(MiaouMCPBase):
             parsed_query = parse_query(query)
 
             if kind == "zip":
-                unit_results = zip_search(doc_path, parsed_query, member_path=path)
+                unit_results = await asyncio.to_thread(
+                    zip_search, doc_path, parsed_query, member_path=path
+                )
             elif path is not None:
                 raise ToolError(f"'{ref}' n'est pas une archive : path ne s'applique pas")
             else:
-                unit_results = search_document(kind, doc_path, parsed_query)
+                unit_results = await asyncio.to_thread(search_document, kind, doc_path, parsed_query)
 
             return render_results(kind, query, unit_results, SEARCH_CAP)
 

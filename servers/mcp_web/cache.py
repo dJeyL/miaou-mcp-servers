@@ -29,7 +29,10 @@ def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
-    return int(raw)
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"Variable d'environnement {name} invalide : {raw!r} (entier attendu)")
 
 
 WORKDIR = Path(os.environ.get("MIAOU_WEB_WORKDIR") or "./miaou-web")
@@ -52,6 +55,17 @@ def html_path(url: str) -> Path:
 
 def structure_path(url: str) -> Path:
     return WORKDIR / f"{url_key(url)}.json"
+
+
+def _touch_all(url: str) -> None:
+    """Rafraîchit le mtime des trois fichiers existants de la clé (W6) : un
+    fetch_read répété touchait seulement .txt, laissant .html/.json expirer
+    pendant que le texte restait vivant — fetch_list échouait alors avec un
+    message trompeur ("appeler fetch_url d'abord") sur une URL bien connue."""
+    now = time.time()
+    for path in (entry_path(url), html_path(url), structure_path(url)):
+        if path.exists():
+            os.utime(path, (now, now))
 
 
 def sweep_expired() -> None:
@@ -86,8 +100,7 @@ def load(url: str) -> str:
         raise CacheMiss(
             f"Aucun contenu en cache pour cette URL — appeler fetch_url d'abord : {url}"
         )
-    now = time.time()
-    os.utime(path, (now, now))
+    _touch_all(url)
     return path.read_text(encoding="utf-8")
 
 
@@ -96,6 +109,9 @@ def store_html(url: str, html_text: str) -> Path:
     WORKDIR.mkdir(parents=True, exist_ok=True)
     path = html_path(url)
     path.write_text(html_text, encoding="utf-8")
+    # Invalide la structure déjà extraite (fetch_list) : un re-fetch peut avoir
+    # changé le HTML, la resservir serait silencieusement périmée.
+    structure_path(url).unlink(missing_ok=True)
     return path
 
 
@@ -106,8 +122,7 @@ def load_html(url: str) -> str:
         raise CacheMiss(
             f"Aucun HTML en cache pour cette URL — appeler fetch_url d'abord : {url}"
         )
-    now = time.time()
-    os.utime(path, (now, now))
+    _touch_all(url)
     return path.read_text(encoding="utf-8")
 
 
@@ -117,11 +132,10 @@ def store_structure(url: str, entries: list[dict]) -> Path:
     return path
 
 
-def load_structure(url: str) -> list[dict]:
+def load_structure(url: str) -> list[dict] | None:
     sweep_expired()
     path = structure_path(url)
     if not path.exists():
         return None
-    now = time.time()
-    os.utime(path, (now, now))
+    _touch_all(url)
     return json.loads(path.read_text(encoding="utf-8"))

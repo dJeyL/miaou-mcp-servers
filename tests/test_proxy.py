@@ -243,6 +243,57 @@ async def test_inprocess_upstream_env_does_not_override_existing():
 
 
 @pytest.mark.asyncio
+async def test_proxy_call_tool_falls_back_to_prefix_when_not_in_tool_map():
+    """P2 : si `name` n'est pas dans tool_map au moment de l'appel (ex. le
+    rafraîchissement automatique du cache SDK n'a pas (encore) exposé cet
+    outil précis), le fallback par préfixe doit router quand même vers le bon
+    upstream plutôt que de renvoyer "Outil inconnu" à tort."""
+    import mcp.types as types
+
+    mock_upstream = MagicMock()
+    mock_upstream.list_tools = AsyncMock(return_value=[])  # cache SDK : rien à lister
+    mock_upstream.call_tool = AsyncMock(
+        return_value=[types.TextContent(type="text", text="hello")]
+    )
+    upstreams = {"bench": mock_upstream}
+    tool_map: dict = {}  # "bench__echo" absent malgré le upstream connu
+    server = build_proxy_server(upstreams, tool_map)
+
+    call_handler = server.request_handlers.get(types.CallToolRequest)
+    await call_handler(
+        types.CallToolRequest(
+            method="tools/call",
+            params=types.CallToolRequestParams(name="bench__echo", arguments={"text": "hi"}),
+        )
+    )
+    mock_upstream.call_tool.assert_awaited_once_with("echo", {"text": "hi"})
+
+
+@pytest.mark.asyncio
+async def test_proxy_call_tool_unknown_prefix_still_fails():
+    """Le fallback ne doit pas masquer un vrai outil inconnu : un préfixe qui
+    ne correspond à aucun upstream reste une erreur."""
+    import mcp.types as types
+
+    upstreams: dict = {}
+    tool_map: dict = {}
+    server = build_proxy_server(upstreams, tool_map)
+
+    call_handler = server.request_handlers.get(types.CallToolRequest)
+    request = types.CallToolRequest(
+        method="tools/call",
+        params=types.CallToolRequestParams(name="ghost__tool", arguments={}),
+    )
+    from mcp.shared.exceptions import McpError
+
+    try:
+        result = await call_handler(request)
+        assert result.root.isError
+    except McpError:
+        pass
+
+
+@pytest.mark.asyncio
 async def test_proxy_call_unknown_tool_returns_error():
     """Un outil inconnu doit lever McpError (propagé ou capturé par le SDK en isError)."""
     import mcp.types as types

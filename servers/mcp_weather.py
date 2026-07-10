@@ -26,13 +26,22 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
     Activé    : oui
 """
 
+import asyncio
 import json
+import urllib.error
 import urllib.parse
 from typing import Optional
 
 from mcp import types
 
 from mcp_base import MiaouMCPBase, make_opener
+
+
+def _fetch_weather_bytes(url: str) -> bytes:
+    """I/O bloquante isolée pour être déportée via asyncio.to_thread (T2) :
+    sans ça, chaque appel gèle l'event loop pendant tout le round-trip réseau."""
+    with make_opener().open(url, timeout=10) as resp:
+        return resp.read(2 * 1024 * 1024)
 
 
 class WeatherServer(MiaouMCPBase):
@@ -44,7 +53,7 @@ class WeatherServer(MiaouMCPBase):
             city: str,
             state: Optional[str] = None,
             country: Optional[str] = None,
-        ) -> types.EmbeddedResource:
+        ) -> str | types.EmbeddedResource:
             """Renvoie la météo actuelle pour une ville via wttr.in (JSON allégé sans astronomy ni hourly). Attention : heures UTC."""
             parts = [city]
             if state:
@@ -55,8 +64,21 @@ class WeatherServer(MiaouMCPBase):
 
             url = f"http://wttr.in/{urllib.parse.quote(location)}?format=j1"
 
-            with make_opener().open(url, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
+            try:
+                raw = await asyncio.to_thread(_fetch_weather_bytes, url)
+            except urllib.error.HTTPError as e:
+                return f"Erreur HTTP {e.code} ({e.reason}) — wttr.in"
+            except urllib.error.URLError as e:
+                return f"Erreur réseau ({e.reason}) — wttr.in"
+            except TimeoutError:
+                return "Timeout (10 s) — wttr.in"
+            except Exception as e:
+                return f"Erreur inattendue ({type(e).__name__}: {e}) — wttr.in"
+
+            try:
+                data = json.loads(raw.decode())
+            except json.JSONDecodeError as e:
+                return f"Réponse invalide de wttr.in (JSON malformé : {e})."
 
             for day in data.get("weather", []):
                 day.pop("astronomy", None)

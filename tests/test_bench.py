@@ -111,3 +111,13 @@ def test_tool_list_contains_all_expected():
     tools = bench_server.mcp._tool_manager.list_tools()
     names = {t.name for t in tools}
     assert names == {"echo", "add", "dns_lookup", "reverse_dns", "get_image", "get_json_resource"}
+
+
+def test_main_legacy_positional_invalid_port_exits_clean(monkeypatch, capsys):
+    """B2 : un port positionnel non numérique (syntaxe legacy `server.py host port`)
+    doit produire un message clair et sys.exit(1), pas un traceback ValueError brut."""
+    monkeypatch.setattr("sys.argv", ["mcp_bench.py", "127.0.0.1", "notaport"])
+    with pytest.raises(SystemExit) as exc_info:
+        bench_server.main()
+    assert exc_info.value.code == 1
+    assert "port invalide" in capsys.readouterr().err.lower()

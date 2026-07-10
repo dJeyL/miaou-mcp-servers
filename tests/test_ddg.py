@@ -67,6 +67,25 @@ async def test_ddg_search_max_results():
 
 
 @pytest.mark.asyncio
+async def test_ddg_search_max_results_clamped_to_30():
+    """B9 : max_results ne doit pas dépasser 30, ni être négatif/nul."""
+    mock_resp = _make_mock_resp(_DDG_HTML)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("ddg_search", {"query": "python", "max_results": 500})
+    items = json.loads(result.resource.text)
+    assert len(items) <= 30
+
+
+@pytest.mark.asyncio
+async def test_ddg_search_max_results_clamped_to_1():
+    mock_resp = _make_mock_resp(_DDG_HTML)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("ddg_search", {"query": "python", "max_results": -5})
+    items = json.loads(result.resource.text)
+    assert len(items) <= 1
+
+
+@pytest.mark.asyncio
 async def test_ddg_search_uri_contains_query():
     mock_resp = _make_mock_resp(_DDG_HTML)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):

@@ -48,8 +48,10 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import html2text
@@ -62,6 +64,7 @@ from .cache import CacheMiss
 from .structure import extract_structure
 
 _DEFAULT_MAX_BYTES = 5 * 1024 * 1024  # 5 Mo
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -110,6 +113,15 @@ def _cache_and_cap(url: str, full_text: str) -> str:
     )
 
 
+def _fetch_bytes(req: urllib.request.Request, max_bytes: int) -> tuple[str, bytes]:
+    """I/O bloquante isolée pour asyncio.to_thread (T2). Renvoie (content_type, corps)."""
+    opener = make_opener()
+    with opener.open(req, timeout=10) as resp:
+        content_type = resp.headers.get("Content-Type", "application/octet-stream")
+        raw = resp.read(max_bytes + 1)
+        return content_type, raw
+
+
 def _format_entry(index: int, entry: dict) -> str:
     if entry["type"] == "heading":
         prefix = "#" * entry["level"]
@@ -125,12 +137,15 @@ class WebServer(MiaouMCPBase):
             url: str,
             max_bytes: int = _DEFAULT_MAX_BYTES,
         ) -> str | types.EmbeddedResource:
-            opener = make_opener()
+            scheme = urllib.parse.urlsplit(url).scheme.lower()
+            if scheme not in _ALLOWED_SCHEMES:
+                return f"Schéma d'URL non autorisé ({scheme or '?'}) — http/https uniquement : {url}"
+            if max_bytes < 1:
+                return f"max_bytes doit être >= 1 (reçu {max_bytes})"
+
             req = urllib.request.Request(url, headers={"User-Agent": _UA})
             try:
-                with opener.open(req, timeout=10) as resp:
-                    content_type = resp.headers.get("Content-Type", "application/octet-stream")
-                    raw = resp.read(max_bytes + 1)
+                content_type, raw = await asyncio.to_thread(_fetch_bytes, req, max_bytes)
             except urllib.error.HTTPError as e:
                 return f"Erreur HTTP {e.code} ({e.reason}) — {url}"
             except urllib.error.URLError as e:
@@ -248,8 +263,10 @@ class WebServer(MiaouMCPBase):
         ) -> str:
             try:
                 html_text = web_cache.load_html(url)
-            except CacheMiss as e:
-                return str(e)
+            except CacheMiss:
+                if web_cache.entry_path(url).exists():
+                    return f"Cette URL n'a pas renvoyé du HTML — fetch_list ne s'applique pas : {url}"
+                return f"Aucun HTML en cache pour cette URL — appeler fetch_url d'abord : {url}"
 
             if entry_start < 0:
                 return f"entry_start doit être >= 0 (reçu {entry_start})"

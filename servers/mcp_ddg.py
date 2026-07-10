@@ -28,6 +28,7 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
     Activé    : oui
 """
 
+import asyncio
 import json
 import urllib.error
 import urllib.parse
@@ -94,6 +95,13 @@ class _DDGParser(HTMLParser):
         return self._results
 
 
+def _fetch_ddg_html(req: urllib.request.Request) -> str:
+    """I/O bloquante isolée pour asyncio.to_thread (T2)."""
+    opener = make_opener()
+    with opener.open(req, timeout=10) as resp:
+        return resp.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
+
+
 class DDGServer(MiaouMCPBase):
     def __init__(self) -> None:
         super().__init__("miaou-ddg", default_port=8769)
@@ -104,6 +112,7 @@ class DDGServer(MiaouMCPBase):
             max_results: int = 5,
         ) -> str | types.EmbeddedResource:
             """Recherche sur DuckDuckGo (endpoint HTML, pas de clé API). Renvoie un tableau JSON [{title, url, snippet}]. Fragile si DDG change son markup."""
+            max_results = max(1, min(max_results, 30))
             body = urllib.parse.urlencode({"q": query, "b": ""}).encode()
             req = urllib.request.Request(
                 _DDG_URL,
@@ -114,10 +123,8 @@ class DDGServer(MiaouMCPBase):
                     "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
                 },
             )
-            opener = make_opener()
             try:
-                with opener.open(req, timeout=10) as resp:
-                    html = resp.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
+                html = await asyncio.to_thread(_fetch_ddg_html, req)
             except urllib.error.HTTPError as e:
                 return f"Erreur HTTP {e.code} ({e.reason}) — DuckDuckGo"
             except urllib.error.URLError as e:

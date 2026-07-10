@@ -146,10 +146,15 @@ clair sans stack trace.
 
 - `brave_search(query, count=5)` : recherche web. Renvoie `TextResourceContents`
   `application/json` — tableau `[{title, url, description}]`.
-- `brave_image_search(query, count=5)` : recherche d'images. `count` plafonné à 20.
-  Renvoie `TextResourceContents` `application/json` — tableau
+- `brave_image_search(query, count=5)` : recherche d'images. Renvoie
+  `TextResourceContents` `application/json` — tableau
   `[{title, page_url, image_url, thumbnail_url, source}]`. Les entrées sans
   `properties.url` sont écartées. URI : `miaou://brave-images/{query}`.
+
+`count` est plafonné à [1, 20] symétriquement sur les deux outils (l'API Brave web
+plafonne aussi à 20 au-delà, 422). Les deux outils partagent un helper commun
+`_brave_call` (requête HTTP, chaîne d'erreurs réseau) — seul le mapping des résultats
+diffère.
 
 ### `servers/mcp_docs/` — extraction de documents (port 8771)
 
@@ -225,7 +230,9 @@ lisible/listable comme un document imbriqué, borné à **un seul niveau** d'imb
 (un zip contenant un zip contenant un docx reste signalé, non extrait, pour borner la
 récursion et le coût de parsing cumulé). Un membre imbriqué reconnu est en plus soumis à
 `MIAOU_DOCS_MAX_FILE_MB` (pas seulement `MAX_UNZIP_MB`) avant parsing par une lib lourde.
-Un PDF sans texte extractible (scan) renvoie une note explicite, pas d'OCR en v1.
+Un PDF sans texte extractible (scan) renvoie une note explicite, pas d'OCR en v1. Un
+attachement texte brut (kind `inconnu`, hors pdf/docx/xlsx/pptx/zip) ne transite jamais
+par `mcp_docs` : MIAOU inline ce type de fichier côté client.
 
 **Sécurité archives (zip)** — non négociable même en contexte mono-utilisateur (coût
 trivial, échec = dommage filesystem) :
@@ -420,6 +427,15 @@ Deux points à ne pas toucher sans bonne raison :
 - **`expose_headers=["Mcp-Session-Id"]`** dans le middleware CORS : MIAOU lit ce
   header après `initialize` pour maintenir la session. Sans lui, le navigateur masque
   le header et chaque appel repart sans session → erreur 404 ou réinitialisation.
+
+Tout appel réseau ou bloquant à l'intérieur d'un outil `async` (urllib dans
+weather/ddg/brave/web, résolution DNS dans bench, parsing de document dans
+`mcp_docs`) est enveloppé dans `asyncio.to_thread(...)` — un outil async qui appelle
+directement une fonction bloquante gèlerait l'event loop pendant tout le round-trip,
+sérialisant les appels concurrents. Isoler l'I/O bloquante dans une fonction
+synchrone dédiée (ex. `_fetch_bytes`, `_fetch_ddg_html`, `_fetch_brave_bytes`) puis
+l'appeler via `await asyncio.to_thread(...)` est le pattern à suivre pour tout
+nouvel outil qui ferait de l'I/O.
 
 ## Tests
 

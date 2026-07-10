@@ -195,6 +195,21 @@ def build_upstreams(cfg: dict[str, Any]) -> dict[str, Upstream]:
 # Proxy MCP Server (low-level mcp.server.Server pour l'enregistrement dynamique)
 # ---------------------------------------------------------------------------
 
+def _resolve_via_prefix(
+    name: str, upstreams: dict[str, Upstream]
+) -> tuple[str, str] | None:
+    """Fallback quand `name` n'est pas (encore) dans tool_map : un client qui
+    rappelle tools/call après reconnexion (cache local, sans repasser par
+    tools/list) sinon reçoit "Outil inconnu" à tort. tool_map reste l'autorité
+    pour tout nom qui contient lui-même "__" au-delà du premier segment."""
+    if "__" not in name:
+        return None
+    prefix, orig_name = name.split("__", 1)
+    if prefix in upstreams:
+        return prefix, orig_name
+    return None
+
+
 def build_proxy_server(
     upstreams: dict[str, Upstream],
     tool_map: dict[str, tuple[str, str]],
@@ -222,11 +237,15 @@ def build_proxy_server(
     async def handle_call_tool(
         name: str, arguments: dict[str, Any] | None
     ) -> list[Any]:
-        if name not in tool_map:
-            from mcp.shared.exceptions import McpError
-            from mcp.types import INVALID_PARAMS, ErrorData
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Outil inconnu : '{name}'"))
-        upstream_name, orig_name = tool_map[name]
+        if name in tool_map:
+            upstream_name, orig_name = tool_map[name]
+        else:
+            resolved = _resolve_via_prefix(name, upstreams)
+            if resolved is None:
+                from mcp.shared.exceptions import McpError
+                from mcp.types import INVALID_PARAMS, ErrorData
+                raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Outil inconnu : '{name}'"))
+            upstream_name, orig_name = resolved
         return await upstreams[upstream_name].call_tool(orig_name, arguments or {})
 
     _wrap_ref_unknown_sentinel(server)
@@ -294,14 +313,21 @@ def build_app(
 
     @asynccontextmanager
     async def lifespan(app: Starlette):
-        for upstream in upstreams.values():
-            await upstream.start()
-        # session_manager.run() initialise le task group interne requis pour
-        # traiter les requêtes MCP (sans ça : RuntimeError "Task group is not initialized").
-        async with session_manager.run():
-            yield
-        for upstream in upstreams.values():
-            await upstream.stop()
+        started: list[Upstream] = []
+        try:
+            for upstream in upstreams.values():
+                await upstream.start()
+                started.append(upstream)
+            # session_manager.run() initialise le task group interne requis pour
+            # traiter les requêtes MCP (sans ça : RuntimeError "Task group is not initialized").
+            async with session_manager.run():
+                yield
+        finally:
+            for upstream in started:
+                try:
+                    await upstream.stop()
+                except Exception:
+                    pass
 
     async def handle_mcp(scope: Any, receive: Any, send: Any) -> None:
         await session_manager.handle_request(scope, receive, send)

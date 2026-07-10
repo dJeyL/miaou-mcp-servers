@@ -2,6 +2,7 @@
 import io
 import json
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -90,3 +91,39 @@ async def test_get_weather_optional_params_omitted():
     assert "Bordeaux" in captured_url[0]
     # Pas de virgule parasite dans l'URL
     assert ",," not in captured_url[0]
+
+
+@pytest.mark.asyncio
+async def test_get_weather_http_error_returns_clear_string():
+    """B6 : une erreur réseau doit renvoyer un message clair, pas fuiter
+    l'exception urllib brute."""
+    err = urllib.error.HTTPError("http://wttr.in/x", 503, "Service Unavailable", {}, None)
+    with patch("urllib.request.OpenerDirector.open", side_effect=err):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris"})
+    assert isinstance(result, str)
+    assert "503" in result
+
+
+@pytest.mark.asyncio
+async def test_get_weather_url_error_returns_clear_string():
+    err = urllib.error.URLError("Connection refused")
+    with patch("urllib.request.OpenerDirector.open", side_effect=err):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris"})
+    assert isinstance(result, str)
+    assert "réseau" in result.lower() or "Connection refused" in result
+
+
+@pytest.mark.asyncio
+async def test_get_weather_invalid_json_returns_clear_string():
+    """wttr.in peut renvoyer du HTML d'erreur au lieu de JSON."""
+    mock = MagicMock()
+    mock.__enter__ = lambda s: s
+    mock.__exit__ = MagicMock(return_value=False)
+    mock.read.return_value = b"<html>error</html>"
+    with patch("urllib.request.OpenerDirector.open", return_value=mock):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris"})
+    assert isinstance(result, str)
+    assert "invalide" in result.lower()

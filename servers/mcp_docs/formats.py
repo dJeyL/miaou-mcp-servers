@@ -123,6 +123,12 @@ def _truncation_notice(continue_hint: str) -> str:
     return f"\n\n[Tronqué à {READ_CAP} caractères — {continue_hint}]"
 
 
+def _pagination_notice(continue_hint: str, unit: str = "Page") -> str:
+    """Notice pour une pagination par unité (page/slide), pas par caractère :
+    rien n'a été tronqué au cap, seule une unité a été servie (F6)."""
+    return f"\n\n[{unit} 1 seule servie — {continue_hint}]"
+
+
 def _apply_range(body: str, rng: TextRange) -> tuple[str, str]:
     """Découpe `body` selon la fenêtre char/ligne, plafonne à READ_CAP, et
     renvoie (texte, notice). La notice indique le prochain offset à demander
@@ -148,6 +154,16 @@ def _apply_range(body: str, rng: TextRange) -> tuple[str, str]:
             # départ (la ligne partielle finale sera relue en entier).
             served_lines = capped.count("\n")
             next_line = start + served_lines
+            if served_lines == 0:
+                # Le cap coupe avant la première fin de ligne : suggérer le
+                # même line_start n'avancerait pas (F7) — le mode caractère
+                # est la seule façon de progresser sur une ligne unique
+                # dépassant le cap.
+                notice = _truncation_notice(
+                    f"cette ligne dépasse {READ_CAP} caractères — utiliser char_start "
+                    f"plutôt que line_start pour la paginer"
+                )
+                return capped, notice
             notice = _truncation_notice(
                 f"line_start={next_line} pour la suite (réduire la fenêtre si une "
                 f"ligne unique dépasse {READ_CAP} caractères)"
@@ -182,11 +198,14 @@ def _apply_range(body: str, rng: TextRange) -> tuple[str, str]:
 
 def _parse_range(selector: str, total: int) -> tuple[int, int]:
     """Parse 'N' ou 'N-M' (1-indexé, inclusif), borné à [1, total]."""
-    if "-" in selector:
-        start_s, end_s = selector.split("-", 1)
-        start, end = int(start_s), int(end_s)
-    else:
-        start = end = int(selector)
+    try:
+        if "-" in selector:
+            start_s, end_s = selector.split("-", 1)
+            start, end = int(start_s), int(end_s)
+        else:
+            start = end = int(selector)
+    except ValueError:
+        raise ToolError(f"selector invalide : '{selector}' (attendu 'N' ou 'N-M')")
     start = max(1, start)
     end = min(total, end)
     if start > end:
@@ -221,6 +240,8 @@ def pdf_list(path: DocSource) -> str:
 
 def pdf_read(path: DocSource, selector: str | None, rng: TextRange | None = None) -> str:
     with _fitz_open(path) as doc:
+        if doc.page_count == 0:
+            return "[PDF sans aucune page]"
         if selector:
             start, end = _parse_range(selector, doc.page_count)
         else:
@@ -248,7 +269,7 @@ def pdf_read(path: DocSource, selector: str | None, rng: TextRange | None = None
 
         notice = empty_note
         if not selector and doc.page_count > 1:
-            notice += _truncation_notice(f"selector='2-{doc.page_count}' pour la suite")
+            notice += _pagination_notice(f"selector='2-{doc.page_count}' pour la suite")
 
         capped, truncated = _cap_text(body, READ_CAP)
         if truncated and not notice:
@@ -332,7 +353,10 @@ def xlsx_read(path: DocSource, selector: str | None) -> str:
 
             truncated_rows = False
             if cell_range:
-                selected = ws[cell_range]
+                try:
+                    selected = ws[cell_range]
+                except (ValueError, IndexError) as e:
+                    raise ToolError(f"Plage de cellules invalide : '{cell_range}' ({e})")
                 # ws["B1"] renvoie une Cell unique (pas une plage) ; ws["A1:C10"]
                 # renvoie un tuple de tuples de lignes. Normaliser au 2e cas pour
                 # que le rendu ligne par ligne ci-dessous fonctionne dans les deux.
@@ -387,6 +411,7 @@ def xlsx_search(path: DocSource, query: Query) -> list[UnitResult]:
             for sheet_name in wb.sheetnames:
                 ws = wb[sheet_name]
                 snippets = []
+                occurrences = 0
                 for row in ws.iter_rows():
                     for cell in row:
                         if cell.value is None:
@@ -394,10 +419,14 @@ def xlsx_search(path: DocSource, query: Query) -> list[UnitResult]:
                         text = str(cell.value)
                         hits = match_unit(text, query)
                         if hits:
+                            # Un snippet par cellule matchée (le label `Feuille!Coord`
+                            # reste un selector `read` atomique), mais toutes les
+                            # occurrences de la cellule comptent dans hit_count.
+                            occurrences += len(hits)
                             snippet = make_snippet(text, hits[0].offset, hits[0].length)
                             snippets.append(f"{sheet_name}!{cell.coordinate} : {snippet}")
                 if snippets:
-                    results.append(UnitResult(label=sheet_name, hit_count=len(snippets), snippets=snippets))
+                    results.append(UnitResult(label=sheet_name, hit_count=occurrences, snippets=snippets))
             return results
         finally:
             wb.close()
@@ -410,7 +439,7 @@ def xlsx_search(path: DocSource, query: Query) -> list[UnitResult]:
 # DOCX (python-docx)
 # ---------------------------------------------------------------------------
 
-_HEADING_RE = re.compile(r"^Heading (\d+)$")
+_HEADING_RE = re.compile(r"^(?:Heading|Titre) (\d+)$")
 
 
 def _table_text(table) -> str:
@@ -587,6 +616,8 @@ def pptx_read(path: DocSource, selector: str | None, rng: TextRange | None = Non
 
     prs = Presentation(path if isinstance(path, io.BytesIO) else str(path))
     total = len(prs.slides)
+    if total == 0:
+        return "[PPTX sans aucune slide]"
 
     if selector:
         start, end = _parse_range(selector, total)
@@ -606,7 +637,7 @@ def pptx_read(path: DocSource, selector: str | None, rng: TextRange | None = Non
 
     notice = ""
     if not selector and total > 1:
-        notice = _truncation_notice(f"selector='2-{total}' pour la suite")
+        notice = _pagination_notice(f"selector='2-{total}' pour la suite", unit="Slide")
     capped, truncated = _cap_text(body, READ_CAP)
     if truncated and not notice:
         notice = _truncation_notice("relire avec un selector plus étroit")
@@ -660,34 +691,38 @@ def _is_nested_archive(head: bytes) -> bool:
 
 
 def zip_list(path: DocSource) -> str:
-    with zipfile.ZipFile(path) as z:
-        infos = z.infolist()
-        lines = ["ZIP — entrées :"]
-        total_declared = 0
-        for info in infos:
-            kind = "dir" if info.is_dir() else "file"
-            flags = []
-            if _is_zip_slip(info.filename):
-                flags.append("chemin suspect, non extractible")
-            if not info.is_dir() and _is_encrypted(info):
-                flags.append("chiffré, non extractible")
-            if not info.is_dir() and info.filename.lower().endswith((".docx", ".xlsx", ".pptx", ".pdf")):
-                flags.append("document structuré, lisible via read(path=...)")
-            elif not info.is_dir() and info.filename.lower().endswith(".zip"):
-                flags.append("archive imbriquée potentielle, non extractible au-delà d'un niveau")
-            flag_note = f" [{', '.join(flags)}]" if flags else ""
-            lines.append(f"- {info.filename} ({info.file_size} octets, {kind}){flag_note}")
-            total_declared += info.file_size
+    try:
+        with zipfile.ZipFile(path) as z:
+            infos = z.infolist()
+    except zipfile.BadZipFile as e:
+        raise ToolError(f"Archive zip corrompue ou invalide : {e}")
 
-        total_mb = total_declared / (1024 * 1024)
-        if total_mb > MAX_UNZIP_MB:
-            lines.append(
-                f"\n[Taille décompressée totale déclarée : {total_mb:.1f} Mo, "
-                f"dépasse la limite de {MAX_UNZIP_MB} Mo — l'extraction de membres "
-                f"individuels reste bornée par membre, mais l'archive entière ne "
-                f"pourrait pas être extraite intégralement]"
-            )
-        return "\n".join(lines)
+    lines = ["ZIP — entrées :"]
+    total_declared = 0
+    for info in infos:
+        kind = "dir" if info.is_dir() else "file"
+        flags = []
+        if _is_zip_slip(info.filename):
+            flags.append("chemin suspect, non extractible")
+        if not info.is_dir() and _is_encrypted(info):
+            flags.append("chiffré, non extractible")
+        if not info.is_dir() and info.filename.lower().endswith((".docx", ".xlsx", ".pptx", ".pdf")):
+            flags.append("document structuré, lisible via read(path=...)")
+        elif not info.is_dir() and info.filename.lower().endswith(".zip"):
+            flags.append("archive imbriquée potentielle, non extractible au-delà d'un niveau")
+        flag_note = f" [{', '.join(flags)}]" if flags else ""
+        lines.append(f"- {info.filename} ({info.file_size} octets, {kind}){flag_note}")
+        total_declared += info.file_size
+
+    total_mb = total_declared / (1024 * 1024)
+    if total_mb > MAX_UNZIP_MB:
+        lines.append(
+            f"\n[Taille décompressée totale déclarée : {total_mb:.1f} Mo, "
+            f"dépasse la limite de {MAX_UNZIP_MB} Mo — l'extraction de membres "
+            f"individuels reste bornée par membre, mais l'archive entière ne "
+            f"pourrait pas être extraite intégralement]"
+        )
+    return "\n".join(lines)
 
 
 def _extract_zip_member_bytes(path: DocSource, member_path: str) -> bytes:
@@ -701,8 +736,8 @@ def _extract_zip_member_bytes(path: DocSource, member_path: str) -> bytes:
     with zipfile.ZipFile(path) as z:
         try:
             info = z.getinfo(member_path)
-        except KeyError:
-            raise ToolError(f"Membre introuvable dans l'archive : '{member_path}'")
+        except KeyError as e:
+            raise ToolError(f"Membre introuvable dans l'archive : '{member_path}'") from e
         if info.is_dir():
             raise ToolError(f"'{member_path}' est un répertoire, pas un fichier")
         if _is_encrypted(info):
@@ -732,7 +767,7 @@ def _extract_zip_member_bytes(path: DocSource, member_path: str) -> bytes:
                         )
                     chunks.append(chunk)
         except zipfile.BadZipFile as e:
-            raise ToolError(f"Archive corrompue ou en-tête incohérent pour '{member_path}' : {e}")
+            raise ToolError(f"Archive corrompue ou en-tête incohérent pour '{member_path}' : {e}") from e
         return b"".join(chunks)
 
 
@@ -843,11 +878,16 @@ def zip_search(path: DocSource, query: Query, member_path: str | None = None) ->
         # inextractible, comme zip_read_member (pas un skip silencieux ici).
         data = _extract_zip_member_bytes(path, member_path)
         if _is_structured_document(data[:8]):
-            return []
+            note = (
+                f"[Membre '{member_path}' non cherché : document structuré ou "
+                f"binaire, la recherche zip ne porte que sur le texte brut]"
+            )
+            return [UnitResult(label="(note)", hit_count=0, snippets=[note])]
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
-            return []
+            note = f"[Membre '{member_path}' non cherché : contenu binaire]"
+            return [UnitResult(label="(note)", hit_count=0, snippets=[note])]
         snippets = snippets_for_unit(text, query)
         if not snippets:
             return []
@@ -855,8 +895,11 @@ def zip_search(path: DocSource, query: Query, member_path: str | None = None) ->
 
     results = []
     skipped: list[str] = []
-    with zipfile.ZipFile(path) as z:
-        infos = z.infolist()
+    try:
+        with zipfile.ZipFile(path) as z:
+            infos = z.infolist()
+    except zipfile.BadZipFile as e:
+        raise ToolError(f"Archive zip corrompue ou invalide : {e}")
 
     for info in infos:
         if info.is_dir():

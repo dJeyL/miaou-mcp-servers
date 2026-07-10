@@ -51,3 +51,15 @@ def test_preserves_document_order():
 
 def test_empty_document_returns_empty_list():
     assert extract_structure("<html><body><p>Rien ici</p></body></html>") == []
+
+
+def test_ignores_fragment_and_javascript_links():
+    """W11 : #fragment et javascript: sont du bruit de navigation, pas des
+    liens exploitables dans un sommaire."""
+    html = (
+        '<a href="#section-2">Aller à la section</a>'
+        '<a href="javascript:void(0)">Cliquer ici</a>'
+        '<a href="/reel">Lien réel</a>'
+    )
+    entries = extract_structure(html)
+    assert entries == [{"type": "link", "text": "Lien réel", "url": "/reel"}]
