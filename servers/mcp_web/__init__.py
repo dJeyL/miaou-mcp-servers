@@ -305,6 +305,61 @@ class WebServer(MiaouMCPBase):
         cache a expiré."""
         self.mcp.tool(name="fetch_list")(fetch_list)
 
+        async def fetch_resource(
+            url: str,
+            max_bytes: int = web_cache.RESOURCE_MAX_BYTES,
+        ) -> list[types.ContentBlock] | str:
+            scheme = urllib.parse.urlsplit(url).scheme.lower()
+            if scheme not in _ALLOWED_SCHEMES:
+                return f"Schéma d'URL non autorisé ({scheme or '?'}) — http/https uniquement : {url}"
+            if max_bytes < 1:
+                return f"max_bytes doit être >= 1 (reçu {max_bytes})"
+
+            req = urllib.request.Request(url, headers={"User-Agent": _UA})
+            try:
+                content_type, raw = await asyncio.to_thread(_fetch_bytes, req, max_bytes)
+            except urllib.error.HTTPError as e:
+                return f"Erreur HTTP {e.code} ({e.reason}) — {url}"
+            except urllib.error.URLError as e:
+                return f"Erreur réseau ({e.reason}) — {url}"
+            except TimeoutError:
+                return f"Timeout (10 s) — {url}"
+            except Exception as e:
+                return f"Erreur inattendue ({type(e).__name__}: {e}) — {url}"
+
+            truncated = len(raw) > max_bytes
+            if truncated:
+                raw = raw[:max_bytes]
+
+            mime = content_type.split(";")[0].strip().lower()
+            blob = base64.b64encode(raw).decode()
+
+            descripteur = f"Resource transférée au client : {mime}, {len(raw)} octets, depuis {url}."
+            if truncated:
+                descripteur += f" Tronqué à {max_bytes} octets."
+
+            return [
+                types.TextContent(type="text", text=descripteur),
+                types.EmbeddedResource(
+                    type="resource",
+                    resource=types.BlobResourceContents(
+                        uri=url,  # type: ignore[arg-type]
+                        mimeType=mime,
+                        blob=blob,
+                    ),
+                ),
+            ]
+
+        fetch_resource.__doc__ = f"""Télécharge une URL et transfère ses octets bruts au
+        client (matérialisation en ressource `res_…`, hors contexte du modèle) —
+        contrairement à fetch_url qui met le texte en contexte, ici seul un
+        descripteur factuel (mime, taille, URL) est renvoyé au modèle. Le contenu
+        est toujours transféré en binaire, même pour du texte/JSON, afin de rester
+        exploitable tel quel côté client (ex. réinjection vers un outil de
+        documents). Téléchargement limité à max_bytes (défaut {web_cache.RESOURCE_MAX_BYTES}
+        octets)."""
+        self.mcp.tool(name="fetch_resource")(fetch_resource)
+
         self.finalize_tools()
 
 

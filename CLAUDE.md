@@ -72,13 +72,13 @@ distinctes — serveur, cache disque, extraction de structure) :
 
 ```
 servers/mcp_web/
-├── __init__.py    # serveur FastMCP + définition des outils (fetch_url/fetch_read/fetch_list)
+├── __init__.py    # serveur FastMCP + définition des outils (fetch_url/fetch_read/fetch_list/fetch_resource)
 ├── __main__.py    # point d'entrée `python -m mcp_web` / `uv run servers/mcp_web`
 ├── cache.py        # cache disque par checksum d'URL (texte, HTML brut, structure JSON)
 └── structure.py    # extraction stdlib (html.parser) des headings/liens, sans dépendance tierce
 ```
 
-Trois outils. `fetch_url(url, max_bytes=5242880)` branch sur le `Content-Type` :
+Quatre outils. `fetch_url(url, max_bytes=5242880)` branch sur le `Content-Type` :
 
 | Content-Type | Traitement | Résultat |
 |---|---|---|
@@ -122,6 +122,26 @@ que le cap de `fetch_read` : `entry_end` ne lève pas le cap, il déplace la fen
 que pour une URL dont `fetch_url` a renvoyé du HTML (`text/html`) ; erreur claire sinon, ou si
 l'URL n'a jamais été récupérée, ou si le cache a expiré.
 
+`fetch_resource(url, max_bytes=5242880)` transfère les **octets bruts** d'une URL au
+**client** (pour matérialisation en ressource `res_…` côté MIAOU) sans jamais les faire
+transiter par le contexte du modèle. À l'inverse de `fetch_url` (qui met le texte rendu en
+contexte, paginé), `fetch_resource` renvoie une liste de deux blocs : un bloc `text`
+descripteur factuel (mime détecté, taille en octets, URL d'origine, note de troncature) —
+seul élément réinjecté au modèle — et un `EmbeddedResource`/`BlobResourceContents` portant
+les octets en base64. Côté MIAOU, `extractResultParts` route un bloc `resource.blob` en
+`store_binary` (→ IDB → `res_…`, hors contexte) et un bloc `text` en passthrough (→ modèle) :
+c'est le canal existant, réutilisé tel quel, pas un nouveau canal. Le contenu est **toujours**
+encodé en binaire (`.blob`), même pour du texte ou du JSON — pour rester exploitable côté
+client (réinjection vers `docs__*` via `content_b64`, ou `js__eval`) plutôt que lu inline.
+Fetch autonome : ne requiert pas de `fetch_url` préalable, et ne lit ni n'écrit le cache
+`mcp_web` (qui ne contient que du texte rendu, pas les octets bruts) — chaque appel
+re-télécharge. Téléchargement borné à `max_bytes` (défaut 5 Mo, `MIAOU_WEB_RESOURCE_MAX_BYTES`),
+troncature notée dans le descripteur. Erreurs réseau et schéma non http/https retournés comme
+chaînes (un seul bloc `text`), pas de stack trace. Le descripteur ne contient ni timestamp ni
+id (stabilité KV-cache) ; l'id `res_…` est généré par le client, pas par le serveur. Le
+paramètre transverse `miaou_intent` (breadcrumb rédigé par le modèle) n'est **pas** déclaré :
+MIAOU le strippe des arguments avant l'envoi sur le wire, aucun serveur MCP ne le reçoit.
+
 Variables d'environnement (toutes optionnelles, défauts constants) :
 
 | Variable | Défaut | Rôle |
@@ -130,6 +150,7 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
 | `MIAOU_WEB_CACHE_TTL_H` | `24` | TTL avant sweep d'une entrée de cache inactive |
 | `MIAOU_WEB_READ_CAP` | `20000` | Cap de caractères en sortie de `fetch_url`/`fetch_read` |
 | `MIAOU_WEB_LIST_CAP` | `100` | Cap du nombre d'entrées en sortie de `fetch_list` |
+| `MIAOU_WEB_RESOURCE_MAX_BYTES` | `5242880` (5 Mo) | Plafond de téléchargement de `fetch_resource` (octets transférés au client) |
 
 ### `servers/mcp_ddg.py` — recherche DuckDuckGo (port 8769)
 
@@ -490,6 +511,13 @@ mirror de `docs/mcp.md` §12 côté MIAOU, à tenir synchronisé si l'un des deu
   — `ref` reste `att-N`, `path` adresse un membre déjà listé par `list`. Écart assumé par
   rapport au brief original : la syntaxe `ref#path` ne matche pas la regex ancrée
   `^att-\d+$` du dispatcher déjà livré.
+- **Format de `ref`** : whitelist de préfixe (`session.py:_REF_RE`) — `att-<N>` (pièce
+  jointe de message), `file-<id>` (fichier de bibliothèque d'espace, MIAOU lot Cbis) ou
+  `res_<id>` (ressource de session côté client, MIAOU lot K, id en base36 après un
+  underscore — pas un tiret). `ref` reste une clé opaque : aucune des trois familles n'est
+  parsée pour un index ou un chemin, la détection de type reste par magic bytes. Un ref
+  hors de ces trois formes est rejeté par `validate_ref` (« ref invalide : … (attendu
+  att-<N>, file-<id> ou res_…) »).
 
 ## Posture sécurité
 

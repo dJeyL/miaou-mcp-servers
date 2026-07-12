@@ -35,7 +35,10 @@ REF_UNKNOWN_ERROR_CODE = -31999
 # att-N : pièce jointe de message (conversation-scopée, cf. MIAOU allocateAttId).
 # file-<id> : fichier de bibliothèque d'espace (Space-scopé, cf. MIAOU lot Cbis,
 # libraryRefFromId — id en base36 minuscules/chiffres).
-_REF_RE = re.compile(r"^(att-\d+|file-[a-z0-9]+)$")
+# res_<id> : ressource de session côté client (conversation-scopée, cf. MIAOU
+# lot K, generateResourceId — 'res_' + id en base36, underscore après "res",
+# pas un tiret comme att-/file-).
+_REF_RE = re.compile(r"^(att-\d+|file-[a-z0-9]+|res_[a-z0-9]+)$")
 _SESSION_ID_FORBIDDEN = re.compile(r"[\\/]|\.\.")
 _SESSION_ID_ALL_DOTS = re.compile(r"^\.+$")
 
@@ -75,7 +78,7 @@ def validate_session_id(session_id: str) -> str:
 
 def validate_ref(ref: str) -> str:
     if not _REF_RE.match(ref):
-        raise ToolError(f"ref invalide : {ref!r} (attendu att-<N> ou file-<id>)")
+        raise ToolError(f"ref invalide : {ref!r} (attendu att-<N>, file-<id> ou res_…)")
     return ref
 
 

@@ -99,6 +99,23 @@ def test_validate_ref_rejects_file_id_uppercase_or_empty_suffix():
         validate_ref("file-")
 
 
+def test_validate_ref_accepts_res_id():
+    """res_<id> : ressource de session côté client (MIAOU lot K,
+    generateResourceId) — underscore après "res", pas un tiret comme
+    att-/file-."""
+    assert validate_ref("res_abc123") == "res_abc123"
+    assert validate_ref("res_2rhku6t4") == "res_2rhku6t4"
+
+
+def test_validate_ref_rejects_res_id_with_dash_or_uppercase():
+    with pytest.raises(ToolError):
+        validate_ref("res-abc")
+    with pytest.raises(ToolError):
+        validate_ref("res_ABC123")
+    with pytest.raises(ToolError):
+        validate_ref("res_")
+
+
 def test_validate_ref_rejects_nested_path():
     """La syntaxe ref#path du brief est explicitement écartée (audit §2) —
     l'adressage de membre d'archive passe par le paramètre `path` séparé."""
@@ -168,6 +185,15 @@ def test_materialize_writes_file_for_library_ref(workdir):
     path = materialize("conv-1", "file-2rhku6t4", content)
     assert path.exists()
     assert path.read_bytes() == b"library content"
+
+
+def test_materialize_writes_file_for_resource_ref(workdir):
+    """res_<id> (ressource de session côté client, MIAOU lot K) suit
+    exactement le même chemin que att-N/file-<id> — pas un cas particulier."""
+    content = base64.b64encode(b"resource content").decode()
+    path = materialize("conv-1", "res_abc123", content)
+    assert path.exists()
+    assert path.read_bytes() == b"resource content"
 
 
 def test_materialize_att_and_file_refs_do_not_collide(workdir):
@@ -1174,6 +1200,36 @@ async def test_list_tool_end_to_end_pdf(workdir):
     tm = docs_server.mcp._tool_manager
     result = await tm.call_tool("list", {"ref": "att-1", "session_id": "conv-1"})
     assert "PDF" in result
+
+
+@pytest.mark.asyncio
+async def test_list_tool_end_to_end_resource_ref(workdir):
+    """res_<id> (ressource de session côté client, MIAOU lot K) doit être
+    accepté et matérialisable/lisible de bout en bout comme att-N/file-<id>."""
+    from mcp_docs import server as docs_server
+
+    path = _make_pdf(workdir, ["irrelevant, materialisation manuelle ci-dessous"])
+    dest = session_dir("conv-1") / "res_abc123.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(path.read_bytes())
+
+    tm = docs_server.mcp._tool_manager
+    result = await tm.call_tool("list", {"ref": "res_abc123", "session_id": "conv-1"})
+    assert "PDF" in result
+
+
+@pytest.mark.asyncio
+async def test_read_tool_end_to_end_resource_ref(workdir):
+    from mcp_docs import server as docs_server
+
+    path = _make_pdf(workdir, ["Resource ref page text"])
+    dest = session_dir("conv-1") / "res_abc123.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(path.read_bytes())
+
+    tm = docs_server.mcp._tool_manager
+    result = await tm.call_tool("read", {"ref": "res_abc123", "session_id": "conv-1"})
+    assert "Resource ref page text" in result
 
 
 @pytest.mark.asyncio

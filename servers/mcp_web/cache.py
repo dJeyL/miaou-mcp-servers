@@ -39,6 +39,7 @@ WORKDIR = Path(os.environ.get("MIAOU_WEB_WORKDIR") or "./miaou-web")
 TTL_HOURS = _env_int("MIAOU_WEB_CACHE_TTL_H", 24)
 READ_CAP = _env_int("MIAOU_WEB_READ_CAP", 20000)
 LIST_CAP = _env_int("MIAOU_WEB_LIST_CAP", 100)
+RESOURCE_MAX_BYTES = _env_int("MIAOU_WEB_RESOURCE_MAX_BYTES", 5 * 1024 * 1024)
 
 
 def url_key(url: str) -> str:

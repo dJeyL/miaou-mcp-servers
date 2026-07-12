@@ -374,6 +374,123 @@ async def test_fetch_read_touches_html_and_structure_mtime(monkeypatch):
         assert path.stat().st_mtime > old_time
 
 
+@pytest.mark.asyncio
+async def test_fetch_resource_binary_returns_two_blocks():
+    body = b"%PDF-1.4 fake pdf bytes"
+    mock_resp = _make_mock_resp(body, "application/pdf")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_resource", {"url": "http://example.com/doc.pdf"})
+    assert isinstance(result, list)
+    assert len(result) == 2
+    text_block, resource_block = result
+    assert isinstance(text_block, types.TextContent)
+    assert "base64" not in text_block.text.lower()
+    assert "application/pdf" in text_block.text
+    assert str(len(body)) in text_block.text
+    assert "http://example.com/doc.pdf" in text_block.text
+    assert isinstance(resource_block, types.EmbeddedResource)
+    assert isinstance(resource_block.resource, types.BlobResourceContents)
+    assert resource_block.resource.mimeType == "application/pdf"
+    assert str(resource_block.resource.uri) == "http://example.com/doc.pdf"
+    assert base64.b64decode(resource_block.resource.blob) == body
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_large_json_stays_blob_not_text():
+    """AUDIT §3.3 : même du JSON volumineux part en .blob, jamais en .text —
+    fetch_resource veut les octets bruts hors contexte, pas une lecture inline."""
+    body = ('{"items": [' + ",".join(str(i) for i in range(2000)) + "]}").encode()
+    mock_resp = _make_mock_resp(body, "application/json")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_resource", {"url": "http://api.example.com/big.json"})
+    assert isinstance(result, list)
+    resource_block = result[1]
+    assert isinstance(resource_block.resource, types.BlobResourceContents)
+    assert not hasattr(resource_block.resource, "text") or resource_block.resource.text is None
+    assert base64.b64decode(resource_block.resource.blob) == body
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_truncates_at_max_bytes():
+    body = b"A" * 100
+    mock_resp = _make_mock_resp(body, "application/octet-stream")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool(
+            "fetch_resource", {"url": "http://example.com/big.bin", "max_bytes": 10}
+        )
+    text_block, resource_block = result
+    decoded = base64.b64decode(resource_block.resource.blob)
+    assert len(decoded) == 10
+    assert "Tronqué" in text_block.text
+    assert "10" in text_block.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_descriptor_is_kv_stable():
+    """Checkpoint §7.4 : deux appels identiques doivent produire un descripteur
+    byte-identique (pas de timestamp/id/hash)."""
+    body = b"stable content"
+    mock_resp = _make_mock_resp(body, "text/csv")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result1 = await _TM.call_tool("fetch_resource", {"url": "http://example.com/data.csv"})
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result2 = await _TM.call_tool("fetch_resource", {"url": "http://example.com/data.csv"})
+    assert result1[0].text == result2[0].text
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rejects_ftp_scheme():
+    result = await _TM.call_tool("fetch_resource", {"url": "ftp://example.com/file"})
+    assert isinstance(result, str)
+    assert "schéma" in result.lower() or "autorisé" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_rejects_non_positive_max_bytes():
+    result = await _TM.call_tool(
+        "fetch_resource", {"url": "http://example.com/x", "max_bytes": 0}
+    )
+    assert isinstance(result, str)
+    assert "max_bytes" in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_url_error_returns_string():
+    err = urllib.error.URLError("Connection refused")
+    with patch("urllib.request.OpenerDirector.open", side_effect=err):
+        result = await _TM.call_tool(
+            "fetch_resource", {"url": "http://unreachable.local/file"}
+        )
+    assert isinstance(result, str)
+    assert "réseau" in result.lower() or "Connection refused" in result
+
+
+def test_resource_max_bytes_env_var_parsed_via_env_int():
+    """MIAOU_WEB_RESOURCE_MAX_BYTES respectée : même mécanisme _env_int que
+    READ_CAP/LIST_CAP, défaut 5 Mo si absente."""
+    assert mcp_web_cache.RESOURCE_MAX_BYTES == mcp_web_cache._env_int(
+        "MIAOU_WEB_RESOURCE_MAX_BYTES", 5 * 1024 * 1024
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_uses_resource_max_bytes_as_default():
+    """Sans max_bytes explicite, le défaut résolu doit être web_cache.RESOURCE_MAX_BYTES
+    (pas un magic number local) : un corps sous ce seuil ne doit pas être tronqué."""
+    body = b"petit corps, largement sous le defaut"
+    mock_resp = _make_mock_resp(body, "application/octet-stream")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_resource", {"url": "http://example.com/small.bin"})
+    text_block, resource_block = result
+    assert "Tronqué" not in text_block.text
+    assert base64.b64decode(resource_block.resource.blob) == body
+
+
+def test_tool_list_contains_fetch_resource():
+    names = {t.name for t in _TM.list_tools()}
+    assert "fetch_resource" in names
+
+
 def test_env_int_invalid_value_raises_named_error(monkeypatch):
     """W8/D2 : une variable d'environnement non numérique doit lever une
     erreur nommant la variable, pas un ValueError anonyme à l'import."""
