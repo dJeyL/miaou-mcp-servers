@@ -198,7 +198,7 @@ servers/mcp_docs/
                      # testable en isolation sans fixture binaire
 ```
 
-Quatre outils exposés (préfixés `docs__` par le proxy) :
+Cinq outils exposés (préfixés `docs__` par le proxy) :
 
 | Outil | Rôle |
 |---|---|
@@ -206,11 +206,33 @@ Quatre outils exposés (préfixés `docs__` par le proxy) :
 | `list(ref, path?, session_id?, content_b64?, filename?)` | Structure du document sans contenu (pages/feuilles/slides/entrées zip) |
 | `read(ref, path?, selector?, char_start?, char_end?, line_start?, line_end?, session_id?, content_b64?, filename?)` | Extrait borné (plage de pages/lignes/slides), plafonné par `MIAOU_DOCS_READ_CAP` ; plage char/ligne pour paginer une unité au-delà du cap |
 | `search(ref, query, path?, session_id?, content_b64?, filename?)` | Recherche de texte groupée par unité (page/feuille/slide/membre zip), plafonnée par `MIAOU_DOCS_SEARCH_CAP` |
+| `extract(ref, path, session_id?, content_b64?, filename?)` | Transfère le texte **intégral** d'un membre texte de zip au client, **sans READ_CAP** (voir exception ci-dessous) ; membre structuré (docx/xlsx/pptx/pdf/zip imbriqué) refusé, orienté vers `read`/`list` |
 
 Signature commune inflatable : `ref: str, content_b64: str | None = None, session_id: str
-| None = None` sur `list`/`read`/`search` — obligatoire pour la détection de capability du
-dispatcher MIAOU (voir « Contrat docs » ci-dessous). `drop_session` n'a volontairement
-pas `ref` : le hook client reste inerte dessus.
+| None = None` sur `list`/`read`/`search`/`extract` — obligatoire pour la détection de
+capability du dispatcher MIAOU (voir « Contrat docs » ci-dessous). `drop_session` n'a
+volontairement pas `ref` : le hook client reste inerte dessus.
+
+**Exception `extract` — membre complet, transfert pas contexte.** `extract` est le SEUL
+outil `docs__` qui renvoie un membre en entier sans le borner par `MIAOU_DOCS_READ_CAP`.
+Ce n'est pas une brèche du cap : `READ_CAP` borne ce qui entre dans le **contexte du
+modèle**, pas ce **transfert**. Les octets partent en `resource.blob` (mimeType textuel)
+via le canal `content_b64` vers le client MIAOU, qui les matérialise en ressource `res_…`
+de classe `inline` — jamais restitués au modèle en tool result. Le modèle reçoit seulement
+un handle, qu'il passe ensuite à `js__eval(handle, code)` pour compter/filtrer/agréger sur
+le membre complet sans jamais payer son poids en tokens. `path` est obligatoire (le membre
+précis à extraire) ; un `ref` qui n'est pas une archive, ou un membre structuré
+(pdf/docx/xlsx/pptx/zip imbriqué), est refusé avec un message orientant vers `read`/`list`.
+Mêmes gardes zip que `read` (zip-slip, chiffrement, taille en flux).
+
+`extract` ne déclare **ni** `char_start`/`line_start` **ni** `query` : côté MIAOU, la
+sélection applicative de l'outil de lecture de contenu (`findDocsInflationTool` /
+`_declaresContentReadSignature`, cf. `docs/mcp.md` point 14 du repo client) exige la
+signature de pagination (`char_start`/`line_start`) — `extract` n'y répond pas et n'est
+donc jamais pris à tort pour l'outil de lecture par ce chemin sans-modèle, exactement
+comme `search` (écarté par son `query`). C'est le **modèle** qui appelle `extract`
+nommément ; le hook d'inflation (`toolDeclaresAttachmentInflation`) ne vérifie que
+`ref`+`content_b64`, tous deux présents.
 
 `search` : requête en ET implicite (termes espacés) + `"phrase exacte"` entre guillemets,
 insensible casse/accents (fold Unicode NFKD + mapping manuel des ligatures œ/æ, non

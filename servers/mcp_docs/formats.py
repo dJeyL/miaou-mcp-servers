@@ -863,6 +863,30 @@ def zip_read_member(
     return capped + notice
 
 
+def zip_extract_member_text(path: DocSource, member_path: str) -> str:
+    """Extrait le **texte intégral** d'un membre zip, sans `_apply_range`/`READ_CAP`
+    — cette voie ne renvoie rien au contexte du modèle : les octets transitent vers
+    le client (canal `content_b64`/`res_…`, lot K MIAOU) qui les matérialise en
+    ressource adressable par `js__eval`. `READ_CAP` borne le *contexte*, pas ce
+    *transfert*. Mêmes gardes que `zip_read_member` (zip-slip, chiffré, taille en
+    flux, via `_extract_zip_member_bytes`) ; un membre structuré (pdf/docx/xlsx/
+    pptx/zip imbriqué) est refusé explicitement — `docs__extract` ne cible que le
+    texte brut (logs/JSON/CSV), `docs__read` reste la voie pour un membre structuré."""
+    data = _extract_zip_member_bytes(path, member_path)
+
+    if _is_structured_document(data[:8]):
+        raise ToolError(
+            f"'{member_path}' est un document structuré (pdf/docx/xlsx/pptx/zip), "
+            f"pas un membre texte — docs__extract ne cible que le texte brut. "
+            f"Utiliser docs__read(path='{member_path}') ou docs__list(path='{member_path}')."
+        )
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ToolError(f"Membre binaire non décodable en UTF-8 : '{member_path}'") from e
+
+
 def zip_search(path: DocSource, query: Query, member_path: str | None = None) -> list[UnitResult]:
     """Cherche dans les membres texte brut d'une archive zip. Sans
     `member_path`, balaie tous les membres non ignorés ; avec `member_path`,

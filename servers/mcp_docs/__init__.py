@@ -56,8 +56,10 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 from __future__ import annotations
 
 import asyncio
+import base64
 import shutil
 
+from mcp import types
 from mcp_base import MiaouMCPBase
 
 from .formats import (
@@ -66,6 +68,7 @@ from .formats import (
     list_document,
     read_document,
     search_document,
+    zip_extract_member_text,
     zip_list_member,
     zip_read_member,
     zip_search,
@@ -263,6 +266,56 @@ class DocsServer(MiaouMCPBase):
         balayés (signalé en fin de résultat). Sans `path`, tous les membres
         texte ; avec `path`, ce seul membre."""
         self.mcp.tool(name="search")(search)
+
+        async def extract(
+            ref: str,
+            path: str,
+            session_id: str | None = None,
+            content_b64: str | None = None,
+            filename: str | None = None,
+        ) -> list[types.ContentBlock]:
+            if session_id is None:
+                raise ToolError("session_id requis (appel hors MIAOU ?)")
+            doc_path = resolve_ref(session_id, ref, content_b64)
+            kind = detect_kind(doc_path, filename)
+            if kind != "zip":
+                raise ToolError(f"'{ref}' n'est pas une archive : extract ne s'applique qu'à un zip")
+
+            text = await asyncio.to_thread(zip_extract_member_text, doc_path, path)
+            blob = base64.b64encode(text.encode("utf-8")).decode()
+
+            # Ce chemin renvoie le membre en entier — READ_CAP borne le contexte
+            # du modèle, pas ce transfert : les octets vont au client (canal
+            # content_b64/res_…, lot K), jamais dans le message tool renvoyé au
+            # modèle. Le descripteur texte ci-dessous est tout ce que le modèle voit.
+            descripteur = (
+                f"Membre '{path}' transféré au client : text/plain, "
+                f"{len(text)} caractères. Adressable via js__eval une fois matérialisé."
+            )
+            return [
+                types.TextContent(type="text", text=descripteur),
+                types.EmbeddedResource(
+                    type="resource",
+                    resource=types.BlobResourceContents(
+                        uri=f"zip-member:{ref}/{path}",  # type: ignore[arg-type]
+                        mimeType="text/plain",
+                        blob=blob,
+                    ),
+                ),
+            ]
+
+        extract.__doc__ = """Extrait le texte **intégral** d'un membre texte d'une archive
+        zip (log/JSON/CSV…) et le transfère au client sans jamais le faire
+        transiter par le contexte du modèle — contrairement à read(path=...) qui
+        renvoie un extrait borné en contexte. Le membre est matérialisé
+        côté client en ressource `res_…`, ensuite exploitable par
+        js__eval(handle, code) pour compter/filtrer/agréger sans coût de contexte.
+
+        Ne cible que le texte brut : un membre structuré (docx/xlsx/pptx/pdf/zip
+        imbriqué) est refusé — utiliser read(path=...) ou list(path=...) pour ce
+        cas. Mêmes gardes de sécurité que read(path=...) sur un zip (zip-slip,
+        membre chiffré, taille en flux)."""
+        self.mcp.tool(name="extract")(extract)
 
         self.finalize_tools()
 

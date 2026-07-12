@@ -27,6 +27,7 @@ from mcp_docs.formats import (
     detect_kind,
     list_document,
     read_document,
+    zip_extract_member_text,
     zip_list_member,
     zip_read_member,
 )
@@ -1488,6 +1489,115 @@ def test_zip_read_member_nested_corrupted_docx_raises_clear_error(tmp_path):
 
     with pytest.raises(ToolError):
         zip_read_member(outer, "membre.docx")
+
+
+# ---------------------------------------------------------------------------
+# zip_extract_member_text (lot M — texte intégral, sans READ_CAP, transfert client)
+# ---------------------------------------------------------------------------
+
+def test_zip_extract_member_text_returns_full_text_no_truncation(tmp_path):
+    """Un membre plus long que READ_CAP doit ressortir intégralement — aucune
+    notice de troncature, contrairement à zip_read_member."""
+    big = "line\n" * (docs_session.READ_CAP // 4)
+    path = _make_zip(tmp_path, {"big.log": big})
+    result = zip_extract_member_text(path, "big.log")
+    assert result == big
+    assert len(result) > docs_session.READ_CAP
+    assert "Tronqué" not in result
+    assert "tronqu" not in result.lower()
+
+
+def test_zip_extract_member_text_rejects_traversal(tmp_path):
+    path = _make_zip(tmp_path, {"a.txt": "hello"})
+    with pytest.raises(ToolError, match="invalide"):
+        zip_extract_member_text(path, "../../etc/passwd")
+
+
+@_requires_zip_cli
+def test_zip_extract_member_text_rejects_encrypted(tmp_path):
+    import zipfile
+
+    archive = _make_encrypted_zip(tmp_path)
+    with zipfile.ZipFile(archive) as z:
+        member_name = z.namelist()[0]
+
+    with pytest.raises(ToolError, match="chiffré"):
+        zip_extract_member_text(archive, member_name)
+
+
+def test_zip_extract_member_text_rejects_structured_document(tmp_path):
+    """Un membre docx doit être refusé explicitement (steer vers docs__read), pas
+    renvoyé comme du texte (XML brut de l'archive Office serait incompréhensible)."""
+    inner = _make_docx(tmp_path, [(1, "Intro"), (None, "Nested body text")])
+    outer = _zip_with_member_bytes(tmp_path, "membre.docx", inner.read_bytes())
+
+    with pytest.raises(ToolError, match="structuré"):
+        zip_extract_member_text(outer, "membre.docx")
+
+
+def test_zip_extract_member_text_rejects_binary_member(tmp_path):
+    path = _make_zip(tmp_path, {})
+    import zipfile
+
+    with zipfile.ZipFile(path, "a") as z:
+        z.writestr("blob.bin", b"\xff\xfe\x00\x01binary")
+
+    with pytest.raises(ToolError, match="binaire"):
+        zip_extract_member_text(path, "blob.bin")
+
+
+def test_zip_extract_member_text_unknown_member_raises(tmp_path):
+    path = _make_zip(tmp_path, {"a.txt": "hello"})
+    with pytest.raises(ToolError, match="introuvable"):
+        zip_extract_member_text(path, "missing.txt")
+
+
+@pytest.mark.asyncio
+async def test_extract_tool_returns_blob_resource_with_textual_mime(workdir):
+    """docs__extract renvoie un TextContent descripteur (sans le texte du membre)
+    + un EmbeddedResource blob mimeType text/plain — le canal K, jamais
+    resource.text (le texte ne doit jamais atterrir dans le contenu textuel)."""
+    from mcp_docs import server as docs_server
+
+    outer = _make_zip(workdir, {"data.json": '{"hits": 42}'})
+    dest = session_dir("conv-1") / "att-1.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(outer.read_bytes())
+
+    tm = docs_server.mcp._tool_manager
+    result = await tm.call_tool(
+        "extract", {"ref": "att-1", "session_id": "conv-1", "path": "data.json"}
+    )
+    blocks = result.content if hasattr(result, "content") else result
+
+    text_blocks = [b for b in blocks if getattr(b, "type", None) == "text"]
+    resource_blocks = [b for b in blocks if getattr(b, "type", None) == "resource"]
+
+    assert len(resource_blocks) == 1
+    resource = resource_blocks[0].resource
+    assert resource.mimeType == "text/plain"
+    assert base64.b64decode(resource.blob).decode("utf-8") == '{"hits": 42}'
+
+    for tb in text_blocks:
+        assert "hits" not in tb.text
+        assert "42" not in tb.text
+
+
+@pytest.mark.asyncio
+async def test_extract_tool_rejects_non_zip_ref(workdir):
+    from mcp.server.fastmcp.exceptions import ToolError as FastMCPToolError
+
+    from mcp_docs import server as docs_server
+
+    dest = session_dir("conv-1") / "att-1.bin"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(b"not a zip")
+
+    tm = docs_server.mcp._tool_manager
+    with pytest.raises(FastMCPToolError, match="archive"):
+        await tm.call_tool(
+            "extract", {"ref": "att-1", "session_id": "conv-1", "path": "whatever.txt"}
+        )
 
 
 @pytest.mark.asyncio
