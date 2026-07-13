@@ -242,6 +242,107 @@ async def test_inprocess_upstream_env_does_not_override_existing():
     del os.environ[key]
 
 
+# ---------------------------------------------------------------------------
+# InProcessUpstream — support config (multi-instance du même module)
+# ---------------------------------------------------------------------------
+
+def test_build_upstreams_inprocess_config_stored():
+    """L'entrée config de config.json est transmise à InProcessUpstream."""
+    cfg = {
+        "port": 8767,
+        "mcpServers": {
+            "ibm_prod": {
+                "type": "inprocess",
+                "module": "mcp_bench",
+                "config": {"base_url": "https://prod.example.com"},
+            }
+        },
+    }
+    upstreams = build_upstreams(cfg)
+    assert upstreams["ibm_prod"]._config == {"base_url": "https://prod.example.com"}
+
+
+@pytest.mark.asyncio
+async def test_inprocess_upstream_uses_build_when_available():
+    """Un module avec build(config) est instancié via build(), pas via l'attribut mcp."""
+    import types as _types
+
+    from mcp.server.fastmcp import FastMCP
+
+    fake_module = _types.ModuleType("mcp_fake_buildable")
+    captured: dict = {}
+
+    def build(config=None):
+        captured["config"] = config
+        fastmcp = FastMCP("fake")
+
+        @fastmcp.tool()
+        def get_base_url() -> str:
+            return (config or {}).get("base_url", "unset")
+
+        return fastmcp
+
+    fake_module.build = build
+    sys.modules["mcp_fake_buildable"] = fake_module
+
+    try:
+        upstream = InProcessUpstream("mcp_fake_buildable", config={"base_url": "https://prod.example.com"})
+        await upstream.start()
+        assert captured["config"] == {"base_url": "https://prod.example.com"}
+        result = await upstream.call_tool("get_base_url", {})
+        assert any("prod.example.com" in str(r) for r in result)
+    finally:
+        del sys.modules["mcp_fake_buildable"]
+
+
+@pytest.mark.asyncio
+async def test_inprocess_upstream_falls_back_to_mcp_singleton_without_build():
+    """Non-régression : un module sans build() (tous les serveurs existants
+    aujourd'hui) continue de résoudre via l'attribut module.mcp, comme avant."""
+    upstream = InProcessUpstream("mcp_bench")
+    await upstream.start()
+    tools = await upstream.list_tools()
+    assert {t.name for t in tools} >= {"echo", "add"}
+
+
+@pytest.mark.asyncio
+async def test_inprocess_upstream_two_instances_same_module_different_config():
+    """Le cas d'usage cible : deux instances du même module (un seul fichier),
+    chacune avec sa propre config, produisent des FastMCP indépendants qui
+    renvoient des valeurs différentes."""
+    import types as _types
+
+    from mcp.server.fastmcp import FastMCP
+
+    fake_module = _types.ModuleType("mcp_fake_multi")
+
+    def build(config=None):
+        fastmcp = FastMCP("fake-multi")
+
+        @fastmcp.tool()
+        def get_base_url() -> str:
+            return (config or {}).get("base_url", "unset")
+
+        return fastmcp
+
+    fake_module.build = build
+    sys.modules["mcp_fake_multi"] = fake_module
+
+    try:
+        upstream_prod = InProcessUpstream("mcp_fake_multi", config={"base_url": "prod"})
+        upstream_uat = InProcessUpstream("mcp_fake_multi", config={"base_url": "uat"})
+        await upstream_prod.start()
+        await upstream_uat.start()
+
+        result_prod = await upstream_prod.call_tool("get_base_url", {})
+        result_uat = await upstream_uat.call_tool("get_base_url", {})
+
+        assert any("prod" in str(r) for r in result_prod)
+        assert any("uat" in str(r) for r in result_uat)
+    finally:
+        del sys.modules["mcp_fake_multi"]
+
+
 @pytest.mark.asyncio
 async def test_proxy_call_tool_falls_back_to_prefix_when_not_in_tool_map():
     """P2 : si `name` n'est pas dans tool_map au moment de l'appel (ex. le

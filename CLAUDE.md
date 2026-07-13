@@ -444,6 +444,39 @@ sans redirection.
 `"_disabled": true` sur une entrée `mcpServers` → upstream ignoré au démarrage.
 `env` sur une entrée inprocess → variables posées via `os.environ.setdefault` avant l'import.
 
+### Multi-instance inprocess (clé `config`)
+
+`importlib.import_module` ne charge un module qu'une fois par process : `env`
+(via `os.environ.setdefault`) est donc figé à la première instanciation et ne
+permet pas plusieurs entrées `mcpServers` du même module avec des valeurs
+différentes (ex. 3 environnements d'une même API : prod/uat/dev). Pour ce cas,
+une entrée `mcpServers` accepte une clé `"config"` (dict libre, propre au
+serveur) en plus de `"env"` :
+
+```json
+"api_prod": { "type": "inprocess", "module": "mcp_example_api", "config": { "base_url": "https://prod...", "client_id": "..." } },
+"api_uat":  { "type": "inprocess", "module": "mcp_example_api", "config": { "base_url": "https://uat...",  "client_id": "..." } }
+```
+
+Un module qui veut supporter ça expose une factory `build(config: dict | None)
+-> FastMCP` en plus du singleton `mcp` — `InProcessUpstream.start()` (dans
+`mcp_proxy.py`) appelle `module.build(config)` si elle existe, sinon retombe
+sur `module.mcp` (comportement actuel, inchangé pour tous les serveurs qui
+n'ont pas de `build()`) :
+
+```python
+def build(config: dict | None = None) -> FastMCP:
+    return MyServer(config or {}).mcp
+
+server = MyServer()
+mcp = server.mcp  # toujours exposé, pour compat avec le chemin sans build()
+```
+
+`self.config` (posé par `MiaouMCPBase.__init__`) transporte ce dict — chaque
+serveur lit ce qu'il veut dedans, aucune validation de schéma imposée par la
+base. `env` reste le mécanisme pour stdio ou pour un serveur inprocess qui
+préfère réellement lire `os.environ` (un seul jeu de valeurs par process).
+
 ## Architecture commune des serveurs
 
 ```python

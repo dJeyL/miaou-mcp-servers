@@ -74,9 +74,15 @@ class Upstream(ABC):
 class InProcessUpstream(Upstream):
     """Appelle un FastMCP dans le même processus Python, sans subprocess."""
 
-    def __init__(self, module_name: str, env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        module_name: str,
+        env: dict[str, str] | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> None:
         self._module_name = module_name
         self._env = env
+        self._config = config
         self._tool_manager: Any = None
 
     async def start(self) -> None:
@@ -85,10 +91,20 @@ class InProcessUpstream(Upstream):
             for key, value in self._env.items():
                 os.environ.setdefault(key, value)
         module = importlib.import_module(self._module_name)
-        fastmcp = getattr(module, "mcp", None)
+        # Un module qui expose build(config) -> FastMCP supporte le multi-instance
+        # (plusieurs entrées config.json du même module, chacune avec sa propre
+        # config) : importlib.import_module ne recharge un module qu'une fois par
+        # process, donc tout état lu au niveau module (ou via env) serait figé à
+        # la première instanciation. Fallback sur le singleton module.mcp pour les
+        # serveurs existants, qui n'ont pas besoin de multi-instance.
+        build_fn = getattr(module, "build", None)
+        if build_fn is not None:
+            fastmcp = build_fn(self._config)
+        else:
+            fastmcp = getattr(module, "mcp", None)
         if fastmcp is None:
             raise RuntimeError(
-                f"Le module '{self._module_name}' n'expose pas d'attribut 'mcp' (FastMCP)."
+                f"Le module '{self._module_name}' n'expose ni 'build(config)' ni 'mcp' (FastMCP)."
             )
         self._tool_manager = fastmcp._tool_manager
 
@@ -175,7 +191,9 @@ def build_upstreams(cfg: dict[str, Any]) -> dict[str, Upstream]:
             module = srv.get("module")
             if not module:
                 raise ValueError(f"Serveur '{name}' inprocess sans clé 'module'.")
-            upstreams[name] = InProcessUpstream(module, env=srv.get("env"))
+            upstreams[name] = InProcessUpstream(
+                module, env=srv.get("env"), config=srv.get("config")
+            )
         elif srv_type == "stdio":
             command = srv.get("command")
             if not command:

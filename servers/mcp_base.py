@@ -65,6 +65,12 @@ def make_opener() -> urllib.request.OpenerDirector:
 class MiaouMCPBase:
     """Base for MIAOU MCP servers.
 
+    `config` transporte un dict libre propre à l'instance (base URL, credentials,
+    etc.) — support du multi-instance inprocess : plusieurs entrées `mcpServers`
+    du même module dans config.json, chacune avec sa propre clé `"config"` (voir
+    `InProcessUpstream` dans mcp_proxy.py). Un serveur qui n'a pas besoin de
+    multi-instance peut l'ignorer et continuer à lire `os.environ` comme avant.
+
     Usage:
         class MyServer(MiaouMCPBase):
             def __init__(self):
@@ -82,8 +88,9 @@ class MiaouMCPBase:
             server.main()
     """
 
-    def __init__(self, name: str, default_port: int) -> None:
+    def __init__(self, name: str, default_port: int, config: dict | None = None) -> None:
         self.default_port = default_port
+        self.config = config or {}
         _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
         self.mcp = FastMCP(name, transport_security=_security)
 

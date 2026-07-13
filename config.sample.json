@@ -45,6 +45,19 @@
       "command": "uv",
       "args": ["run", "servers/mcp_bench.py", "--transport", "stdio"],
       "env": {}
+    },
+    "_example_multi_prod": {
+      "_disabled": true,
+      "type": "inprocess",
+      "module": "mcp_example_api",
+      "config": { "base_url": "https://prod.api.example.com", "client_id": "prod-client-id" },
+      "_comment": "Exemple multi-instance : plusieurs entrées du même module, chacune avec sa propre clé 'config' (dict libre lu par le serveur via self.config). Voir aussi _example_multi_uat ci-dessous — même module, config différente. 'env' reste réservé à stdio ou aux serveurs qui lisent réellement os.environ."
+    },
+    "_example_multi_uat": {
+      "_disabled": true,
+      "type": "inprocess",
+      "module": "mcp_example_api",
+      "config": { "base_url": "https://uat.api.example.com", "client_id": "uat-client-id" }
     }
   }
 }
