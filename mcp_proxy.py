@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -210,6 +211,72 @@ class StdioUpstream(Upstream):
 
 
 # ---------------------------------------------------------------------------
+# Override CLI du proxy réseau (--proxy / --noproxy)
+# ---------------------------------------------------------------------------
+
+# Les 4 variantes de casse lues par urllib (make_opener) comme par la plupart
+# des clients HTTP — on les pose/efface toutes pour ne pas laisser une variante
+# existante contredire l'override CLI.
+_PROXY_ENV_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+
+
+def resolve_proxy_url(raw: str) -> str:
+    """Ajoute "http://" si l'argument --proxy ne porte aucun schéma."""
+    return raw if "://" in raw else f"http://{raw}"
+
+
+def compute_proxy_env_overrides(
+    proxy: str | None, noproxy: bool
+) -> dict[str, str | None] | None:
+    """Calcule les overrides d'environnement proxy à appliquer partout (inprocess
+    via os.environ du process, stdio via le dict env du subprocess).
+
+    None → aucun override (comportement inchangé, ni --proxy ni --noproxy).
+    Une valeur str → variable posée à cette valeur (ex. "http://host:port").
+    Une valeur None → variable à supprimer/ne pas transmettre (--noproxy).
+
+    --proxy et --noproxy sont absolus : ils priment sur tout http_proxy/https_proxy
+    déjà défini dans le `env` d'une entrée config.json (choix explicite : la CLI
+    est la garantie ultime de contrôle du proxy réseau vu par les upstreams).
+    """
+    if noproxy:
+        return {key: None for key in _PROXY_ENV_KEYS}
+    if proxy:
+        url = resolve_proxy_url(proxy)
+        return {key: url for key in _PROXY_ENV_KEYS}
+    return None
+
+
+def apply_proxy_env_overrides_to_process(overrides: dict[str, str | None]) -> None:
+    """Applique les overrides à os.environ du process proxy lui-même — couvre tous
+    les upstreams inprocess, qui partagent ce process (make_opener() dans
+    mcp_base.py relit os.environ à chaque requête via ProxyHandler())."""
+    for key, value in overrides.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def merge_proxy_env_overrides(
+    env: dict[str, str] | None, overrides: dict[str, str | None] | None
+) -> dict[str, str] | None:
+    """Fusionne les overrides proxy dans le `env` d'un upstream stdio (config.json
+    prioritaire par défaut, mais CLI écrase toujours — cf. compute_proxy_env_overrides).
+    Ignoré si overrides est None (ni --proxy ni --noproxy) : env repart inchangé,
+    y compris None (StdioServerParameters distingue env=None de env={})."""
+    if overrides is None:
+        return env
+    merged = dict(env) if env else {}
+    for key, value in overrides.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
 
@@ -223,7 +290,14 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return cfg
 
 
-def build_upstreams(cfg: dict[str, Any]) -> dict[str, Upstream]:
+def build_upstreams(
+    cfg: dict[str, Any],
+    proxy_env_overrides: dict[str, str | None] | None = None,
+) -> dict[str, Upstream]:
+    """`proxy_env_overrides` (cf. compute_proxy_env_overrides) : appliqué au `env`
+    de chaque upstream stdio. Les inprocess n'en ont pas besoin ici — ils partagent
+    l'environnement du process proxy, déjà modifié directement par main() via
+    apply_proxy_env_overrides_to_process() avant l'import des modules."""
     upstreams: dict[str, Upstream] = {}
     for name, srv in cfg.get("mcpServers", {}).items():
         if srv.get("_disabled"):
@@ -240,10 +314,11 @@ def build_upstreams(cfg: dict[str, Any]) -> dict[str, Upstream]:
             command = srv.get("command")
             if not command:
                 raise ValueError(f"Serveur '{name}' stdio sans clé 'command'.")
+            env = merge_proxy_env_overrides(srv.get("env"), proxy_env_overrides)
             upstreams[name] = StdioUpstream(
                 command=command,
                 args=srv.get("args", []),
-                env=srv.get("env"),
+                env=env,
                 cwd=srv.get("cwd"),
             )
         else:
@@ -460,7 +535,31 @@ def main() -> None:
     )
     parser.add_argument("--host", default=None, help="Override de l'adresse d'écoute")
     parser.add_argument("--port", type=int, default=None, help="Override du port")
+    parser.add_argument(
+        "--proxy",
+        default=None,
+        metavar="[http://]host:port",
+        help=(
+            "Force http_proxy/https_proxy (et variantes majuscules) vus par tous "
+            "les serveurs MCP servis (inprocess et stdio), même si ces variables "
+            "sont déjà définies dans l'environnement ou dans config.json. "
+            "'http://' est ajouté si absent."
+        ),
+    )
+    parser.add_argument(
+        "--noproxy",
+        action="store_true",
+        help=(
+            "Force l'absence de proxy pour tous les serveurs MCP servis (inprocess "
+            "et stdio), même si http_proxy/https_proxy sont définis dans "
+            "l'environnement ou dans config.json. Incompatible avec --proxy."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.proxy and args.noproxy:
+        print("Erreur : --proxy et --noproxy sont mutuellement exclusifs.", file=sys.stderr)
+        sys.exit(1)
 
     config_path = Path(args.config)
     if not config_path.exists():
@@ -479,7 +578,15 @@ def main() -> None:
         print(f"Erreur : {e}", file=sys.stderr)
         sys.exit(1)
 
-    upstreams = build_upstreams(cfg)
+    proxy_overrides = compute_proxy_env_overrides(args.proxy, args.noproxy)
+    if proxy_overrides is not None:
+        # Avant build_upstreams : les upstreams inprocess importent leur module
+        # (donc appellent potentiellement make_opener()/ProxyHandler() dès le
+        # premier tool call) en partageant l'environnement de ce process — poser
+        # les overrides ici les couvre sans toucher InProcessUpstream.
+        apply_proxy_env_overrides_to_process(proxy_overrides)
+
+    upstreams = build_upstreams(cfg, proxy_env_overrides=proxy_overrides)
     tool_map: dict[str, tuple[str, str]] = {}
     mcp_server = build_proxy_server(upstreams, tool_map)
     app = build_app(mcp_server, upstreams)

@@ -359,6 +359,32 @@ Les entrées inprocess acceptent un champ `env` pour injecter des variables d'en
 avant l'import du module (`os.environ.setdefault`) — utilisé par `mcp_brave` pour
 `BRAVE_API_KEY`.
 
+### Override du proxy réseau vu par les upstreams (`--proxy` / `--noproxy`)
+
+Deux options CLI, mutuellement exclusives, pour contrôler `http_proxy`/`https_proxy`
+(et variantes `HTTP_PROXY`/`HTTPS_PROXY`) vus par les serveurs upstream servis :
+
+- `--proxy [http://]host:port` : force les 4 variantes de casse à cette valeur
+  (`http://` ajouté si le schéma est absent).
+- `--noproxy` : force l'absence de proxy (les 4 variantes supprimées/non transmises).
+
+Absolus : ils priment sur toute variable déjà présente dans l'environnement du process
+proxy **et** sur un `env` explicite d'une entrée `config.json` — pas seulement sur un
+héritage implicite. Sans l'un ou l'autre, comportement inchangé.
+
+Deux chemins d'application distincts selon le type d'upstream :
+
+- **inprocess** : partage le process du proxy, donc `main()` pose/efface directement les
+  4 clés dans `os.environ` du process (`apply_proxy_env_overrides_to_process`) avant
+  `build_upstreams` — `make_opener()` (`servers/mcp_base.py`) relit `os.environ` à chaque
+  requête via `ProxyHandler()`, aucun changement requis dans `InProcessUpstream`.
+- **stdio** : le SDK MCP (`mcp.client.stdio.get_default_environment`) n'hérite qu'une
+  whitelist restreinte (`HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER`) — les variables
+  proxy du process proxy ne sont **jamais** vues par un subprocess sauf si explicitement
+  posées dans son `env`. `build_upstreams` fusionne donc les overrides dans le `env` de
+  chaque `StdioUpstream` via `merge_proxy_env_overrides` (CLI par-dessus `env` de
+  config.json, `--noproxy` retire même une entrée explicite).
+
 ## Transport et configuration MIAOU
 
 Les trois serveurs utilisent **streamable-http** (JSON-RPC 2.0, endpoint unique POST `/mcp`,
@@ -403,6 +429,8 @@ cp config.sample.json config.json     # puis éditer config.json (BRAVE_API_KEY,
 uv run mcp_proxy.py                   # port défini dans config.json
 uv run mcp_proxy.py --port 8767       # override port
 uv run mcp_proxy.py --config autre.json
+uv run mcp_proxy.py --proxy 10.0.0.1:3128   # force le proxy réseau vu par les upstreams
+uv run mcp_proxy.py --noproxy               # force l'absence de proxy vu par les upstreams
 ```
 
 ### Avec pip

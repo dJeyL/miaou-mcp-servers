@@ -1,4 +1,5 @@
 """Tests pour mcp_proxy.py : config, upstreams, routing."""
+import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,10 +17,14 @@ import mcp_proxy
 from mcp_proxy import (
     InProcessUpstream,
     StdioUpstream,
+    apply_proxy_env_overrides_to_process,
     build_app,
     build_proxy_server,
     build_upstreams,
+    compute_proxy_env_overrides,
     load_config,
+    merge_proxy_env_overrides,
+    resolve_proxy_url,
 )
 
 
@@ -274,6 +279,102 @@ async def test_inprocess_upstream_env_does_not_override_existing():
 
     assert os.environ[key] == "original"
     del os.environ[key]
+
+
+# ---------------------------------------------------------------------------
+# Override CLI --proxy / --noproxy
+# ---------------------------------------------------------------------------
+
+def test_resolve_proxy_url_adds_scheme_if_missing():
+    assert resolve_proxy_url("127.0.0.1:3128") == "http://127.0.0.1:3128"
+
+
+def test_resolve_proxy_url_keeps_existing_scheme():
+    assert resolve_proxy_url("https://proxy.example:3128") == "https://proxy.example:3128"
+
+
+def test_compute_proxy_env_overrides_none_by_default():
+    assert compute_proxy_env_overrides(None, False) is None
+
+
+def test_compute_proxy_env_overrides_proxy_sets_all_case_variants():
+    overrides = compute_proxy_env_overrides("127.0.0.1:3128", False)
+    assert overrides == {
+        "http_proxy": "http://127.0.0.1:3128",
+        "https_proxy": "http://127.0.0.1:3128",
+        "HTTP_PROXY": "http://127.0.0.1:3128",
+        "HTTPS_PROXY": "http://127.0.0.1:3128",
+    }
+
+
+def test_compute_proxy_env_overrides_noproxy_clears_all_case_variants():
+    overrides = compute_proxy_env_overrides(None, True)
+    assert overrides == {
+        "http_proxy": None,
+        "https_proxy": None,
+        "HTTP_PROXY": None,
+        "HTTPS_PROXY": None,
+    }
+
+
+def test_apply_proxy_env_overrides_to_process_sets_and_clears(monkeypatch):
+    monkeypatch.setenv("http_proxy", "http://old:1")
+    monkeypatch.delenv("https_proxy", raising=False)
+
+    apply_proxy_env_overrides_to_process(
+        {"http_proxy": "http://new:2", "https_proxy": "http://new:2"}
+    )
+    assert os.environ["http_proxy"] == "http://new:2"
+    assert os.environ["https_proxy"] == "http://new:2"
+
+    apply_proxy_env_overrides_to_process({"http_proxy": None, "https_proxy": None})
+    assert "http_proxy" not in os.environ
+    assert "https_proxy" not in os.environ
+
+
+def test_merge_proxy_env_overrides_none_leaves_env_untouched():
+    assert merge_proxy_env_overrides(None, None) is None
+    assert merge_proxy_env_overrides({"A": "1"}, None) == {"A": "1"}
+
+
+def test_merge_proxy_env_overrides_cli_wins_over_config_env():
+    """--proxy écrase un http_proxy déjà défini explicitement dans config.json."""
+    env = {"http_proxy": "http://from-config:1", "OTHER": "kept"}
+    overrides = {"http_proxy": "http://from-cli:2", "https_proxy": "http://from-cli:2"}
+    merged = merge_proxy_env_overrides(env, overrides)
+    assert merged == {
+        "http_proxy": "http://from-cli:2",
+        "https_proxy": "http://from-cli:2",
+        "OTHER": "kept",
+    }
+
+
+def test_merge_proxy_env_overrides_noproxy_removes_config_env():
+    """--noproxy retire même un http_proxy explicitement défini dans config.json."""
+    env = {"http_proxy": "http://from-config:1", "OTHER": "kept"}
+    overrides = {"http_proxy": None, "https_proxy": None}
+    merged = merge_proxy_env_overrides(env, overrides)
+    assert merged == {"OTHER": "kept"}
+
+
+def test_build_upstreams_stdio_applies_proxy_overrides():
+    cfg = {
+        "port": 8767,
+        "mcpServers": {
+            "external": {
+                "type": "stdio",
+                "command": "uv",
+                "args": ["run", "servers/mcp_bench.py", "--transport", "stdio"],
+                "env": {"http_proxy": "http://from-config:1"},
+            }
+        },
+    }
+    overrides = {"http_proxy": "http://from-cli:2", "https_proxy": "http://from-cli:2"}
+    upstreams = build_upstreams(cfg, proxy_env_overrides=overrides)
+    assert upstreams["external"]._env == {
+        "http_proxy": "http://from-cli:2",
+        "https_proxy": "http://from-cli:2",
+    }
 
 
 # ---------------------------------------------------------------------------

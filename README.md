@@ -86,7 +86,13 @@ Tous les serveurs acceptent :
 Le proxy accepte en plus :
 
 ```
---config FICHIER          Chemin vers config.json (défaut: config.json)
+--config FICHIER            Chemin vers config.json (défaut: config.json)
+--proxy [http://]host:port  Force http_proxy/https_proxy (+ variantes majuscules) vus
+                             par tous les serveurs servis, même si déjà définis dans
+                             l'environnement ou config.json ("http://" ajouté si absent)
+--noproxy                   Force l'absence de proxy pour tous les serveurs servis,
+                             même si http_proxy/https_proxy sont définis ailleurs
+                             (incompatible avec --proxy)
 ```
 
 ## Configuration du proxy (`config.json`)
