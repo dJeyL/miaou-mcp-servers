@@ -86,12 +86,31 @@ def sweep_expired() -> None:
             continue
 
 
-def store(url: str, text: str) -> Path:
+def store(url: str, text: str, *, purge_html: bool = False) -> Path:
+    """Stocke le texte rendu (converti depuis HTML, ou tel quel pour text/* et
+    mimes textuels structurés). purge_html=True (chemin text/*, appelé hors
+    conversion HTML) supprime .html et .json : une URL déjà cachée en HTML qui
+    redevient text/* au re-fetch ne doit pas laisser fetch_list servir la
+    structure de l'ancienne page (WEB3). Le chemin HTML (_render_html_blocking)
+    appelle store_html juste avant avec purge_html=False, pour ne pas défaire
+    ce qu'il vient d'écrire."""
     sweep_expired()
     WORKDIR.mkdir(parents=True, exist_ok=True)
     path = entry_path(url)
     path.write_text(text, encoding="utf-8")
+    if purge_html:
+        html_path(url).unlink(missing_ok=True)
+        structure_path(url).unlink(missing_ok=True)
     return path
+
+
+def purge(url: str) -> None:
+    """Supprime les trois fichiers de la clé (WEB3) : appelé quand un re-fetch
+    renvoie du contenu binaire, pour ne pas laisser .txt/.html périmés servir
+    fetch_read/fetch_list sur une URL désormais binaire."""
+    sweep_expired()
+    for path in (entry_path(url), html_path(url), structure_path(url)):
+        path.unlink(missing_ok=True)
 
 
 def load(url: str) -> str:
@@ -128,6 +147,8 @@ def load_html(url: str) -> str:
 
 
 def store_structure(url: str, entries: list[dict]) -> Path:
+    sweep_expired()
+    WORKDIR.mkdir(parents=True, exist_ok=True)
     path = structure_path(url)
     path.write_text(json.dumps(entries), encoding="utf-8")
     return path
@@ -139,4 +160,10 @@ def load_structure(url: str) -> list[dict] | None:
     if not path.exists():
         return None
     _touch_all(url)
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        # Cache corrompu (troncature disque, édition manuelle) : traité comme
+        # absent (WEB7), l'appelant (mcp_web/__init__.py) re-extrait depuis le
+        # HTML déjà en cache plutôt que de fuiter JSONDecodeError au client.
+        return None

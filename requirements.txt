@@ -2,7 +2,7 @@
 # Avec uv : uv run <script> installe automatiquement depuis le bloc PEP 723.
 # Avec pip : pip install -r requirements.txt
 
-mcp>=1.2
+mcp>=1.28.1
 uvicorn
 starlette
 anyio

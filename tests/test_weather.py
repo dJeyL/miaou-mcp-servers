@@ -127,3 +127,40 @@ async def test_get_weather_invalid_json_returns_clear_string():
         result = await tm.call_tool("get_weather", {"city": "Paris"})
     assert isinstance(result, str)
     assert "invalide" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_get_weather_truncated_utf8_does_not_raise():
+    """W1 : une réponse tronquée à la borne des 2 Mo peut couper un caractère
+    multi-octets — errors='replace' évite qu'UnicodeDecodeError fuite au client."""
+    mock = MagicMock()
+    mock.__enter__ = lambda s: s
+    mock.__exit__ = MagicMock(return_value=False)
+    body = json.dumps({"weather": [], "current_condition": []}).encode()
+    mock.read.return_value = body[:-1] + "é".encode("utf-8")[:1]  # coupe un multi-octet
+    with patch("urllib.request.OpenerDirector.open", return_value=mock):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris"})
+    assert isinstance(result, str)
+    assert "invalide" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_get_weather_degenerate_weather_field_returns_clear_string():
+    """W2 : 'weather' n'est pas une liste — pas d'AttributeError/TypeError fuité."""
+    mock_resp = _make_mock_resp({"weather": "not-a-list", "current_condition": []})
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris"})
+    assert isinstance(result, str)
+    assert "invalide" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_get_weather_weather_entry_not_dict_skipped():
+    """W2 : une entrée de 'weather' qui n'est pas un dict est ignorée sans planter."""
+    mock_resp = _make_mock_resp({"weather": ["not-a-dict", {"date": "x"}], "current_condition": []})
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris"})
+    assert isinstance(result, types.EmbeddedResource)

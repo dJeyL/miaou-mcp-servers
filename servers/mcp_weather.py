@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2", "uvicorn", "starlette"]
+# dependencies = ["mcp>=1.28.1", "uvicorn", "starlette"]
 # ///
 """
 Serveur MCP météo pour MIAOU.
@@ -76,13 +76,17 @@ class WeatherServer(MiaouMCPBase):
                 return f"Erreur inattendue ({type(e).__name__}: {e}) — wttr.in"
 
             try:
-                data = json.loads(raw.decode())
+                data = json.loads(raw.decode("utf-8", errors="replace"))
             except json.JSONDecodeError as e:
                 return f"Réponse invalide de wttr.in (JSON malformé : {e})."
 
-            for day in data.get("weather", []):
-                day.pop("astronomy", None)
-                day.pop("hourly", None)
+            weather = data.get("weather", [])
+            if not isinstance(weather, list):
+                return "Réponse invalide de wttr.in (JSON malformé : champ 'weather' inattendu)."
+            for day in weather:
+                if isinstance(day, dict):
+                    day.pop("astronomy", None)
+                    day.pop("hourly", None)
 
             return types.EmbeddedResource(
                 type="resource",

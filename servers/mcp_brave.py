@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2", "uvicorn", "starlette"]
+# dependencies = ["mcp>=1.28.1", "uvicorn", "starlette"]
 # ///
 """
 Serveur MCP Brave Search pour MIAOU.
@@ -95,7 +95,7 @@ class BraveServer(MiaouMCPBase):
             query: str,
             count: int = 5,
         ) -> str | types.EmbeddedResource:
-            """Recherche web via l'API Brave Search. Renvoie un tableau JSON [{title, url, description}]. Requiert BRAVE_API_KEY dans l'environnement."""
+            """Recherche web via l'API Brave Search. Renvoie un tableau JSON [{title, url, description}]. count borné à [1, 20]. Requiert BRAVE_API_KEY dans l'environnement."""
             raw = await _brave_call(_BRAVE_API_URL, query, _clamp_count(count), "Brave Search")
             if isinstance(raw, str):
                 return raw
@@ -105,7 +105,10 @@ class BraveServer(MiaouMCPBase):
             except json.JSONDecodeError as e:
                 return f"Réponse invalide de Brave Search (JSON malformé : {e})."
 
-            web_results = data.get("web", {}).get("results", [])
+            web = data.get("web")
+            web_results = web.get("results", []) if isinstance(web, dict) else []
+            if not isinstance(web_results, list):
+                return "Réponse invalide de Brave Search (JSON malformé : champ 'results' inattendu)."
             results = [
                 {
                     "title": r.get("title", ""),
@@ -113,6 +116,7 @@ class BraveServer(MiaouMCPBase):
                     "description": r.get("description", ""),
                 }
                 for r in web_results
+                if isinstance(r, dict)
             ]
 
             return types.EmbeddedResource(
@@ -129,7 +133,7 @@ class BraveServer(MiaouMCPBase):
             query: str,
             count: int = 5,
         ) -> str | types.EmbeddedResource:
-            """Recherche d'images via l'API Brave Search. Renvoie un tableau JSON [{title, page_url, image_url, thumbnail_url, source}] — index d'URLs seulement, pas les données binaires. Requiert BRAVE_API_KEY dans l'environnement."""
+            """Recherche d'images via l'API Brave Search. Renvoie un tableau JSON [{title, page_url, image_url, thumbnail_url, source}] — index d'URLs seulement, pas les données binaires. count borné à [1, 20]. Requiert BRAVE_API_KEY dans l'environnement."""
             raw = await _brave_call(
                 _BRAVE_IMAGES_API_URL, query, _clamp_count(count), "Brave Image Search"
             )
@@ -142,6 +146,8 @@ class BraveServer(MiaouMCPBase):
                 return f"Réponse invalide de Brave Image Search (JSON malformé : {e})."
 
             raw_results = data.get("results", [])
+            if not isinstance(raw_results, list):
+                return "Réponse invalide de Brave Image Search (JSON malformé : champ 'results' inattendu)."
             results = [
                 {
                     "title": r.get("title", ""),
@@ -151,7 +157,7 @@ class BraveServer(MiaouMCPBase):
                     "source": r.get("source", ""),
                 }
                 for r in raw_results
-                if r.get("properties", {}).get("url")
+                if isinstance(r, dict) and r.get("properties", {}).get("url")
             ]
 
             return types.EmbeddedResource(

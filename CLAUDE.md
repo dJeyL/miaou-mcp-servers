@@ -4,7 +4,7 @@ Instructions pour travailler dans ce dépôt.
 
 ## Ce qu'est le projet
 
-Six serveurs MCP de développement (bench, weather, fetch, ddg, brave, docs) et un serveur
+Six serveurs MCP de développement (bench, weather, web, ddg, brave, docs) et un serveur
 proxy qui les agrège, extraits du dépôt [MIAOU](https://github.com/dJeyL/miaou), un client de
 chat web pour API OpenAI-compatible (single-file HTML). Ils servent à tester l'agrégation
 MCP de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
@@ -26,6 +26,7 @@ miaou-mcp-servers/
 │   ├── mcp_brave.py      # recherche Brave Search API (port 8770)
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package (voir plus bas)
 ├── tests/
+│   ├── test_base.py
 │   ├── test_bench.py
 │   ├── test_weather.py
 │   ├── test_web.py
@@ -37,6 +38,8 @@ miaou-mcp-servers/
 ├── config.sample.json    # template de config pour le proxy
 ├── config.json           # (gitignored) config active du proxy
 ├── requirements.txt      # pour les utilisateurs sans uv
+├── pyproject.toml        # métadonnées projet + config pytest (asyncio_mode=auto) + groupe dev
+├── uv.lock               # lock uv, versionné
 └── .gitignore
 ```
 
@@ -249,6 +252,26 @@ Chaque label de résultat est réutilisable tel quel comme selector `read` (ou `
 un membre de zip). Sans `path` sur une archive, `search` balaie tous ses membres texte ;
 avec `path`, restreint à ce seul membre.
 
+Le balayage d'archive sans `path` est borné par deux budgets **globaux**, en plus du garde
+par membre (`MIAOU_DOCS_MAX_UNZIP_MB`) : un cumul décompressé (`MIAOU_DOCS_MAX_UNZIP_MB`
+réutilisé comme budget **total** du balayage) et un temps d'exécution
+(`MIAOU_DOCS_SCAN_TIMEOUT_S`, défaut 30 s) — sans eux, une archive de N membres chacun
+juste sous la limite individuelle reste balayée en entier (zip-bomb par accumulation).
+Dépassement = arrêt **propre**, pas une erreur : les résultats déjà trouvés sont renvoyés,
+et la note finale des zones aveugles nomme le budget dépassé et **tous** les membres non
+couverts. `read`/`extract` ciblés (un seul membre) ne sont pas concernés : leur garde par
+membre suffit.
+
+**Locales des headings docx** — la granularité `search`/`list`/`read` par section repose sur
+le **nom d'affichage** du style de paragraphe (`_HEADING_RE` dans `formats.py`), pas sur le
+`styleId` OOXML `Heading1` (invariant par locale, mais absent d'un style créé à la main ou
+hérité d'un gabarit localisé). Locales reconnues : anglais (`Heading N`), français
+(`Titre N`), allemand (`Überschrift N`), espagnol (`Título N`), italien (`Titolo N`). Le
+motif est ancré et exige le numéro — en fr/es/it, le style *Title* (distinct de *Heading 1*)
+s'appelle `Titre`/`Título`/`Titolo` **sans** numéro et n'est donc pas pris pour un heading.
+Un docx dans une autre locale, ou dont les styles ont été renommés, est traité comme sans
+structure de heading (labels `(préambule)`/`(corps)`) : limitation documentée, pas un bug.
+
 `read` — plage char/ligne : `char_start`/`char_end` (offset caractère, `char_start`
 obligatoire) OU `line_start`/`line_end` (numéro de ligne 1-indexé inclusif, `line_start`
 obligatoire), les deux modes mutuellement exclusifs. La plage porte sur le **texte que
@@ -302,7 +325,8 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
 | `MIAOU_DOCS_TTL_H` | `24` | TTL avant sweep d'une session inactive |
 | `MIAOU_DOCS_MAX_FILE_MB` | `20` | Taille max d'un fichier matérialisé (avant décodage b64) |
 | `MIAOU_DOCS_MAX_SESSION_MB` | `200` | Quota disque total par session |
-| `MIAOU_DOCS_MAX_UNZIP_MB` | `100` | Taille décompressée max d'une archive (garde header + flux) |
+| `MIAOU_DOCS_MAX_UNZIP_MB` | `100` | Taille décompressée max d'une archive (garde header + flux), et budget cumulé total d'un balayage `search` |
+| `MIAOU_DOCS_SCAN_TIMEOUT_S` | `30` | Budget de temps d'un balayage `search` multi-membres (arrêt propre, zones aveugles notées) |
 | `MIAOU_DOCS_READ_CAP` | `20000` | Cap de caractères par réponse `read` |
 | `MIAOU_DOCS_SEARCH_CAP` | `50` | Cap du nombre de snippets par réponse `search` |
 
@@ -342,7 +366,7 @@ réponses JSON ou SSE `event:message`/`data:`). C'est le transport implémenté 
 
 Pour connecter les serveurs depuis MIAOU → Paramètres → Serveurs MCP :
 
-| Champ | bench | weather | fetch | ddg | brave | docs | proxy |
+| Champ | bench | weather | web | ddg | brave | docs | proxy |
 |---|---|---|---|---|---|---|---|
 | Nom | `bench` | `weather` | `web` | `duckduckgo` | `brave` | `docs` | `proxy` |
 | URL | `:8765/mcp` | `:8766/mcp` | `:8768/mcp` | `:8769/mcp` | `:8770/mcp` | `:8771/mcp` | `:8767/mcp` |
@@ -516,13 +540,20 @@ nouvel outil qui ferait de l'I/O.
 ## Tests
 
 ```bash
-# Avec uv
+# Avec uv — commande canonique, ne dépend pas de pyproject.toml/uv.lock
 uv run --with pytest --with pytest-asyncio --with html2text --with pymupdf \
   --with python-docx --with openpyxl --with python-pptx pytest tests/
+
+# Avec uv — alternative via pyproject.toml (groupe dev) + uv.lock, équivalente
+# depuis que [project.dependencies] couvre l'union runtime (DD7)
+uv run --group dev pytest tests/
 
 # Avec pip (après pip install -r requirements.txt)
 pytest tests/
 ```
+
+`pyproject.toml` porte `asyncio_mode = "auto"` (pytest-asyncio) — les deux commandes
+uv ci-dessus s'appuient dessus, la commande canonique n'a juste pas besoin du lock.
 
 Les tests de bench mockent `asyncio.sleep` pour éviter les délais de 2 s.
 Les tests de weather, fetch, ddg et brave mockent `urllib.request.OpenerDirector.open`.
@@ -550,7 +581,8 @@ mirror de `docs/mcp.md` §12 côté MIAOU, à tenir synchronisé si l'un des deu
   Absent → erreur claire (appel hors MIAOU), jamais silencieusement ignoré.
 - **`content_b64`** : injecté seulement au premier appel par (conversation, ref) ; un
   rechargement de page re-pousse le même contenu → la matérialisation doit être
-  **idempotente** (réécriture silencieuse d'un ref déjà connu, jamais une erreur).
+  **idempotente** (ré-acceptation silencieuse d'un ref déjà connu, sans réécriture — le
+  fichier déjà matérialisé fait foi, jamais une erreur).
 - **REF_UNKNOWN** : un `ref` inconnu sans `content_b64` doit produire une vraie **erreur
   JSON-RPC** avec `err.data.code === 'REF_UNKNOWN'` — le dispatcher la détecte et rejoue
   l'appel une fois avec le contenu inliné. Un `isError` textuel ne déclenche PAS le rejeu.
@@ -562,6 +594,16 @@ mirror de `docs/mcp.md` §12 côté MIAOU, à tenir synchronisé si l'un des deu
   que `_handle_request` du SDK convertit en erreur JSON-RPC. **Ce rejeu ne fonctionne que
   derrière le proxy** : en standalone (FastMCP pur, port 8771 direct), l'appel échoue en
   isError textuel sans déclencher le rejeu — documenté ici, pas une régression à corriger.
+  **Déclaration du contrat, côté serveur** : le proxy ne connaît aucun sentinel en propre
+  et n'importe pas `mcp_docs` — un upstream inprocess *déclare* le contrat en exposant
+  `REF_UNKNOWN_SENTINEL` (str) et `REF_UNKNOWN_ERROR_CODE` (int) au niveau module ;
+  `InProcessUpstream.start()` les lit par `getattr`, et le wrapper ne convertit le sentinel
+  que pour les outils routés vers un upstream qui les déclare. Conséquences : un proxy
+  configuré sans `docs` n'importe ni `mcp_docs` ni ses libs de parsing, et un message
+  d'erreur d'un autre serveur qui contiendrait « REF_UNKNOWN » n'est pas converti (le match
+  reste par sous-chaîne : FastMCP préfixe le message, il ne peut pas être ancré en tête).
+  Les upstreams **stdio** sont hors périmètre : le proxy ne peut pas lire de constante dans
+  un subprocess, un serveur stdio devrait lever l'erreur JSON-RPC lui-même.
 - **Adressage de membres d'archive** : paramètre `path` séparé (pas de suffixe `ref#path`)
   — `ref` reste `att-N`, `path` adresse un membre déjà listé par `list`. Écart assumé par
   rapport au brief original : la syntaxe `ref#path` ne matche pas la regex ancrée

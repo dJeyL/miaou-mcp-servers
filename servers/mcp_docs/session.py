@@ -3,16 +3,18 @@
 Session (docs server) : répertoire de travail côté serveur, keyé par
 `session_id` = id de conversation MIAOU. C'est un **cache** — la source de
 vérité reste toujours le navigateur (IndexedDB). Un `ref` (`att-N`, pièce
-jointe de message ; ou `file-<id>`, fichier de bibliothèque d'espace, cf.
-MIAOU lot Cbis) est matérialisé au premier appel portant `content_b64`, puis
-réutilisable par `ref` seul tant que la session n'a pas expiré (TTL, sweep
-opportuniste). Les deux familles de ref ne collisionnent jamais sur le disque
-(préfixes distincts dans le nom de fichier matérialisé, cf. `ref_path`).
+jointe de message ; `file-<id>`, fichier de bibliothèque d'espace, cf. MIAOU
+lot Cbis ; ou `res_<id>`, ressource de session côté client, cf. MIAOU lot K)
+est matérialisé au premier appel portant `content_b64`, puis réutilisable par
+`ref` seul tant que la session n'a pas expiré (TTL, sweep opportuniste). Les
+trois familles de ref ne collisionnent jamais sur le disque (préfixes
+distincts dans le nom de fichier matérialisé, cf. `ref_path`).
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 import re
 import shutil
@@ -39,7 +41,7 @@ REF_UNKNOWN_ERROR_CODE = -31999
 # lot K, generateResourceId — 'res_' + id en base36, underscore après "res",
 # pas un tiret comme att-/file-).
 _REF_RE = re.compile(r"^(att-\d+|file-[a-z0-9]+|res_[a-z0-9]+)$")
-_SESSION_ID_FORBIDDEN = re.compile(r"[\\/]|\.\.")
+_SESSION_ID_FORBIDDEN = re.compile(r"[\\/\x00]|\.\.")
 _SESSION_ID_ALL_DOTS = re.compile(r"^\.+$")
 
 
@@ -51,7 +53,10 @@ def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
-    return int(raw)
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"Variable d'environnement {name} invalide : {raw!r} (entier attendu)")
 
 
 WORKDIR = Path(os.environ.get("MIAOU_DOCS_WORKDIR") or "./miaou-docs")
@@ -143,7 +148,10 @@ def materialize(session_id: str, ref: str, content_b64: str) -> Path:
     if path.exists():
         return path
 
-    data = base64.b64decode(content_b64)
+    try:
+        data = base64.b64decode(content_b64, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ToolError(f"content_b64 invalide : {e}") from e
     if len(data) / (1024 * 1024) > MAX_FILE_MB:
         raise ToolError(
             f"Fichier trop volumineux ({len(data) / (1024 * 1024):.1f} Mo, max {MAX_FILE_MB} Mo)"

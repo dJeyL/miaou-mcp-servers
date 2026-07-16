@@ -41,6 +41,15 @@ def test_load_config_missing_port(tmp_path):
         load_config(cfg_file)
 
 
+def test_load_config_invalid_json_raises_clear_error(tmp_path):
+    """PRX3 : un config.json malformé doit lever un message clair, pas un
+    json.JSONDecodeError brut face à l'opérateur."""
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text("{not valid json")
+    with pytest.raises(ValueError, match="JSON"):
+        load_config(cfg_file)
+
+
 # ---------------------------------------------------------------------------
 # build_upstreams
 # ---------------------------------------------------------------------------
@@ -104,6 +113,31 @@ def test_build_upstreams_stdio_missing_command():
     }
     with pytest.raises(ValueError, match="command"):
         build_upstreams(cfg)
+
+
+# ---------------------------------------------------------------------------
+# StdioUpstream — timeout de handshake (PRX4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stdio_upstream_start_times_out_on_hanging_handshake(monkeypatch):
+    """PRX4 : un subprocess qui ne répond jamais à initialize ne doit pas
+    bloquer le démarrage du proxy indéfiniment — timeout avec message clair."""
+    import asyncio
+
+    monkeypatch.setattr(mcp_proxy, "_STDIO_HANDSHAKE_TIMEOUT_S", 0.05)
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _hanging_stdio_client(params):
+        await asyncio.sleep(10)
+        yield (None, None)
+
+    with patch("mcp.client.stdio.stdio_client", _hanging_stdio_client):
+        upstream = StdioUpstream(command="does-not-matter", args=[])
+        with pytest.raises(RuntimeError, match="handshake"):
+            await upstream.start()
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +340,21 @@ async def test_inprocess_upstream_falls_back_to_mcp_singleton_without_build():
 
 
 @pytest.mark.asyncio
+async def test_inprocess_upstream_warns_on_shared_module_without_build(capsys):
+    """PRX5 : deux entrées inprocess pointant le même module sans build()
+    partagent le même singleton FastMCP (env figé au premier import) — un
+    warning stderr doit signaler la situation, pas silencieusement."""
+    first = InProcessUpstream("mcp_bench")
+    second = InProcessUpstream("mcp_bench")
+    await first.start()
+    capsys.readouterr()  # ignore un éventuel warning du 1er import (déjà chargé par d'autres tests)
+    await second.start()
+    captured = capsys.readouterr()
+    assert "mcp_bench" in captured.err
+    assert "build" in captured.err
+
+
+@pytest.mark.asyncio
 async def test_inprocess_upstream_two_instances_same_module_different_config():
     """Le cas d'usage cible : deux instances du même module (un seul fichier),
     chacune avec sa propre config, produisent des FastMCP indépendants qui
@@ -373,8 +422,12 @@ async def test_proxy_call_tool_falls_back_to_prefix_when_not_in_tool_map():
 @pytest.mark.asyncio
 async def test_proxy_call_tool_unknown_prefix_still_fails():
     """Le fallback ne doit pas masquer un vrai outil inconnu : un préfixe qui
-    ne correspond à aucun upstream reste une erreur."""
+    ne correspond à aucun upstream reste une erreur (T7 : fusion de deux tests
+    quasi-identiques, même chemin de code — outil inconnu = préfixe inconnu
+    ici, aucun upstream enregistré). Le pattern try/except est tolérant par
+    design : le SDK peut soit capturer McpError en isError, soit la propager."""
     import mcp.types as types
+    from mcp.shared.exceptions import McpError
 
     upstreams: dict = {}
     tool_map: dict = {}
@@ -385,33 +438,8 @@ async def test_proxy_call_tool_unknown_prefix_still_fails():
         method="tools/call",
         params=types.CallToolRequestParams(name="ghost__tool", arguments={}),
     )
-    from mcp.shared.exceptions import McpError
-
     try:
         result = await call_handler(request)
-        assert result.root.isError
-    except McpError:
-        pass
-
-
-@pytest.mark.asyncio
-async def test_proxy_call_unknown_tool_returns_error():
-    """Un outil inconnu doit lever McpError (propagé ou capturé par le SDK en isError)."""
-    import mcp.types as types
-    from mcp.shared.exceptions import McpError
-
-    upstreams: dict = {}
-    tool_map: dict = {}
-
-    server = build_proxy_server(upstreams, tool_map)
-    call_handler = server.request_handlers.get(types.CallToolRequest)
-    request = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(name="nonexistent__tool", arguments={}),
-    )
-    try:
-        result = await call_handler(request)
-        # Le SDK a capturé McpError et renvoyé une réponse isError
         assert result.root.isError, "Attendu isError=True pour un outil inconnu"
     except McpError:
         pass  # comportement attendu si le SDK propage l'exception
@@ -467,3 +495,91 @@ async def test_build_app_mcp_without_trailing_slash_no_redirect():
     assert received_paths == ["/mcp/"]
     status = next(m["status"] for m in sent if m["type"] == "http.response.start")
     assert status == 200
+
+
+# ---------------------------------------------------------------------------
+# Portée du sentinel REF_UNKNOWN (PRX1/PRX2)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ref_unknown_sentinel_not_converted_for_upstream_without_contract():
+    """PRX1 : un upstream qui ne déclare pas le contrat REF_UNKNOWN garde son
+    isError textuel, même si le texte contient « REF_UNKNOWN » — avant le
+    scoping, ce faux positif était converti en erreur JSON-RPC et déclenchait un
+    rejeu client inutile."""
+    import mcp.types as types
+
+    upstream = MagicMock()
+    upstream.ref_unknown_contract = None
+    upstream.call_tool = AsyncMock(
+        side_effect=RuntimeError("boom REF_UNKNOWN mentionné dans le message")
+    )
+    upstream.list_tools = AsyncMock(return_value=[])
+
+    server = build_proxy_server({"other": upstream}, {"other__t": ("other", "t")})
+    handler = server.request_handlers[types.CallToolRequest]
+    result = await handler(
+        types.CallToolRequest(
+            method="tools/call",
+            params=types.CallToolRequestParams(name="other__t", arguments={}),
+        )
+    )
+
+    # Pas de McpError levée : le résultat reste un CallToolResult isError.
+    assert result.root.isError is True
+    assert "REF_UNKNOWN" in result.root.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_ref_unknown_contract_read_from_upstream_module():
+    """PRX2 : le contrat est lu sur le module upstream réellement importé
+    (getattr), pas via un import mcp_docs codé en dur dans le proxy."""
+    upstream = InProcessUpstream("mcp_docs")
+    await upstream.start()
+
+    import mcp_docs
+
+    assert upstream.ref_unknown_contract == (
+        mcp_docs.REF_UNKNOWN_SENTINEL,
+        mcp_docs.REF_UNKNOWN_ERROR_CODE,
+    )
+
+    # Un module sans les constantes ne déclare aucun contrat.
+    bench = InProcessUpstream("mcp_bench")
+    await bench.start()
+    assert bench.ref_unknown_contract is None
+
+
+def test_proxy_without_docs_does_not_import_mcp_docs(tmp_path):
+    """PRX2 : un proxy configuré sans l'entrée docs ne doit pas importer
+    mcp_docs (ni pymupdf/python-docx/openpyxl/python-pptx, ni instancier
+    DocsServer()). Vérifié dans un subprocess neuf : mcp_docs est déjà chargé
+    dans le process de test par les autres cas."""
+    import subprocess
+    import textwrap
+
+    script = textwrap.dedent(
+        f"""
+        import asyncio, sys
+        sys.path.insert(0, {str(_ROOT)!r})
+        sys.path.insert(0, {str(_SERVERS)!r})
+        from mcp_proxy import build_upstreams, build_proxy_server
+
+        cfg = {{"port": 8767, "mcpServers": {{"bench": {{"type": "inprocess", "module": "mcp_bench"}}}}}}
+        upstreams = build_upstreams(cfg)
+
+        async def go():
+            for u in upstreams.values():
+                await u.start()
+            build_proxy_server(upstreams, {{}})
+
+        asyncio.run(go())
+        assert "mcp_docs" not in sys.modules, "mcp_docs importé alors que docs est absent de la config"
+        print("OK")
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2", "uvicorn", "starlette", "html2text"]
+# dependencies = ["mcp>=1.28.1", "uvicorn", "starlette", "html2text"]
 # ///
 """
 Serveur MCP fetch pour MIAOU.
@@ -40,7 +40,7 @@ pas ici, cd dans servers/ ou utiliser --directory) :
     uv run --directory servers python -m mcp_web --host 0.0.0.0     # toutes interfaces
 
 Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
-    Nom       : fetch
+    Nom       : web
     URL       : http://127.0.0.1:8768/mcp
     Transport : streamable-http   (deviné depuis /mcp)
     Activé    : oui
@@ -99,10 +99,13 @@ def _is_textual_mime(mime: str) -> bool:
     )
 
 
-def _cache_and_cap(url: str, full_text: str) -> str:
+def _cache_and_cap(url: str, full_text: str, *, purge_html: bool = False) -> str:
     """Met le texte complet en cache (clé = SHA256 de l'URL) et renvoie une version
-    plafonnée à READ_CAP, avec notice de pagination si tronquée."""
-    web_cache.store(url, full_text)
+    plafonnée à READ_CAP, avec notice de pagination si tronquée. purge_html=True
+    (chemin text/*) invalide .html/.json d'une URL qui était auparavant du HTML
+    (WEB3) ; le chemin HTML (_render_html_blocking) garde False, store_html vient
+    de (re)poser ces fichiers."""
+    web_cache.store(url, full_text, purge_html=purge_html)
     cap = web_cache.READ_CAP
     if len(full_text) <= cap:
         return full_text
@@ -113,6 +116,27 @@ def _cache_and_cap(url: str, full_text: str) -> str:
     )
 
 
+def _render_html_blocking(url: str, html_text: str, truncation_note: str) -> str:
+    """Mise en cache du HTML brut, conversion html2text (CPU-bound sur plusieurs Mo)
+    et mise en cache du texte rendu, groupées pour un seul asyncio.to_thread —
+    l'ordre compte (store_html avant la conversion, _cache_and_cap après)."""
+    web_cache.store_html(url, html_text)
+    h = html2text.HTML2Text()
+    h.ignore_images = True
+    h.body_width = 0
+    cleaned = h.handle(html_text).strip() + truncation_note
+    return _cache_and_cap(url, cleaned)
+
+
+def _load_structure_blocking(url: str, html_text: str) -> list[dict]:
+    """Lecture du cache de structure, sinon extraction + mise en cache."""
+    entries = web_cache.load_structure(url)
+    if entries is None:
+        entries = extract_structure(html_text)
+        web_cache.store_structure(url, entries)
+    return entries
+
+
 def _fetch_bytes(req: urllib.request.Request, max_bytes: int) -> tuple[str, bytes]:
     """I/O bloquante isolée pour asyncio.to_thread (T2). Renvoie (content_type, corps)."""
     opener = make_opener()
@@ -120,6 +144,38 @@ def _fetch_bytes(req: urllib.request.Request, max_bytes: int) -> tuple[str, byte
         content_type = resp.headers.get("Content-Type", "application/octet-stream")
         raw = resp.read(max_bytes + 1)
         return content_type, raw
+
+
+async def _guarded_fetch(
+    url: str, max_bytes: int, cap: int
+) -> tuple[str, bytes, bool] | str:
+    """Gardes + téléchargement communs à fetch_url/fetch_resource (WEB4) : schéma
+    http/https, clamp max_bytes vers [1, cap], requête + erreurs réseau en
+    chaînes. Renvoie soit un message d'erreur (str), soit
+    (content_type, corps_tronqué, truncated)."""
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        return f"Schéma d'URL non autorisé ({scheme or '?'}) — http/https uniquement : {url}"
+    if max_bytes < 1:
+        return f"max_bytes doit être >= 1 (reçu {max_bytes})"
+    max_bytes = min(max_bytes, cap)
+
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    try:
+        content_type, raw = await asyncio.to_thread(_fetch_bytes, req, max_bytes)
+    except urllib.error.HTTPError as e:
+        return f"Erreur HTTP {e.code} ({e.reason}) — {url}"
+    except urllib.error.URLError as e:
+        return f"Erreur réseau ({e.reason}) — {url}"
+    except TimeoutError:
+        return f"Timeout (10 s) — {url}"
+    except Exception as e:
+        return f"Erreur inattendue ({type(e).__name__}: {e}) — {url}"
+
+    truncated = len(raw) > max_bytes
+    if truncated:
+        raw = raw[:max_bytes]
+    return content_type, raw, truncated
 
 
 def _format_entry(index: int, entry: dict) -> str:
@@ -137,27 +193,11 @@ class WebServer(MiaouMCPBase):
             url: str,
             max_bytes: int = _DEFAULT_MAX_BYTES,
         ) -> str | types.EmbeddedResource:
-            scheme = urllib.parse.urlsplit(url).scheme.lower()
-            if scheme not in _ALLOWED_SCHEMES:
-                return f"Schéma d'URL non autorisé ({scheme or '?'}) — http/https uniquement : {url}"
-            if max_bytes < 1:
-                return f"max_bytes doit être >= 1 (reçu {max_bytes})"
-
-            req = urllib.request.Request(url, headers={"User-Agent": _UA})
-            try:
-                content_type, raw = await asyncio.to_thread(_fetch_bytes, req, max_bytes)
-            except urllib.error.HTTPError as e:
-                return f"Erreur HTTP {e.code} ({e.reason}) — {url}"
-            except urllib.error.URLError as e:
-                return f"Erreur réseau ({e.reason}) — {url}"
-            except TimeoutError:
-                return f"Timeout (10 s) — {url}"
-            except Exception as e:
-                return f"Erreur inattendue ({type(e).__name__}: {e}) — {url}"
-
-            truncated = len(raw) > max_bytes
-            if truncated:
-                raw = raw[:max_bytes]
+            fetched = await _guarded_fetch(url, max_bytes, _DEFAULT_MAX_BYTES)
+            if isinstance(fetched, str):
+                return fetched
+            content_type, raw, truncated = fetched
+            max_bytes = min(max_bytes, _DEFAULT_MAX_BYTES)
 
             mime = content_type.split(";")[0].strip().lower()
             charset = _charset_from_content_type(content_type)
@@ -168,17 +208,15 @@ class WebServer(MiaouMCPBase):
                     html_text = raw.decode(charset, errors="replace")
                 except LookupError:
                     html_text = raw.decode("utf-8", errors="replace")
-                web_cache.store_html(url, html_text)
-                h = html2text.HTML2Text()
-                h.ignore_images = True
-                h.body_width = 0
-                cleaned = h.handle(html_text).strip() + truncation_note
+                text = await asyncio.to_thread(
+                    _render_html_blocking, url, html_text, truncation_note
+                )
                 return types.EmbeddedResource(
                     type="resource",
                     resource=types.TextResourceContents(
                         uri=url,  # type: ignore[arg-type]
                         mimeType="text/plain",
-                        text=_cache_and_cap(url, cleaned),
+                        text=text,
                     ),
                 )
             elif _is_textual_mime(mime):
@@ -192,10 +230,11 @@ class WebServer(MiaouMCPBase):
                     resource=types.TextResourceContents(
                         uri=url,  # type: ignore[arg-type]
                         mimeType=mime,
-                        text=_cache_and_cap(url, full_text),
+                        text=await asyncio.to_thread(_cache_and_cap, url, full_text, purge_html=True),
                     ),
                 )
             else:
+                await asyncio.to_thread(web_cache.purge, url)
                 return types.EmbeddedResource(
                     type="resource",
                     resource=types.BlobResourceContents(
@@ -209,7 +248,7 @@ class WebServer(MiaouMCPBase):
         en texte, mimes textuels (text/*, JSON, XML, JavaScript, suffixes
         +json/+xml) renvoyés tels quels avec leur mime d'origine, binaire
         (image, etc.) encodé en base64. Téléchargement limité à max_bytes
-        (défaut 5 Mo).
+        (défaut et plafond {_DEFAULT_MAX_BYTES} octets).
 
         Le texte renvoyé est en plus plafonné à {web_cache.READ_CAP} caractères ;
         le texte complet est conservé en cache — paginer avec
@@ -223,7 +262,7 @@ class WebServer(MiaouMCPBase):
             char_end: int | None = None,
         ) -> str:
             try:
-                full_text = web_cache.load(url)
+                full_text = await asyncio.to_thread(web_cache.load, url)
             except CacheMiss as e:
                 return str(e)
 
@@ -231,6 +270,8 @@ class WebServer(MiaouMCPBase):
                 return f"char_start doit être >= 0 (reçu {char_start})"
             if char_end is not None and char_end < char_start:
                 return f"char_end ({char_end}) < char_start ({char_start})"
+            if char_start >= len(full_text) and full_text:
+                return f"char_start ({char_start}) hors bornes (texte de {len(full_text)} caractères)"
 
             cap = web_cache.READ_CAP
             requested_end = char_start + cap if char_end is None else min(char_end, char_start + cap)
@@ -259,7 +300,7 @@ class WebServer(MiaouMCPBase):
             entry_end: int | None = None,
         ) -> str:
             try:
-                html_text = web_cache.load_html(url)
+                html_text = await asyncio.to_thread(web_cache.load_html, url)
             except CacheMiss:
                 if web_cache.entry_path(url).exists():
                     return f"Cette URL n'a pas renvoyé du HTML — fetch_list ne s'applique pas : {url}"
@@ -270,10 +311,7 @@ class WebServer(MiaouMCPBase):
             if entry_end is not None and entry_end < entry_start:
                 return f"entry_end ({entry_end}) < entry_start ({entry_start})"
 
-            entries = web_cache.load_structure(url)
-            if entries is None:
-                entries = extract_structure(html_text)
-                web_cache.store_structure(url, entries)
+            entries = await asyncio.to_thread(_load_structure_blocking, url, html_text)
 
             cap = web_cache.LIST_CAP
             requested_end = (
@@ -284,7 +322,9 @@ class WebServer(MiaouMCPBase):
             next_offset = entry_start + len(page)
 
             if not page:
-                return f"Aucune entrée (headings/liens) entre {entry_start} et {total} au total."
+                if entry_start >= total:
+                    return f"entry_start ({entry_start}) hors bornes ({total} entrée(s) au total)."
+                return f"Aucune entrée (headings/liens) dans la plage demandée ({total} entrée(s) au total)."
 
             lines = [_format_entry(entry_start + i, entry) for i, entry in enumerate(page)]
             note = ""
@@ -309,27 +349,11 @@ class WebServer(MiaouMCPBase):
             url: str,
             max_bytes: int = web_cache.RESOURCE_MAX_BYTES,
         ) -> list[types.ContentBlock] | str:
-            scheme = urllib.parse.urlsplit(url).scheme.lower()
-            if scheme not in _ALLOWED_SCHEMES:
-                return f"Schéma d'URL non autorisé ({scheme or '?'}) — http/https uniquement : {url}"
-            if max_bytes < 1:
-                return f"max_bytes doit être >= 1 (reçu {max_bytes})"
-
-            req = urllib.request.Request(url, headers={"User-Agent": _UA})
-            try:
-                content_type, raw = await asyncio.to_thread(_fetch_bytes, req, max_bytes)
-            except urllib.error.HTTPError as e:
-                return f"Erreur HTTP {e.code} ({e.reason}) — {url}"
-            except urllib.error.URLError as e:
-                return f"Erreur réseau ({e.reason}) — {url}"
-            except TimeoutError:
-                return f"Timeout (10 s) — {url}"
-            except Exception as e:
-                return f"Erreur inattendue ({type(e).__name__}: {e}) — {url}"
-
-            truncated = len(raw) > max_bytes
-            if truncated:
-                raw = raw[:max_bytes]
+            fetched = await _guarded_fetch(url, max_bytes, web_cache.RESOURCE_MAX_BYTES)
+            if isinstance(fetched, str):
+                return fetched
+            content_type, raw, truncated = fetched
+            max_bytes = min(max_bytes, web_cache.RESOURCE_MAX_BYTES)
 
             mime = content_type.split(";")[0].strip().lower()
             blob = base64.b64encode(raw).decode()
@@ -356,8 +380,8 @@ class WebServer(MiaouMCPBase):
         descripteur factuel (mime, taille, URL) est renvoyé au modèle. Le contenu
         est toujours transféré en binaire, même pour du texte/JSON, afin de rester
         exploitable tel quel côté client (ex. réinjection vers un outil de
-        documents). Téléchargement limité à max_bytes (défaut {web_cache.RESOURCE_MAX_BYTES}
-        octets)."""
+        documents). Téléchargement limité à max_bytes (défaut et plafond
+        {web_cache.RESOURCE_MAX_BYTES} octets)."""
         self.mcp.tool(name="fetch_resource")(fetch_resource)
 
         self.finalize_tools()

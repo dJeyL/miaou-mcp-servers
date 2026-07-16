@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2", "uvicorn", "starlette"]
+# dependencies = ["mcp>=1.28.1", "uvicorn", "starlette"]
 # ///
 """
 Serveur MCP DuckDuckGo pour MIAOU.
@@ -111,7 +111,7 @@ class DDGServer(MiaouMCPBase):
             query: str,
             max_results: int = 5,
         ) -> str | types.EmbeddedResource:
-            """Recherche sur DuckDuckGo (endpoint HTML, pas de clé API). Renvoie un tableau JSON [{title, url, snippet}]. Fragile si DDG change son markup."""
+            """Recherche sur DuckDuckGo (endpoint HTML, pas de clé API). Renvoie un tableau JSON [{title, url, snippet}]. max_results borné à [1, 30]. Fragile si DDG change son markup."""
             max_results = max(1, min(max_results, 30))
             body = urllib.parse.urlencode({"q": query, "b": ""}).encode()
             req = urllib.request.Request(

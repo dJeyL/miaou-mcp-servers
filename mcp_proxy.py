@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2", "uvicorn", "starlette", "anyio", "html2text", "pymupdf", "python-docx", "openpyxl", "python-pptx"]
+# dependencies = ["mcp>=1.28.1", "uvicorn", "starlette", "anyio", "html2text", "pymupdf", "python-docx", "openpyxl", "python-pptx"]
 # ///
 """
 Serveur MCP proxy pour MIAOU — agrège plusieurs serveurs MCP upstream.
@@ -84,12 +84,18 @@ class InProcessUpstream(Upstream):
         self._env = env
         self._config = config
         self._tool_manager: Any = None
+        # Renseigné au start() si le module upstream expose le contrat
+        # REF_UNKNOWN (cf. _ref_unknown_contract / _wrap_ref_unknown_sentinel).
+        # Aucun import de mcp_docs ici : c'est le module réellement chargé, quel
+        # qu'il soit, qui déclare son sentinel — le proxy n'en connaît aucun.
+        self.ref_unknown_contract: tuple[str, Any] | None = None
 
     async def start(self) -> None:
         if self._env:
             import os
             for key, value in self._env.items():
                 os.environ.setdefault(key, value)
+        already_imported = self._module_name in sys.modules
         module = importlib.import_module(self._module_name)
         # Un module qui expose build(config) -> FastMCP supporte le multi-instance
         # (plusieurs entrées config.json du même module, chacune avec sa propre
@@ -101,12 +107,29 @@ class InProcessUpstream(Upstream):
         if build_fn is not None:
             fastmcp = build_fn(self._config)
         else:
+            if already_imported:
+                print(
+                    f"Attention : module '{self._module_name}' réutilisé par plusieurs "
+                    f"entrées inprocess sans build(config) — même instance FastMCP "
+                    f"partagée (env figé au premier import).",
+                    file=sys.stderr,
+                )
             fastmcp = getattr(module, "mcp", None)
         if fastmcp is None:
             raise RuntimeError(
                 f"Le module '{self._module_name}' n'expose ni 'build(config)' ni 'mcp' (FastMCP)."
             )
         self._tool_manager = fastmcp._tool_manager
+
+        # PRX2 : lecture opportuniste du contrat REF_UNKNOWN sur le module qui
+        # vient d'être importé, au lieu d'un `from mcp_docs import ...` au niveau
+        # du wrapper — celui-ci forçait l'import de mcp_docs (et de pymupdf,
+        # python-docx, openpyxl, python-pptx, plus l'instanciation de
+        # DocsServer()) même sur un proxy configuré sans l'entrée docs.
+        sentinel = getattr(module, "REF_UNKNOWN_SENTINEL", None)
+        error_code = getattr(module, "REF_UNKNOWN_ERROR_CODE", None)
+        if sentinel is not None and error_code is not None:
+            self.ref_unknown_contract = (sentinel, error_code)
 
     async def stop(self) -> None:
         pass
@@ -124,6 +147,9 @@ class InProcessUpstream(Upstream):
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> list[Any]:
         return await self._tool_manager.call_tool(name, arguments, convert_result=True)
+
+
+_STDIO_HANDSHAKE_TIMEOUT_S = 15
 
 
 class StdioUpstream(Upstream):
@@ -144,6 +170,8 @@ class StdioUpstream(Upstream):
         self._session: Any = None
 
     async def start(self) -> None:
+        import asyncio
+
         from mcp.client.session import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -153,10 +181,21 @@ class StdioUpstream(Upstream):
             env=self._env,
             cwd=self._cwd,
         )
-        read, write = await self._exit_stack.enter_async_context(stdio_client(params))
-        session = ClientSession(read, write)
-        self._session = await self._exit_stack.enter_async_context(session)
-        await self._session.initialize()
+        async def _handshake() -> None:
+            read, write = await self._exit_stack.enter_async_context(stdio_client(params))
+            session = ClientSession(read, write)
+            self._session = await self._exit_stack.enter_async_context(session)
+            await self._session.initialize()
+
+        try:
+            # wait_for (pas asyncio.timeout, réservé à Python 3.11+) — le PEP 723
+            # de ce fichier déclare requires-python >= 3.10.
+            await asyncio.wait_for(_handshake(), timeout=_STDIO_HANDSHAKE_TIMEOUT_S)
+        except asyncio.TimeoutError as e:
+            raise RuntimeError(
+                f"Subprocess '{self._command}' n'a pas répondu au handshake MCP "
+                f"initialize sous {_STDIO_HANDSHAKE_TIMEOUT_S}s."
+            ) from e
 
     async def stop(self) -> None:
         await self._exit_stack.aclose()
@@ -175,7 +214,10 @@ class StdioUpstream(Upstream):
 # ---------------------------------------------------------------------------
 
 def load_config(path: str | Path) -> dict[str, Any]:
-    cfg = json.loads(Path(path).read_text())
+    try:
+        cfg = json.loads(Path(path).read_text())
+    except json.JSONDecodeError as e:
+        raise ValueError(f"La config '{path}' n'est pas un JSON valide : {e}") from e
     if "port" not in cfg:
         raise ValueError(f"La config '{path}' doit contenir la clé 'port'.")
     return cfg
@@ -266,11 +308,11 @@ def build_proxy_server(
             upstream_name, orig_name = resolved
         return await upstreams[upstream_name].call_tool(orig_name, arguments or {})
 
-    _wrap_ref_unknown_sentinel(server)
+    _wrap_ref_unknown_sentinel(server, upstreams)
     return server
 
 
-def _wrap_ref_unknown_sentinel(server: Server) -> None:
+def _wrap_ref_unknown_sentinel(server: Server, upstreams: dict[str, Upstream]) -> None:
     """Convertit le sentinel REF_UNKNOWN (texte isError) en erreur JSON-RPC.
 
     Le SDK MCP (@server.call_tool(), voir mcp/server/lowlevel/server.py) avale
@@ -283,16 +325,43 @@ def _wrap_ref_unknown_sentinel(server: Server) -> None:
     types.CallToolRequest (server.request_handlers), inspecter son résultat, et
     lever McpError quand le sentinel est détecté — _handle_request (L777)
     convertit alors l'exception en erreur JSON-RPC (`response = err.error`).
+
+    Portée (PRX1) : la conversion ne s'applique qu'aux outils routés vers un
+    upstream inprocess dont le module expose lui-même REF_UNKNOWN_SENTINEL et
+    REF_UNKNOWN_ERROR_CODE (lus au start(), cf. InProcessUpstream — le proxy ne
+    connaît ni mcp_docs ni aucun sentinel en propre). Le sentinel étant cherché
+    par sous-chaîne (FastMCP
+    préfixe le message avant qu'il n'atteigne isError, le match ne peut pas être
+    ancré en tête), sans ce scoping un message d'erreur quelconque contenant
+    « REF_UNKNOWN » — autre serveur, outil citant la constante — déclencherait un
+    rejeu client inutile. Les upstreams stdio sont hors périmètre : le proxy ne
+    peut pas lire de constante dans un subprocess, un serveur stdio qui voudrait
+    ce contrat devrait lever l'erreur JSON-RPC lui-même.
     """
     from mcp.shared.exceptions import McpError
     from mcp.types import ErrorData
-
-    from mcp_docs import REF_UNKNOWN_ERROR_CODE, REF_UNKNOWN_SENTINEL
 
     original_handler = server.request_handlers[types.CallToolRequest]
 
     async def handler(req: types.CallToolRequest):
         result = await original_handler(req)
+        name = req.params.name
+        prefix = name.split("__", 1)[0] if "__" in name else None
+        upstream = upstreams.get(prefix) if prefix is not None else None
+        # Contrat résolu à l'appel, pas à la construction : build_proxy_server()
+        # s'exécute avant le lifespan qui démarre les upstreams, or
+        # ref_unknown_contract n'est renseigné que par start(). Un instantané pris
+        # ici capturerait un dict vide et désactiverait REF_UNKNOWN en silence.
+        contract = getattr(upstream, "ref_unknown_contract", None)
+        # Forme validée, pas dépaquetée à l'aveugle : `ref_unknown_contract` est
+        # un attribut d'upstream (déclaratif, renseigné hors de ce module) — une
+        # valeur mal formée doit laisser passer le résultat tel quel, pas faire
+        # planter chaque tools/call sur un ValueError d'unpacking.
+        if not (isinstance(contract, tuple) and len(contract) == 2):
+            return result
+        sentinel, error_code = contract
+        if not isinstance(sentinel, str) or not isinstance(error_code, int):
+            return result
         call_result = result.root
         if call_result.isError and call_result.content:
             first = call_result.content[0]
@@ -300,10 +369,10 @@ def _wrap_ref_unknown_sentinel(server: Server) -> None:
             # FastMCP préfixe le message d'exception ("Error executing tool
             # <name>: ...") avant qu'il n'atteigne isError — le sentinel n'est
             # donc pas forcément en tête du texte final, juste présent dedans.
-            if REF_UNKNOWN_SENTINEL in text:
+            if sentinel in text:
                 raise McpError(
                     ErrorData(
-                        code=REF_UNKNOWN_ERROR_CODE,
+                        code=error_code,
                         message=text,
                         data={"code": "REF_UNKNOWN"},
                     )
@@ -402,9 +471,13 @@ def main() -> None:
         )
         sys.exit(1)
 
-    cfg = load_config(config_path)
-    host = args.host or cfg.get("host", "127.0.0.1")
-    port = args.port or int(cfg["port"])
+    try:
+        cfg = load_config(config_path)
+        host = args.host or cfg.get("host", "127.0.0.1")
+        port = args.port or int(cfg["port"])
+    except ValueError as e:
+        print(f"Erreur : {e}", file=sys.stderr)
+        sys.exit(1)
 
     upstreams = build_upstreams(cfg)
     tool_map: dict[str, tuple[str, str]] = {}

@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import io
 import re
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from .search import Query, UnitResult, make_snippet, match_unit, snippets_for_unit
-from .session import MAX_FILE_MB, MAX_UNZIP_MB, READ_CAP, ToolError
+from .session import MAX_FILE_MB, MAX_UNZIP_MB, READ_CAP, ToolError, _env_int
+
+# FMT5 : budget de temps max pour le balayage complet de zip_search (tous
+# membres), indépendant du garde par membre MAX_UNZIP_MB.
+_ZIP_SEARCH_TIME_BUDGET_S = _env_int("MIAOU_DOCS_SCAN_TIMEOUT_S", 30)
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +185,7 @@ def _apply_range(body: str, rng: TextRange) -> tuple[str, str]:
     # Mode caractères.
     total = len(body)
     start = rng.char_start  # garanti >= 0 par la validation
-    if start >= total and total > 0:
+    if start > 0 and start >= total:
         return "", f"\n\n[Offset {start} au-delà de la fin ({total} caractères)]"
     end = rng.char_end if rng.char_end is not None else total
     end = min(end, total)
@@ -196,21 +201,28 @@ def _apply_range(body: str, rng: TextRange) -> tuple[str, str]:
     return capped, notice
 
 
-def _parse_range(selector: str, total: int) -> tuple[int, int]:
-    """Parse 'N' ou 'N-M' (1-indexé, inclusif), borné à [1, total]."""
+def _parse_range(selector: str, total: int) -> tuple[int, int, str]:
+    """Parse 'N' ou 'N-M' (1-indexé, inclusif), borné à [1, total]. Renvoie
+    (start, end, notice) — notice vide si la plage demandée tenait déjà dans
+    [1, total], sinon signale le clamp (FMT4 : un '5-100' sur un document de 10
+    unités servait silencieusement 5-10, sans que rien ne le rappelle si les
+    en-têtes d'unité n'étaient pas assez explicites)."""
     try:
         if "-" in selector:
             start_s, end_s = selector.split("-", 1)
-            start, end = int(start_s), int(end_s)
+            requested_start, requested_end = int(start_s), int(end_s)
         else:
-            start = end = int(selector)
+            requested_start = requested_end = int(selector)
     except ValueError:
         raise ToolError(f"selector invalide : '{selector}' (attendu 'N' ou 'N-M')")
-    start = max(1, start)
-    end = min(total, end)
+    start = max(1, requested_start)
+    end = min(total, requested_end)
     if start > end:
         raise ToolError(f"selector invalide : '{selector}' (document de {total} unité(s))")
-    return start, end
+    notice = ""
+    if start != requested_start or end != requested_end:
+        notice = f"\n\n[Plage ramenée à {start}-{end} (demandé : {selector}, document de {total} unité(s))]"
+    return start, end, notice
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +254,9 @@ def pdf_read(path: DocSource, selector: str | None, rng: TextRange | None = None
     with _fitz_open(path) as doc:
         if doc.page_count == 0:
             return "[PDF sans aucune page]"
+        range_notice = ""
         if selector:
-            start, end = _parse_range(selector, doc.page_count)
+            start, end, range_notice = _parse_range(selector, doc.page_count)
         else:
             start, end = 1, 1
 
@@ -265,15 +278,15 @@ def pdf_read(path: DocSource, selector: str | None, rng: TextRange | None = None
 
         if rng is not None:
             capped, notice = _apply_range(body, rng)
-            return capped + empty_note + notice
+            return capped + range_notice + empty_note + notice
 
-        notice = empty_note
+        notice = range_notice + empty_note
         if not selector and doc.page_count > 1:
             notice += _pagination_notice(f"selector='2-{doc.page_count}' pour la suite")
 
         capped, truncated = _cap_text(body, READ_CAP)
-        if truncated and not notice:
-            notice = _truncation_notice("relire avec un selector plus étroit")
+        if truncated:
+            notice += _truncation_notice("relire avec un selector plus étroit")
         return capped + notice
 
 
@@ -319,8 +332,15 @@ def xlsx_list(path: DocSource) -> str:
             lines = ["XLSX — feuilles :"]
             for name in wb.sheetnames:
                 ws = wb[name]
-                dim = ws.calculate_dimension()
-                lines.append(f"- {name} ({dim}, {ws.max_row} ligne(s) x {ws.max_column} colonne(s))")
+                try:
+                    dim = ws.calculate_dimension()
+                except ValueError:
+                    # Feuille "unsized" (pas d'élément <dimension> dans le XML,
+                    # certains générateurs) : forcer le calcul en balayant les cellules.
+                    dim = ws.calculate_dimension(force=True)
+                max_row = ws.max_row if ws.max_row is not None else "?"
+                max_col = ws.max_column if ws.max_column is not None else "?"
+                lines.append(f"- {name} ({dim}, {max_row} ligne(s) x {max_col} colonne(s))")
             return "\n".join(lines)
         finally:
             wb.close()
@@ -439,7 +459,22 @@ def xlsx_search(path: DocSource, query: Query) -> list[UnitResult]:
 # DOCX (python-docx)
 # ---------------------------------------------------------------------------
 
-_HEADING_RE = re.compile(r"^(?:Heading|Titre) (\d+)$")
+# Locales reconnues pour les styles de heading Word (FMT6) : anglais (Heading N),
+# français (Titre N), allemand (Überschrift N), espagnol (Título N), italien
+# (Titolo N). Un docx dans une autre locale (ou avec des styles renommés) est
+# traité comme sans structure de heading (docx_read tombe sur les 50 premiers
+# paragraphes + tables, docx_search sur les labels (préambule)/(corps)) : pas
+# un bug, une limitation documentée du parsing par nom de style.
+#
+# Le motif est ancré et exige le numéro : en fr/es/it, le style « Title »
+# (distinct de « Heading 1 ») s'appelle Titre/Título/Titolo *sans* numéro —
+# l'ancrage évite de le prendre pour un heading de niveau indéterminé.
+# On matche le nom d'affichage (`style.name`, ce qu'expose python-docx) et non
+# le styleId OOXML `Heading1`, invariant par locale : un style hérité d'un
+# gabarit localisé ou créé à la main n'a pas forcément de styleId canonique.
+_HEADING_RE = re.compile(
+    r"^(?:Heading|Titre|Überschrift|Título|Titolo) (\d+)$"
+)
 
 
 def _table_text(table) -> str:
@@ -521,8 +556,8 @@ def docx_read(path: DocSource, selector: str | None, rng: TextRange | None = Non
         return capped + range_notice
 
     capped, truncated = _cap_text(body, READ_CAP)
-    if truncated and not notice:
-        notice = _truncation_notice("relire avec un selector plus étroit")
+    if truncated:
+        notice += _truncation_notice("relire avec un selector plus étroit")
     return capped + notice
 
 
@@ -619,8 +654,9 @@ def pptx_read(path: DocSource, selector: str | None, rng: TextRange | None = Non
     if total == 0:
         return "[PPTX sans aucune slide]"
 
+    range_notice = ""
     if selector:
-        start, end = _parse_range(selector, total)
+        start, end, range_notice = _parse_range(selector, total)
     else:
         start, end = 1, 1
 
@@ -633,14 +669,14 @@ def pptx_read(path: DocSource, selector: str | None, rng: TextRange | None = Non
 
     if rng is not None:
         capped, notice = _apply_range(body, rng)
-        return capped + notice
+        return capped + range_notice + notice
 
-    notice = ""
+    notice = range_notice
     if not selector and total > 1:
         notice = _pagination_notice(f"selector='2-{total}' pour la suite", unit="Slide")
     capped, truncated = _cap_text(body, READ_CAP)
-    if truncated and not notice:
-        notice = _truncation_notice("relire avec un selector plus étroit")
+    if truncated:
+        notice += _truncation_notice("relire avec un selector plus étroit")
     return capped + notice
 
 
@@ -896,22 +932,26 @@ def zip_search(path: DocSource, query: Query, member_path: str | None = None) ->
     note finale (décision #3) — pas de dispatch récursif ici, contrairement à
     `zip_read_member` (limitation explicite du brief, zip = texte seul pour
     la recherche). Label unité = chemin du membre (round-trip :
-    `read(path=member_path)`)."""
+    `read(path=member_path)`). Balayage sans `member_path` borné par un budget
+    cumulé de MAX_UNZIP_MB (au-delà du garde par membre) et un budget de temps
+    (arrêt anticipé signalé en note, zones aveugles)."""
     if member_path is not None:
         # Ciblage explicite : erreur claire si le membre n'existe pas ou est
         # inextractible, comme zip_read_member (pas un skip silencieux ici).
+        # Un membre structuré/binaire ciblé explicitement est un ToolError
+        # (réponse définitive et actionnable), pas un UnitResult à 0 hit — sinon
+        # render_results affiche "0 occurrence(s) dans 1 unité(s)" suivi de la
+        # note, une formulation qui laisse croire à une recherche effectuée (FMT7).
         data = _extract_zip_member_bytes(path, member_path)
         if _is_structured_document(data[:8]):
-            note = (
-                f"[Membre '{member_path}' non cherché : document structuré ou "
-                f"binaire, la recherche zip ne porte que sur le texte brut]"
+            raise ToolError(
+                f"Membre '{member_path}' non cherché : document structuré ou "
+                f"binaire, la recherche zip ne porte que sur le texte brut."
             )
-            return [UnitResult(label="(note)", hit_count=0, snippets=[note])]
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
-            note = f"[Membre '{member_path}' non cherché : contenu binaire]"
-            return [UnitResult(label="(note)", hit_count=0, snippets=[note])]
+            raise ToolError(f"Membre '{member_path}' non cherché : contenu binaire.")
         snippets = snippets_for_unit(text, query)
         if not snippets:
             return []
@@ -919,13 +959,15 @@ def zip_search(path: DocSource, query: Query, member_path: str | None = None) ->
 
     results = []
     skipped: list[str] = []
+    cumulative_mb = 0.0
+    start_time = time.monotonic()
     try:
         with zipfile.ZipFile(path) as z:
             infos = z.infolist()
     except zipfile.BadZipFile as e:
         raise ToolError(f"Archive zip corrompue ou invalide : {e}")
 
-    for info in infos:
+    for index, info in enumerate(infos):
         if info.is_dir():
             continue
         name = info.filename
@@ -938,12 +980,35 @@ def zip_search(path: DocSource, query: Query, member_path: str | None = None) ->
         if info.file_size / (1024 * 1024) > MAX_UNZIP_MB:
             skipped.append(f"{name} (trop volumineux)")
             continue
+        # FMT5 : le garde-fou par membre (MAX_UNZIP_MB) ne borne pas le cumul —
+        # une archive de nombreux membres proches de la limite reste balayée en
+        # entier. Deux budgets globaux, indépendants des gardes par membre déjà
+        # posées : volume décompressé cumulé et temps écoulé (anti zip-bomb).
+        # Sur arrêt, tous les membres restants sont non couverts, pas seulement
+        # celui en cours : la note doit les nommer tous pour rester vraie.
+        if cumulative_mb > MAX_UNZIP_MB:
+            aborted = f"budget cumulé de {MAX_UNZIP_MB} Mo dépassé"
+        elif time.monotonic() - start_time > _ZIP_SEARCH_TIME_BUDGET_S:
+            aborted = f"budget de temps de {_ZIP_SEARCH_TIME_BUDGET_S} s dépassé"
+        else:
+            aborted = None
+        if aborted is not None:
+            remaining = [
+                i.filename for i in infos[index:]
+                if not i.is_dir() and not _is_zip_slip(i.filename)
+            ]
+            skipped.append(
+                f"balayage interrompu ({aborted}), membres non couverts : "
+                + ", ".join(remaining)
+            )
+            break
 
         try:
             data = _extract_zip_member_bytes(path, name)
         except ToolError:
             skipped.append(f"{name} (illisible)")
             continue
+        cumulative_mb += len(data) / (1024 * 1024)
 
         if _is_structured_document(data[:8]):
             skipped.append(f"{name} (document structuré, non cherché)")
@@ -1005,11 +1070,27 @@ _SEARCH_DISPATCH = {
 }
 
 
+def _reraise_as_corrupt(kind: str, exc: Exception) -> None:
+    """Convertit une exception de lib de parsing (document forgé/corrompu) en
+    ToolError sans chemin disque ni détail interne de la lib — FMT2 : fitz.FileDataError
+    inclut le chemin de session dans son message, KeyError de python-docx sur un zip
+    Office incomplet fuiterait brute sinon."""
+    raise ToolError(f"document illisible ou corrompu (type détecté : {kind})") from exc
+
+
+_PARSING_EXCEPTIONS = (KeyError, ValueError, OSError, RuntimeError)
+
+
 def list_document(kind: str, path: DocSource) -> str:
     fn = _LIST_DISPATCH.get(kind)
     if fn is None:
         raise ToolError(f"Type de document non supporté ou non reconnu (détecté : '{kind}')")
-    return fn(path)
+    try:
+        return fn(path)
+    except ToolError:
+        raise
+    except _PARSING_EXCEPTIONS as e:
+        _reraise_as_corrupt(kind, e)
 
 
 def read_document(kind: str, path: DocSource, selector: str | None, rng: TextRange | None = None) -> str:
@@ -1023,14 +1104,24 @@ def read_document(kind: str, path: DocSource, selector: str | None, rng: TextRan
     fn = _READ_DISPATCH.get(kind)
     if fn is None:
         raise ToolError(f"Type de document non supporté ou non reconnu (détecté : '{kind}')")
-    # xlsx_read n'accepte pas rng (rejeté ci-dessus) : appel à 2 arguments.
-    if kind == "xlsx":
-        return fn(path, selector)
-    return fn(path, selector, rng)
+    try:
+        # xlsx_read n'accepte pas rng (rejeté ci-dessus) : appel à 2 arguments.
+        if kind == "xlsx":
+            return fn(path, selector)
+        return fn(path, selector, rng)
+    except ToolError:
+        raise
+    except _PARSING_EXCEPTIONS as e:
+        _reraise_as_corrupt(kind, e)
 
 
 def search_document(kind: str, path: DocSource, query: Query) -> list[UnitResult]:
     fn = _SEARCH_DISPATCH.get(kind)
     if fn is None:
         raise ToolError(f"Recherche non encore supportée pour ce format (détecté : '{kind}')")
-    return fn(path, query)
+    try:
+        return fn(path, query)
+    except ToolError:
+        raise
+    except _PARSING_EXCEPTIONS as e:
+        _reraise_as_corrupt(kind, e)

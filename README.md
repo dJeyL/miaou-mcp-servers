@@ -53,7 +53,7 @@ cp config.sample.json config.json
 uv run mcp_proxy.py
 ```
 
-`config.sample.json` active bench, weather, fetch, duckduckgo et docs par défaut en
+`config.sample.json` active bench, weather, web, duckduckgo et docs par défaut en
 inprocess. brave est désactivé jusqu'à ce que `BRAVE_API_KEY` soit renseigné.
 
 ## Configuration MIAOU
@@ -63,7 +63,7 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 ```
 bench       → http://127.0.0.1:8765/mcp   (streamable-http)
 weather     → http://127.0.0.1:8766/mcp   (streamable-http)
-fetch       → http://127.0.0.1:8768/mcp   (streamable-http)
+web         → http://127.0.0.1:8768/mcp   (streamable-http)
 duckduckgo  → http://127.0.0.1:8769/mcp   (streamable-http)
 brave       → http://127.0.0.1:8770/mcp   (streamable-http)
 docs        → http://127.0.0.1:8771/mcp   (streamable-http)
@@ -126,9 +126,12 @@ Pour un serveur externe (subprocess stdio) :
 ## Tests
 
 ```bash
-# Avec uv
+# Avec uv — commande canonique
 uv run --with pytest --with pytest-asyncio --with html2text --with pymupdf \
   --with python-docx --with openpyxl --with python-pptx pytest tests/ -v
+
+# Avec uv — alternative via pyproject.toml (groupe dev) + uv.lock
+uv run --group dev pytest tests/ -v
 
 # Avec pip (après pip install -r requirements.txt)
 pytest tests/ -v
@@ -151,6 +154,7 @@ miaou-mcp-servers/
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package
 ├── tests/
 │   ├── __init__.py
+│   ├── test_base.py
 │   ├── test_bench.py
 │   ├── test_weather.py
 │   ├── test_web.py
@@ -160,7 +164,9 @@ miaou-mcp-servers/
 │   ├── test_docs.py
 │   └── test_proxy.py
 ├── config.sample.json
-└── requirements.txt
+├── requirements.txt
+├── pyproject.toml        # métadonnées + config pytest (asyncio_mode=auto) + groupe dev
+└── uv.lock               # lock uv, versionné
 ```
 
 ## Sécurité

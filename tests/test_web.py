@@ -293,6 +293,23 @@ async def test_fetch_list_paginates_and_caches_structure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fetch_list_recovers_from_corrupted_structure_cache():
+    """WEB7 : un .json corrompu (troncature disque, édition manuelle) doit être
+    traité comme un cache absent, pas fuiter json.JSONDecodeError — fetch_list
+    ré-extrait la structure depuis le .html déjà en cache."""
+    mock_resp = _make_mock_resp(_STRUCTURED_HTML, "text/html; charset=utf-8")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/corrupt-structure"})
+
+    mcp_web_cache.structure_path("http://example.com/corrupt-structure").write_text(
+        "{not valid json", encoding="utf-8"
+    )
+
+    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/corrupt-structure"})
+    assert "Titre principal" in result
+
+
+@pytest.mark.asyncio
 async def test_fetch_list_unknown_url_returns_clear_message():
     result = await _TM.call_tool("fetch_list", {"url": "http://never-fetched.example.com"})
     assert isinstance(result, str)
@@ -310,6 +327,21 @@ async def test_fetch_list_on_non_html_url_returns_distinct_message():
     result = await _TM.call_tool("fetch_list", {"url": "http://example.com/plain.txt"})
     assert isinstance(result, str)
     assert "n'a pas renvoyé du HTML" in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_list_entry_start_beyond_total_returns_clear_message():
+    """WEB5 : entry_start au-delà du total ne doit plus produire la formulation
+    bancale "entre 250 et 12 au total"."""
+    mock_resp = _make_mock_resp(_STRUCTURED_HTML, "text/html; charset=utf-8")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/oob-list"})
+
+    result = await _TM.call_tool(
+        "fetch_list", {"url": "http://example.com/oob-list", "entry_start": 250}
+    )
+    assert "hors bornes" in result
+    assert "entre" not in result
 
 
 @pytest.mark.asyncio
@@ -500,6 +532,62 @@ def test_env_int_invalid_value_raises_named_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_fetch_url_clamps_max_bytes_above_default():
+    """WEB1 : max_bytes ne doit pas dépasser _DEFAULT_MAX_BYTES vers le haut —
+    sinon un appelant peut demander 10**12 octets et faire lire tout en mémoire."""
+    import mcp_web
+
+    body = b"A" * 100
+    mock_resp = _make_mock_resp(body, "text/plain")
+    captured = {}
+
+    def capturing_open(self, req, *args, **kwargs):
+        captured["req"] = req
+        return mock_resp
+
+    with patch("mcp_web._fetch_bytes", wraps=mcp_web._fetch_bytes) as spy, \
+         patch("urllib.request.OpenerDirector.open", capturing_open):
+        await _TM.call_tool(
+            "fetch_url", {"url": "http://example.com/huge", "max_bytes": 10**12}
+        )
+    called_max_bytes = spy.call_args[0][1]
+    assert called_max_bytes == mcp_web._DEFAULT_MAX_BYTES
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_clamps_max_bytes_above_resource_max():
+    import mcp_web
+
+    body = b"A" * 100
+    mock_resp = _make_mock_resp(body, "application/octet-stream")
+
+    with patch("mcp_web._fetch_bytes", wraps=mcp_web._fetch_bytes) as spy, \
+         patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        await _TM.call_tool(
+            "fetch_resource", {"url": "http://example.com/huge.bin", "max_bytes": 10**12}
+        )
+    called_max_bytes = spy.call_args[0][1]
+    assert called_max_bytes == mcp_web_cache.RESOURCE_MAX_BYTES
+
+
+@pytest.mark.asyncio
+async def test_fetch_read_out_of_bounds_char_start_returns_notice():
+    """WEB2 : char_start >= len(texte) doit renvoyer une notice explicite,
+    jamais une chaîne vide nue."""
+    body = b"short text"
+    mock_resp = _make_mock_resp(body, "text/plain")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/oob"})
+
+    result = await _TM.call_tool(
+        "fetch_read", {"url": "http://example.com/oob", "char_start": 1000}
+    )
+    assert result != ""
+    assert "hors bornes" in result.lower()
+    assert str(len(body)) in result
+
+
+@pytest.mark.asyncio
 async def test_fetch_list_reflects_new_html_after_refetch():
     """W2 : un re-fetch doit invalider la structure déjà extraite, sinon
     fetch_list resservirait des headings/liens périmés."""
@@ -517,3 +605,95 @@ async def test_fetch_list_reflects_new_html_after_refetch():
     result = await _TM.call_tool("fetch_list", {"url": "http://example.com/refetch"})
     assert "Nouveau titre" in result
     assert "Ancien titre" not in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_list_stale_after_html_becomes_text(monkeypatch):
+    """WEB3 : une URL d'abord HTML, re-téléchargée en text/*, ne doit plus
+    laisser fetch_list servir la structure de l'ancienne page HTML — le .html
+    et le .json doivent être purgés par la branche textuelle de fetch_url."""
+    html = b"<html><body><h1>Page HTML</h1></body></html>"
+    mock_resp_html = _make_mock_resp(html, "text/html; charset=utf-8")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_html):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/switch"})
+    await _TM.call_tool("fetch_list", {"url": "http://example.com/switch"})
+
+    text_body = b"maintenant du texte brut"
+    mock_resp_text = _make_mock_resp(text_body, "text/plain; charset=utf-8")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_text):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/switch"})
+
+    list_result = await _TM.call_tool("fetch_list", {"url": "http://example.com/switch"})
+    assert "n'a pas renvoyé du HTML" in list_result
+
+    read_result = await _TM.call_tool("fetch_read", {"url": "http://example.com/switch"})
+    assert "maintenant du texte brut" in read_result
+
+
+@pytest.mark.asyncio
+async def test_fetch_read_stale_after_html_becomes_binary():
+    """WEB3 : une URL d'abord HTML, re-téléchargée en binaire, ne doit plus
+    laisser fetch_read servir l'ancien texte — .txt/.html/.json doivent être
+    purgés par la branche binaire de fetch_url."""
+    html = b"<html><body><h1>Page HTML</h1></body></html>"
+    mock_resp_html = _make_mock_resp(html, "text/html; charset=utf-8")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_html):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/to-binary"})
+    await _TM.call_tool("fetch_list", {"url": "http://example.com/to-binary"})
+
+    binary_body = bytes(range(256))
+    mock_resp_bin = _make_mock_resp(binary_body, "image/png")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_bin):
+        await _TM.call_tool("fetch_url", {"url": "http://example.com/to-binary"})
+
+    read_result = await _TM.call_tool("fetch_read", {"url": "http://example.com/to-binary"})
+    assert isinstance(read_result, str)
+    assert "fetch_url" in read_result  # message de cache absent/expiré
+
+    list_result = await _TM.call_tool("fetch_list", {"url": "http://example.com/to-binary"})
+    assert "fetch_url" in list_result
+
+
+# ---------------------------------------------------------------------------
+# WEB9 — conversion html2text et écritures cache hors event loop
+# (asyncio.to_thread). fetch_url reste fonctionnel de bout en bout, et une
+# coroutine concurrente progresse pendant la conversion (CPU-bound sur plusieurs
+# Mo de HTML).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fetch_url_renders_html_off_the_event_loop():
+    import asyncio
+
+    import mcp_web
+
+    html = b"<html><body><p>Hello world</p></body></html>"
+    mock_resp = _make_mock_resp(html, "text/html; charset=utf-8")
+
+    BLOCK = 0.3
+    real_render = mcp_web._render_html_blocking
+
+    def _slow_render(*args, **kwargs):
+        time.sleep(BLOCK)  # gèlerait la loop si appelée hors to_thread
+        return real_render(*args, **kwargs)
+
+    concurrent_ran = asyncio.Event()
+
+    async def _concurrent():
+        await asyncio.sleep(BLOCK / 3)
+        concurrent_ran.set()
+
+    async def _call():
+        with patch.object(mcp_web, "_render_html_blocking", _slow_render):
+            with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+                return await _TM.call_tool("fetch_url", {"url": "http://example.com"})
+
+    call_task = asyncio.create_task(_call())
+    await _concurrent()
+    assert not call_task.done(), "la conversion trop rapide — le test ne mesure rien"
+    assert concurrent_ran.is_set(), "la loop est restée bloquée pendant la conversion html2text"
+
+    result = await call_task
+    assert isinstance(result, types.EmbeddedResource)
+    assert result.resource.mimeType == "text/plain"
+    assert "Hello world" in result.resource.text

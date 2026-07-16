@@ -63,3 +63,15 @@ def test_ignores_fragment_and_javascript_links():
     )
     entries = extract_structure(html)
     assert entries == [{"type": "link", "text": "Lien réel", "url": "/reel"}]
+
+
+def test_ignores_data_uri_links():
+    """WEB8 : un href data: (potentiellement très long) est du même bruit de
+    navigation que #fragment/javascript:, jamais un lien de navigation réel."""
+    html = (
+        '<a href="data:text/plain;base64,SGVsbG8=">Blob</a>'
+        '<a href="DATA:image/png;base64,iVBORw0KGgo=">Blob maj</a>'
+        '<a href="/reel">Lien réel</a>'
+    )
+    entries = extract_structure(html)
+    assert entries == [{"type": "link", "text": "Lien réel", "url": "/reel"}]

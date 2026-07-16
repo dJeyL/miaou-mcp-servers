@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2", "uvicorn", "starlette"]
+# dependencies = ["mcp>=1.28.1", "uvicorn", "starlette"]
 # ///
 """
 Serveur MCP de banc d'essai pour MIAOU (V2 — délégation distante).
@@ -77,7 +77,8 @@ class BenchServer(MiaouMCPBase):
 
         @self.mcp.tool()
         async def reverse_dns(ip: str) -> str:
-            """Résout une adresse IP en nom d'hôte (PTR) depuis le réseau local du serveur."""
+            """Résout une adresse IP en nom d'hôte (PTR) depuis le réseau local du serveur.
+            Un hostname est aussi accepté en entrée (gethostbyaddr fait forward+reverse)."""
             await asyncio.sleep(2)
             try:
                 hostname, _, _ = await asyncio.to_thread(socket.gethostbyaddr, ip)

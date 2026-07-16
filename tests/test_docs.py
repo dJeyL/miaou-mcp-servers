@@ -81,6 +81,21 @@ def test_validate_session_id_rejects_dot(workdir):
         validate_session_id(".")
 
 
+def test_validate_session_id_rejects_nul_byte():
+    """DOC8 : un NUL non filtré passe validate_session_id puis fait fuiter
+    ValueError('embedded null character in path') à mkdir dans touch_session."""
+    with pytest.raises(ToolError):
+        validate_session_id("a\x00b")
+
+
+def test_docs_env_int_invalid_value_raises_named_error(monkeypatch):
+    """DOC5 : même comportement que mcp_web.cache._env_int — nommer la
+    variable plutôt qu'un ValueError anonyme à l'import."""
+    monkeypatch.setenv("MIAOU_DOCS_READ_CAP", "not-a-number")
+    with pytest.raises(ValueError, match="MIAOU_DOCS_READ_CAP"):
+        docs_session._env_int("MIAOU_DOCS_READ_CAP", 20000)
+
+
 def test_validate_ref_accepts_att_n():
     assert validate_ref("att-1") == "att-1"
     assert validate_ref("att-42") == "att-42"
@@ -142,7 +157,9 @@ def test_materialize_writes_file(workdir):
 
 def test_materialize_is_idempotent(workdir):
     """Un rechargement de page MIAOU repousse content_b64 pour un ref déjà connu —
-    ré-écriture silencieuse, pas une erreur."""
+    ré-acceptation silencieuse SANS réécriture (le fichier déjà matérialisé
+    fait foi), pas une erreur (T6 : la docstring recopiait auparavant la
+    formulation « réécriture silencieuse », inexacte — corrigée avec DD2)."""
     content = base64.b64encode(b"hello world").decode()
     path1 = materialize("conv-1", "att-1", content)
     path1.write_bytes(b"already there, must not be overwritten")
@@ -177,6 +194,13 @@ def test_materialize_rejects_bad_session_id(workdir):
     content = base64.b64encode(b"data").decode()
     with pytest.raises(ToolError):
         materialize("../escape", "att-1", content)
+
+
+def test_materialize_rejects_invalid_base64(workdir):
+    """DOC2 : un base64 invalide (padding incorrect) doit lever une ToolError
+    claire, pas laisser fuiter binascii.Error brute au client."""
+    with pytest.raises(ToolError, match="content_b64 invalide"):
+        materialize("conv-1", "att-1", "not-valid-base64!!!")
 
 
 def test_materialize_writes_file_for_library_ref(workdir):
@@ -298,6 +322,28 @@ async def test_drop_session_idempotent_when_absent(workdir):
     tm = docs_server.mcp._tool_manager
     result = await tm.call_tool("drop_session", {"session_id": "conv-never-existed"})
     assert "conv-never-existed" in result
+
+
+@pytest.mark.asyncio
+async def test_drop_session_sweeps_other_expired_sessions(workdir):
+    """DD3/DOC7 : CLAUDE.md affirme le sweep TTL 'en tête de chaque appel
+    d'outil' — drop_session doit désormais le faire aussi, pas seulement
+    list/read/search/extract."""
+    from mcp_docs import server as docs_server
+
+    other = session_dir("conv-expired")
+    other.mkdir(parents=True)
+    old_time = time.time() - 999999
+    import os
+    os.utime(other, (old_time, old_time))
+
+    target = session_dir("conv-target")
+    target.mkdir(parents=True)
+
+    tm = docs_server.mcp._tool_manager
+    await tm.call_tool("drop_session", {"session_id": "conv-target"})
+
+    assert not other.exists()  # balayée par le sweep, pas par drop_session lui-même
 
 
 # ---------------------------------------------------------------------------
@@ -704,6 +750,40 @@ def test_docx_list_reports_french_heading_style(tmp_path):
     assert "pas de heading" not in result
 
 
+def _make_docx_with_heading_style(tmp_path, style_name, title_text, filename):
+    """FMT6 : même principe que _make_docx_with_french_heading_style pour une
+    locale de style arbitraire (allemand, espagnol, italien)."""
+    import docx
+    from docx.enum.style import WD_STYLE_TYPE
+
+    d = docx.Document()
+    styles = d.styles
+    if style_name not in [s.name for s in styles]:
+        localized_style = styles.add_style(style_name, WD_STYLE_TYPE.PARAGRAPH)
+        localized_style.base_style = styles["Heading 1"]
+    para = d.add_paragraph(title_text)
+    para.style = d.styles[style_name]
+    path = tmp_path / filename
+    d.save(str(path))
+    return path
+
+
+@pytest.mark.parametrize(
+    "style_name,filename",
+    [
+        ("Überschrift 1", "doc_de.docx"),
+        ("Título 1", "doc_es.docx"),
+        ("Titolo 1", "doc_it.docx"),
+    ],
+)
+def test_docx_list_reports_other_locale_heading_styles(tmp_path, style_name, filename):
+    """FMT6 : allemand/espagnol/italien reconnus en plus de EN/FR."""
+    path = _make_docx_with_heading_style(tmp_path, style_name, "Einleitung", filename)
+    result = list_document("docx", path)
+    assert "Einleitung" in result
+    assert "pas de heading" not in result
+
+
 def test_docx_list_reports_headings(tmp_path):
     path = _make_docx(tmp_path, [(1, "Title"), (None, "Body text"), (2, "Subtitle")])
     result = list_document("docx", path)
@@ -1078,12 +1158,14 @@ def test_zip_search_targeted_member_via_path(tmp_path):
     assert [r.label for r in results] == ["a.txt"]
 
 
-def test_zip_search_targeted_binary_member_reports_note_not_empty(tmp_path):
-    """F5 : cibler explicitement un membre binaire via member_path doit
-    renvoyer une note explicite, pas un simple [] indiscernable d'un
-    'pas de match' silencieux."""
+def test_zip_search_targeted_binary_member_raises_clear_error(tmp_path):
+    """F5/FMT7 : cibler explicitement un membre binaire via member_path doit
+    lever une erreur claire (réponse définitive et actionnable), pas un
+    UnitResult à 0 hit qui se lirait comme une recherche effectuée sans
+    résultat ("0 occurrence(s) dans 1 unité(s)")."""
     from mcp_docs.formats import zip_search
     from mcp_docs.search import parse_query
+    from mcp_docs.session import ToolError
 
     path = _make_zip(tmp_path, {})
     import zipfile
@@ -1091,16 +1173,15 @@ def test_zip_search_targeted_binary_member_reports_note_not_empty(tmp_path):
     with zipfile.ZipFile(path, "a") as z:
         z.writestr("blob.bin", b"\xff\xfe\x00\x01binary")
 
-    results = zip_search(path, parse_query("chat"), member_path="blob.bin")
-    assert len(results) == 1
-    assert results[0].label == "(note)"
-    assert "non cherché" in results[0].snippets[0]
+    with pytest.raises(ToolError, match="non cherché"):
+        zip_search(path, parse_query("chat"), member_path="blob.bin")
 
 
-def test_zip_search_targeted_structured_member_reports_note(tmp_path):
-    """F5 : idem pour un membre reconnu comme document structuré (docx)."""
+def test_zip_search_targeted_structured_member_raises_clear_error(tmp_path):
+    """F5/FMT7 : idem pour un membre reconnu comme document structuré (docx)."""
     from mcp_docs.formats import zip_search
     from mcp_docs.search import parse_query
+    from mcp_docs.session import ToolError
 
     inner_docx = _make_docx(tmp_path, [(None, "chat noir")])
     path = _make_zip(tmp_path, {})
@@ -1109,10 +1190,8 @@ def test_zip_search_targeted_structured_member_reports_note(tmp_path):
     with zipfile.ZipFile(path, "a") as z:
         z.write(inner_docx, "inner.docx")
 
-    results = zip_search(path, parse_query("chat"), member_path="inner.docx")
-    assert len(results) == 1
-    assert results[0].label == "(note)"
-    assert "non cherché" in results[0].snippets[0]
+    with pytest.raises(ToolError, match="non cherché"):
+        zip_search(path, parse_query("chat"), member_path="inner.docx")
 
 
 def test_zip_search_structured_and_binary_members_ignored_and_noted(tmp_path):
@@ -1135,6 +1214,72 @@ def test_zip_search_structured_and_binary_members_ignored_and_noted(tmp_path):
     assert "nested.docx" in note.snippets[0]
     # Le membre docx imbriqué n'est pas cherché malgré son contenu matchable.
     assert not any(r.label == "nested.docx" for r in results)
+
+
+def test_zip_search_cumulative_size_budget_stops_scan(tmp_path, monkeypatch):
+    """FMT5 : le garde par membre (MAX_UNZIP_MB) ne bornait pas le cumul —
+    plusieurs membres, chacun sous la limite individuelle, pouvaient être
+    balayés en entier sans borne globale. Un budget cumulé abaisse le seuil
+    pour le test et vérifie que le balayage s'arrête avant le dernier membre."""
+    import mcp_docs.formats as fmt
+
+    monkeypatch.setattr(fmt, "MAX_UNZIP_MB", 100)
+    monkeypatch.setattr(fmt, "_ZIP_SEARCH_TIME_BUDGET_S", 45)
+    # Trois membres de ~0.6 Mo chacun (sous MAX_UNZIP_MB par membre) ; on
+    # abaisse le budget cumulé à 1 Mo pour forcer l'arrêt avant le 3e.
+    content = "chat noir " * 60000  # ~0.6 Mo
+    path = _make_zip(tmp_path, {"a.txt": content, "b.txt": content, "c.txt": content})
+
+    monkeypatch.setattr(fmt, "MAX_UNZIP_MB", 1)
+    results = fmt.zip_search(path, parse_query("chat"))
+    note = next((r for r in results if r.label == "(note)"), None)
+    assert note is not None
+    # Budget de temps laissé à 45 s : c'est bien le cumul qui coupe, la note
+    # doit le nommer précisément (sinon le test passerait pour la mauvaise raison).
+    assert "budget cumulé" in note.snippets[0]
+    assert "c.txt" in note.snippets[0]
+
+
+def test_zip_search_time_budget_stops_scan(tmp_path, monkeypatch):
+    """FMT5 : budget de temps global (MIAOU_DOCS_SCAN_TIMEOUT_S). Budget mis à
+    0 s → le balayage s'arrête au premier membre, avec une note nommant le
+    budget de temps et le membre non couvert, sans lever d'erreur."""
+    import mcp_docs.formats as fmt
+
+    monkeypatch.setattr(fmt, "_ZIP_SEARCH_TIME_BUDGET_S", 0)
+    path = _make_zip(tmp_path, {"a.txt": "chat noir", "b.txt": "chat noir"})
+
+    results = fmt.zip_search(path, parse_query("chat"))
+    note = next((r for r in results if r.label == "(note)"), None)
+    assert note is not None
+    assert "budget de temps" in note.snippets[0]
+    assert "a.txt" in note.snippets[0]
+
+
+def test_zip_search_time_budget_is_env_overridable(monkeypatch):
+    """FMT5 : le budget de temps suit le même mécanisme _env_int que les autres
+    caps de mcp_docs (défaut 30 s, surchargeable par MIAOU_DOCS_SCAN_TIMEOUT_S)."""
+    import mcp_docs.session as docs_session
+
+    monkeypatch.setenv("MIAOU_DOCS_SCAN_TIMEOUT_S", "5")
+    assert docs_session._env_int("MIAOU_DOCS_SCAN_TIMEOUT_S", 30) == 5
+    monkeypatch.delenv("MIAOU_DOCS_SCAN_TIMEOUT_S")
+    assert docs_session._env_int("MIAOU_DOCS_SCAN_TIMEOUT_S", 30) == 30
+
+
+def test_zip_search_nominal_scan_unaffected_by_budgets(tmp_path):
+    """FMT5 non-régression : une archive ordinaire reste balayée en entier, tous
+    les membres cherchés, sans note de zone aveugle (budgets par défaut)."""
+    import mcp_docs.formats as fmt
+
+    path = _make_zip(
+        tmp_path,
+        {"a.txt": "chat noir", "b.txt": "chat gris", "c.txt": "rien ici"},
+    )
+    results = fmt.zip_search(path, parse_query("chat"))
+    labels = {r.label for r in results}
+    assert labels == {"a.txt", "b.txt"}
+    assert "(note)" not in labels
 
 
 def test_zip_search_no_match_returns_empty_without_note(tmp_path):
@@ -1217,6 +1362,17 @@ async def test_list_tool_end_to_end_resource_ref(workdir):
     tm = docs_server.mcp._tool_manager
     result = await tm.call_tool("list", {"ref": "res_abc123", "session_id": "conv-1"})
     assert "PDF" in result
+
+
+def test_list_tool_docstring_does_not_restrict_ref_to_att_n():
+    """DOC4 : la docstring de `list` ne doit pas décrire `ref` comme un
+    att-N — trois familles existent (att-N/file-<id>/res_<id>), un modèle
+    scrupuleux pourrait sinon refuser de passer un handle res_… à `list`."""
+    from mcp_docs import server as docs_server
+
+    tm = docs_server.mcp._tool_manager
+    tool = next(t for t in tm.list_tools() if t.name == "list")
+    assert "att-N" not in tool.description
 
 
 @pytest.mark.asyncio
@@ -1844,6 +2000,52 @@ def test_apply_range_line_start_beyond_end():
     assert "au-delà" in notice
 
 
+def test_apply_range_char_start_positive_on_empty_body_reports_out_of_bounds():
+    """FMT8 : char_start > 0 sur un corps vide tombait auparavant sur
+    ToolError('Plage de caractères invalide : 5-None') au lieu de la notice
+    hors bornes normale."""
+    from mcp_docs.formats import TextRange, _apply_range
+
+    text, notice = _apply_range("", TextRange(char_start=5))
+    assert text == ""
+    assert "au-delà" in notice
+
+
+def test_apply_range_char_start_zero_on_empty_body_returns_empty_without_error():
+    from mcp_docs.formats import TextRange, _apply_range
+
+    text, notice = _apply_range("", TextRange(char_start=0))
+    assert text == ""
+    assert notice == ""
+
+
+def test_parse_range_within_bounds_reports_no_notice():
+    from mcp_docs.formats import _parse_range
+
+    start, end, notice = _parse_range("2-4", 10)
+    assert (start, end) == (2, 4)
+    assert notice == ""
+
+
+def test_parse_range_clamped_reports_notice():
+    """FMT4 : une plage qui déborde du document doit désormais l'annoncer
+    plutôt que de clamper silencieusement."""
+    from mcp_docs.formats import _parse_range
+
+    start, end, notice = _parse_range("5-100", 10)
+    assert (start, end) == (5, 10)
+    assert "5-10" in notice
+    assert "5-100" in notice
+
+
+def test_pdf_read_range_selector_clamped_reports_notice(tmp_path):
+    """FMT4 vu depuis pdf_read : le clamp de _parse_range doit apparaître dans
+    la sortie de l'outil, pas seulement dans la fonction interne."""
+    path = _make_pdf(tmp_path, ["Page A", "Page B", "Page C"])
+    result = read_document("pdf", path, "2-100")
+    assert "Plage ramenée à 2-3" in result
+
+
 def test_pdf_read_char_range_exceeds_cap_via_offset(tmp_path, monkeypatch):
     """Une page unique dépassant READ_CAP devient lisible en entier via
     plusieurs appels char_start décalés. La plage porte sur le body rendu
@@ -2060,3 +2262,139 @@ def test_render_results_truncates_at_cap():
     out = render_results("pdf", "chat", units, cap=2)
     assert "Tronqué à 2 snippets" in out
     assert "2 occurrence(s) supplémentaire(s)" in out
+
+
+# ---------------------------------------------------------------------------
+# FMT1 — la notice de troncature READ_CAP ne doit jamais être masquée par une
+# notice de pagination/vide déjà posée (concaténation, pas `if not notice`).
+# ---------------------------------------------------------------------------
+
+def test_pdf_read_truncation_notice_not_masked_by_pagination_notice(tmp_path, monkeypatch):
+    import mcp_docs.formats as fmt
+
+    monkeypatch.setattr(fmt, "READ_CAP", 20)
+    path = _make_pdf(tmp_path, ["X" * 200, "second page"])
+    result = fmt.read_document("pdf", path, None)
+    assert "seule servie" in result
+    assert "Tronqué à 20 caractères" in result
+
+
+def test_pptx_read_truncation_notice_not_masked_by_pagination_notice(tmp_path, monkeypatch):
+    import mcp_docs.formats as fmt
+
+    monkeypatch.setattr(fmt, "READ_CAP", 20)
+    path = _make_pptx(tmp_path, ["X" * 200, "second slide"])
+    result = fmt.read_document("pptx", path, None)
+    assert "seule servie" in result
+    assert "Tronqué à 20 caractères" in result
+
+
+def test_docx_read_truncation_notice_not_masked_by_para_notice(tmp_path, monkeypatch):
+    import mcp_docs.formats as fmt
+
+    monkeypatch.setattr(fmt, "READ_CAP", 20)
+    structure = [(None, f"paragraph {i}") for i in range(60)]
+    path = _make_docx(tmp_path, structure)
+    result = fmt.read_document("docx", path, None)
+    assert "selector=<titre d'un heading>" in result
+    assert "Tronqué à 20 caractères" in result
+
+
+# ---------------------------------------------------------------------------
+# FMT2 — exceptions des libs de parsing sur document forgé/corrompu converties
+# en ToolError, sans détail interne (chemin disque, trace stdlib).
+# ---------------------------------------------------------------------------
+
+def test_pdf_read_corrupt_document_raises_clear_tool_error(tmp_path):
+    path = tmp_path / "corrupt.pdf"
+    path.write_bytes(b"%PDF" + b"garbage" * 20)
+    with pytest.raises(ToolError, match="illisible ou corrompu") as exc_info:
+        read_document("pdf", path, None)
+    assert str(tmp_path) not in str(exc_info.value)
+
+
+def test_docx_list_corrupt_office_zip_raises_clear_tool_error(tmp_path):
+    """Zip avec un dossier word/ (détecté docx) mais sans [Content_Types].xml —
+    python-docx lève une KeyError brute, doit devenir une ToolError propre."""
+    import zipfile
+
+    path = tmp_path / "broken.docx"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("word/document.xml", "<xml/>")
+    with pytest.raises(ToolError, match="illisible ou corrompu"):
+        list_document("docx", path)
+
+
+# ---------------------------------------------------------------------------
+# FMT3 — xlsx sans élément <dimension> ("unsized") : fallback plutôt que fuite
+# de ValueError openpyxl.
+# ---------------------------------------------------------------------------
+
+def test_xlsx_list_unsized_sheet_falls_back(tmp_path):
+    import re
+    import zipfile
+
+    src = _make_xlsx(tmp_path, {"Data": [["a", "b"], ["1", "2"]]})
+    dst = tmp_path / "unsized.xlsx"
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                data = re.sub(rb"<dimension[^/]*/>", b"", data)
+            zout.writestr(item, data)
+
+    result = list_document("xlsx", dst)
+    assert "Data" in result
+    assert "colonne(s)" in result
+
+
+# ---------------------------------------------------------------------------
+# DOC1/DOC9 — matérialisation et nettoyage hors event loop (asyncio.to_thread).
+# Le test vérifie à la fois que l'outil reste fonctionnel de bout en bout via
+# tool_manager, et que la loop reste ordonnançable pendant l'étape bloquante
+# (resolve_ref : sweep + b64decode + quota + write_bytes).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_materializes_off_the_event_loop(workdir, tmp_path):
+    """docs__list reste fonctionnel de bout en bout, et une coroutine concurrente
+    progresse pendant la matérialisation : resolve_ref (sweep + b64decode + quota
+    + write_bytes) ne doit pas s'exécuter dans l'event loop."""
+    import asyncio
+
+    from mcp_docs import server as docs_server
+
+    path = _make_zip(tmp_path, {"a.txt": "hello", "dir/b.txt": "world"})
+    content_b64 = base64.b64encode(path.read_bytes()).decode()
+
+    BLOCK = 0.3
+    real_resolve = docs_session.resolve_ref
+
+    def _slow_resolve(*args, **kwargs):
+        time.sleep(BLOCK)  # gèlerait la loop si appelée hors to_thread
+        return real_resolve(*args, **kwargs)
+
+    concurrent_ran = asyncio.Event()
+
+    async def _concurrent():
+        # Se réveille bien avant la fin du resolve : n'y parvient que si la loop
+        # est libre pendant l'étape bloquante.
+        await asyncio.sleep(BLOCK / 3)
+        concurrent_ran.set()
+
+    async def _call():
+        with patch.object(mcp_docs, "resolve_ref", _slow_resolve):
+            tm = docs_server.mcp._tool_manager
+            return await tm.call_tool(
+                "list",
+                {"ref": "att-1", "session_id": "conv-thread", "content_b64": content_b64},
+            )
+
+    call_task = asyncio.create_task(_call())
+    await _concurrent()
+    assert not call_task.done(), "resolve_ref trop rapide — le test ne mesure rien"
+    assert concurrent_ran.is_set(), "la loop est restée bloquée pendant resolve_ref"
+
+    result = await call_task
+    assert "a.txt" in result
+    assert "dir/b.txt" in result

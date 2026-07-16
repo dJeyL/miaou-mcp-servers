@@ -75,18 +75,6 @@ async def test_brave_extracts_title_url_description():
 
 
 @pytest.mark.asyncio
-async def test_brave_count_respected():
-    mock_resp = _make_mock_resp(_BRAVE_RESPONSE)
-    with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
-         patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_search", {"query": "python", "count": 1})
-    # count=1 est transmis à l'API ; le mock retourne 2 résultats quand même
-    # (le serveur ne tronque pas côté client, il délègue à l'API)
-    items = json.loads(result.resource.text)
-    assert isinstance(items, list)
-
-
-@pytest.mark.asyncio
 async def test_brave_uri_contains_query():
     mock_resp = _make_mock_resp(_BRAVE_RESPONSE)
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
@@ -132,6 +120,39 @@ async def test_brave_url_error_returns_string():
 def test_tool_list_contains_brave_search():
     names = {t.name for t in _TM.list_tools()}
     assert "brave_search" in names
+
+
+@pytest.mark.asyncio
+async def test_brave_search_degenerate_web_field_returns_empty_results():
+    """W2-bis : data['web'] scalaire au lieu d'un dict — pas d'AttributeError
+    fuité ; traité comme absence de résultats, pas une erreur (le JSON est
+    valide, juste dégénéré sur ce champ)."""
+    mock_resp = _make_mock_resp({"web": None})
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
+         patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("brave_search", {"query": "python"})
+    assert isinstance(result, types.EmbeddedResource)
+    assert json.loads(result.resource.text) == []
+
+
+@pytest.mark.asyncio
+async def test_brave_search_degenerate_results_field_returns_clear_string():
+    mock_resp = _make_mock_resp({"web": {"results": "not-a-list"}})
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
+         patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("brave_search", {"query": "python"})
+    assert isinstance(result, str)
+    assert "invalide" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_brave_search_result_entry_not_dict_skipped():
+    mock_resp = _make_mock_resp({"web": {"results": ["not-a-dict"]}})
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
+         patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("brave_search", {"query": "python"})
+    items = json.loads(result.resource.text)
+    assert items == []
 
 
 @pytest.mark.asyncio
@@ -317,3 +338,24 @@ async def test_image_search_handles_null_thumbnail():
     items = json.loads(result.resource.text)
     assert len(items) == 1
     assert items[0]["thumbnail_url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_image_search_degenerate_results_field_returns_clear_string():
+    """W2-bis : data['results'] scalaire — pas d'AttributeError fuité."""
+    mock_resp = _make_mock_resp({"results": "not-a-list"})
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
+         patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+    assert isinstance(result, str)
+    assert "invalide" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_image_search_result_entry_not_dict_skipped():
+    mock_resp = _make_mock_resp({"results": ["not-a-dict"]})
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
+         patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+    items = json.loads(result.resource.text)
+    assert items == []

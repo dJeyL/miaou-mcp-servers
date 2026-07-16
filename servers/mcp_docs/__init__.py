@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2", "uvicorn", "starlette", "pymupdf", "python-docx", "openpyxl", "python-pptx"]
+# dependencies = ["mcp>=1.28.1", "uvicorn", "starlette", "pymupdf", "python-docx", "openpyxl", "python-pptx"]
 # ///
 """
 Serveur MCP d'extraction de documents pour MIAOU (PDF, Office, Zip).
@@ -58,6 +58,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import shutil
+from pathlib import Path
 
 from mcp import types
 from mcp_base import MiaouMCPBase
@@ -82,6 +83,7 @@ from .session import (
     ToolError,
     resolve_ref,
     session_dir,
+    sweep_expired_sessions,
     validate_session_id,
 )
 
@@ -92,6 +94,36 @@ __all__ = [
     "mcp",
     "server",
 ]
+
+
+def _drop_session_blocking(session_id: str) -> None:
+    """Sweep + validation + rmtree groupés pour un seul asyncio.to_thread (le
+    rmtree peut porter sur MAX_SESSION_MB de fichiers). Le sweep en tête rend
+    vraie la phrase CLAUDE.md « sweep opportuniste en tête de chaque appel
+    d'outil » (DD3/DOC7) — inoffensif ici, la session ciblée est de toute
+    façon supprimée juste après, sweepée ou non."""
+    sweep_expired_sessions()
+    validate_session_id(session_id)
+    d = session_dir(session_id)
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _resolve_and_detect(
+    session_id: str, ref: str, content_b64: str | None, filename: str | None
+) -> tuple[Path, str]:
+    """Sweep TTL + validation + matérialisation + détection de type, groupés pour un
+    seul asyncio.to_thread : l'ordre compte (sweep → validate → materialize) et
+    chaque étape est bloquante (rmtree, b64decode, rglob de quota, write_bytes)."""
+    doc_path = resolve_ref(session_id, ref, content_b64)
+    return doc_path, detect_kind(doc_path, filename)
+
+
+def _extract_member_blocking(doc_path: Path, path: str) -> tuple[str, str]:
+    """Lecture du membre + encodage base64 groupés : le membre peut approcher
+    MAX_UNZIP_MB, l'encodage est aussi coûteux que l'extraction."""
+    text = zip_extract_member_text(doc_path, path)
+    return text, base64.b64encode(text.encode("utf-8")).decode()
 
 
 def _build_range(
@@ -141,10 +173,7 @@ class DocsServer(MiaouMCPBase):
         async def drop_session(session_id: str) -> str:
             """Supprime le répertoire de cache d'une session (nettoyage à la suppression
             d'une conversation MIAOU). Idempotent : silencieux si la session n'existe pas."""
-            validate_session_id(session_id)
-            d = session_dir(session_id)
-            if d.exists():
-                shutil.rmtree(d, ignore_errors=True)
+            await asyncio.to_thread(_drop_session_blocking, session_id)
             return f"Session '{session_id}' supprimée."
 
         @self.mcp.tool(name="list")
@@ -156,8 +185,9 @@ class DocsServer(MiaouMCPBase):
             filename: str | None = None,
         ) -> str:
             """Liste la structure d'un document (pages/feuilles/slides/entrées zip)
-            sans en renvoyer le contenu. `ref` identifie l'attachement (att-N) ;
-            `content_b64` matérialise le fichier au premier appel ; `filename`
+            sans en renvoyer le contenu. `ref` est une clé opaque fournie par le
+            client identifiant le document ; `content_b64` matérialise le fichier
+            au premier appel ; `filename`
             (optionnel) aide à la détection de type par extension, sinon magic
             bytes. `path` liste la structure d'un membre d'archive qui est
             lui-même un document structuré (docx/xlsx/pptx/pdf), un seul niveau
@@ -165,8 +195,9 @@ class DocsServer(MiaouMCPBase):
             reste lisible tel quel via `read(path=...)`."""
             if session_id is None:
                 raise ToolError("session_id requis (appel hors MIAOU ?)")
-            doc_path = resolve_ref(session_id, ref, content_b64)
-            kind = detect_kind(doc_path, filename)
+            doc_path, kind = await asyncio.to_thread(
+                _resolve_and_detect, session_id, ref, content_b64, filename
+            )
 
             if path is not None:
                 if kind != "zip":
@@ -192,8 +223,9 @@ class DocsServer(MiaouMCPBase):
 
             rng = _build_range(char_start, char_end, line_start, line_end)
 
-            doc_path = resolve_ref(session_id, ref, content_b64)
-            kind = detect_kind(doc_path, filename)
+            doc_path, kind = await asyncio.to_thread(
+                _resolve_and_detect, session_id, ref, content_b64, filename
+            )
 
             if path is not None:
                 if kind != "zip":
@@ -231,8 +263,9 @@ class DocsServer(MiaouMCPBase):
         ) -> str:
             if session_id is None:
                 raise ToolError("session_id requis (appel hors MIAOU ?)")
-            doc_path = resolve_ref(session_id, ref, content_b64)
-            kind = detect_kind(doc_path, filename)
+            doc_path, kind = await asyncio.to_thread(
+                _resolve_and_detect, session_id, ref, content_b64, filename
+            )
             parsed_query = parse_query(query)
 
             if kind == "zip":
@@ -264,7 +297,10 @@ class DocsServer(MiaouMCPBase):
         Dans un zip, seuls les membres texte brut sont cherchés ; les
         membres docx/xlsx/pptx/pdf, chiffrés ou binaires ne sont pas
         balayés (signalé en fin de résultat). Sans `path`, tous les membres
-        texte ; avec `path`, ce seul membre."""
+        texte ; avec `path`, ce seul membre. Un balayage sans `path` peut
+        s'arrêter avant la fin sur une archive volumineuse (budget de volume
+        ou de temps) : les membres non couverts sont alors nommés en fin de
+        résultat — l'absence d'occurrence n'y vaut pas absence dans l'archive."""
         self.mcp.tool(name="search")(search)
 
         async def extract(
@@ -276,13 +312,13 @@ class DocsServer(MiaouMCPBase):
         ) -> list[types.ContentBlock]:
             if session_id is None:
                 raise ToolError("session_id requis (appel hors MIAOU ?)")
-            doc_path = resolve_ref(session_id, ref, content_b64)
-            kind = detect_kind(doc_path, filename)
+            doc_path, kind = await asyncio.to_thread(
+                _resolve_and_detect, session_id, ref, content_b64, filename
+            )
             if kind != "zip":
                 raise ToolError(f"'{ref}' n'est pas une archive : extract ne s'applique qu'à un zip")
 
-            text = await asyncio.to_thread(zip_extract_member_text, doc_path, path)
-            blob = base64.b64encode(text.encode("utf-8")).decode()
+            text, blob = await asyncio.to_thread(_extract_member_blocking, doc_path, path)
 
             # Ce chemin renvoie le membre en entier — READ_CAP borne le contexte
             # du modèle, pas ce transfert : les octets vont au client (canal

@@ -53,7 +53,7 @@ async def test_ddg_search_extracts_fields():
     assert len(items) > 0
     first = items[0]
     assert first["url"] == "https://example.com"
-    assert "résultat" in first["title"].lower() or first["title"]
+    assert "résultat" in first["title"].lower()
     assert first["snippet"]
 
 

@@ -7,7 +7,6 @@ whose own PEP 723 blocks declare the shared dependencies.
 
 import argparse
 import inspect
-import os
 import sys
 import urllib.request
 
@@ -48,18 +47,14 @@ def _strip_schema_titles(schema: object) -> None:
 
 
 def make_opener() -> urllib.request.OpenerDirector:
-    """Construit un opener urllib proxy-aware (lit http_proxy/https_proxy, en
-    majuscules ou minuscules, chaque variable mappée sur son propre scheme)."""
-    http_proxy = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
-    https_proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
-    proxies = {}
-    if http_proxy:
-        proxies["http"] = http_proxy
-    if https_proxy:
-        proxies["https"] = https_proxy
-    if proxies:
-        return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
-    return urllib.request.build_opener()
+    """Construit un opener urllib proxy-aware (http_proxy/https_proxy, en
+    majuscules ou minuscules, chaque variable mappée sur son propre scheme).
+
+    Délègue à `ProxyHandler()` sans arguments (B2) plutôt que de construire le
+    dict `proxies` à la main : `ProxyHandler(proxies)` explicite court-circuite
+    `no_proxy`/`NO_PROXY`, alors que `ProxyHandler()` seul lit `getproxies()`
+    (qui, lui, respecte `no_proxy`) à chaque requête via `proxy_bypass`."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler())
 
 
 class MiaouMCPBase:
@@ -144,7 +139,7 @@ class MiaouMCPBase:
         positional = args_raw and not args_raw[0].startswith("--")
 
         if positional:
-            host = args_raw[0] if len(args_raw) > 0 else "127.0.0.1"
+            host = args_raw[0]
             if len(args_raw) > 1:
                 try:
                     port = int(args_raw[1])
@@ -153,6 +148,11 @@ class MiaouMCPBase:
                     sys.exit(1)
             else:
                 port = self.default_port
+            if len(args_raw) > 2:
+                print(
+                    f"Avertissement : argument(s) positionnel(s) ignoré(s) : {args_raw[2:]}",
+                    file=sys.stderr,
+                )
             self.run_http(host, port)
             return
 
