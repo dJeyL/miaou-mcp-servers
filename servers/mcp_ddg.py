@@ -34,8 +34,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
+from typing import Annotated
 
 from mcp import types
+from pydantic import Field
 
 from mcp_base import MiaouMCPBase, make_opener
 
@@ -109,7 +111,10 @@ class DDGServer(MiaouMCPBase):
         @self.mcp.tool()
         async def ddg_search(
             query: str,
-            max_results: int = 5,
+            max_results: Annotated[
+                int,
+                Field(description="Nombre maximal de résultats, silencieusement ramené dans [1, 30]."),
+            ] = 5,
         ) -> str | types.EmbeddedResource:
             """Recherche sur DuckDuckGo (endpoint HTML, pas de clé API). Renvoie un tableau JSON [{title, url, snippet}]. max_results borné à [1, 30]. Fragile si DDG change son markup."""
             max_results = max(1, min(max_results, 30))

@@ -53,9 +53,11 @@ import base64
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Annotated
 
 import html2text
 from mcp import types
+from pydantic import Field
 
 from mcp_base import MiaouMCPBase, make_opener
 
@@ -191,7 +193,15 @@ class WebServer(MiaouMCPBase):
 
         async def fetch_url(
             url: str,
-            max_bytes: int = _DEFAULT_MAX_BYTES,
+            max_bytes: Annotated[
+                int,
+                Field(
+                    description=(
+                        f"Taille maximale en octets à télécharger ; une valeur plus "
+                        f"grande que le plafond ({_DEFAULT_MAX_BYTES}) y est silencieusement ramenée."
+                    )
+                ),
+            ] = _DEFAULT_MAX_BYTES,
         ) -> str | types.EmbeddedResource:
             fetched = await _guarded_fetch(url, max_bytes, _DEFAULT_MAX_BYTES)
             if isinstance(fetched, str):
@@ -259,7 +269,16 @@ class WebServer(MiaouMCPBase):
         async def fetch_read(
             url: str,
             char_start: int = 0,
-            char_end: int | None = None,
+            char_end: Annotated[
+                int | None,
+                Field(
+                    description=(
+                        f"Fin de plage en caractères (exclusive, optionnelle) ; ne lève "
+                        f"pas le plafond de {web_cache.READ_CAP} caractères par appel, "
+                        f"déplace seulement la fenêtre demandée."
+                    )
+                ),
+            ] = None,
         ) -> str:
             try:
                 full_text = await asyncio.to_thread(web_cache.load, url)
@@ -347,7 +366,16 @@ class WebServer(MiaouMCPBase):
 
         async def fetch_resource(
             url: str,
-            max_bytes: int = web_cache.RESOURCE_MAX_BYTES,
+            max_bytes: Annotated[
+                int,
+                Field(
+                    description=(
+                        f"Taille maximale en octets à transférer au client ; une valeur "
+                        f"plus grande que le plafond ({web_cache.RESOURCE_MAX_BYTES}) y "
+                        f"est silencieusement ramenée."
+                    )
+                ),
+            ] = web_cache.RESOURCE_MAX_BYTES,
         ) -> list[types.ContentBlock] | str:
             fetched = await _guarded_fetch(url, max_bytes, web_cache.RESOURCE_MAX_BYTES)
             if isinstance(fetched, str):

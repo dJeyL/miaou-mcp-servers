@@ -30,9 +30,10 @@ import asyncio
 import json
 import urllib.error
 import urllib.parse
-from typing import Optional
+from typing import Annotated, Optional
 
 from mcp import types
+from pydantic import Field
 
 from mcp_base import MiaouMCPBase, make_opener
 
@@ -51,8 +52,18 @@ class WeatherServer(MiaouMCPBase):
         @self.mcp.tool()
         async def get_weather(
             city: str,
-            state: Optional[str] = None,
-            country: Optional[str] = None,
+            state: Annotated[
+                Optional[str],
+                Field(
+                    description="Région/État pour désambiguïser la ville en cas d'homonymie (optionnel, ex. \"Texas\")."
+                ),
+            ] = None,
+            country: Annotated[
+                Optional[str],
+                Field(
+                    description="Pays pour désambiguïser la ville en cas d'homonymie (optionnel, nom en anglais recommandé)."
+                ),
+            ] = None,
         ) -> str | types.EmbeddedResource:
             """Renvoie la météo actuelle pour une ville via wttr.in (JSON allégé sans astronomy ni hourly). Attention : heures UTC."""
             parts = [city]

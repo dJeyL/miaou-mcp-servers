@@ -34,9 +34,11 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 import asyncio
 import base64
 import socket
+from typing import Annotated
 
 from mcp import types
 from mcp.server.fastmcp import Image
+from pydantic import Field
 
 from mcp_base import MiaouMCPBase
 
@@ -76,7 +78,14 @@ class BenchServer(MiaouMCPBase):
                 return f"Échec de résolution de {hostname} : {e}"
 
         @self.mcp.tool()
-        async def reverse_dns(ip: str) -> str:
+        async def reverse_dns(
+            ip: Annotated[
+                str,
+                Field(
+                    description="Adresse IP à résoudre en nom d'hôte ; un nom d'hôte est aussi accepté (résolu en forward+reverse)."
+                ),
+            ],
+        ) -> str:
             """Résout une adresse IP en nom d'hôte (PTR) depuis le réseau local du serveur.
             Un hostname est aussi accepté en entrée (gethostbyaddr fait forward+reverse)."""
             await asyncio.sleep(2)

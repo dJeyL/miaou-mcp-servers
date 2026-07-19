@@ -34,8 +34,10 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Annotated
 
 from mcp import types
+from pydantic import Field
 
 from mcp_base import MiaouMCPBase, make_opener
 
@@ -93,7 +95,10 @@ class BraveServer(MiaouMCPBase):
         @self.mcp.tool()
         async def brave_search(
             query: str,
-            count: int = 5,
+            count: Annotated[
+                int,
+                Field(description="Nombre de résultats, silencieusement ramené dans [1, 20]."),
+            ] = 5,
         ) -> str | types.EmbeddedResource:
             """Recherche web via l'API Brave Search. Renvoie un tableau JSON [{title, url, description}]. count borné à [1, 20]. Requiert BRAVE_API_KEY dans l'environnement."""
             raw = await _brave_call(_BRAVE_API_URL, query, _clamp_count(count), "Brave Search")
@@ -131,7 +136,10 @@ class BraveServer(MiaouMCPBase):
         @self.mcp.tool()
         async def brave_image_search(
             query: str,
-            count: int = 5,
+            count: Annotated[
+                int,
+                Field(description="Nombre d'images, silencieusement ramené dans [1, 20]."),
+            ] = 5,
         ) -> str | types.EmbeddedResource:
             """Recherche d'images via l'API Brave Search. Renvoie un tableau JSON [{title, page_url, image_url, thumbnail_url, source}] — index d'URLs seulement, pas les données binaires. count borné à [1, 20]. Requiert BRAVE_API_KEY dans l'environnement."""
             raw = await _brave_call(
