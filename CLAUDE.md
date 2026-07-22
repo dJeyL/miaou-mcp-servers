@@ -656,6 +656,19 @@ Décorer une fonction avec `@self.mcp.tool()` dans le `__init__` du serveur conc
 FastMCP génère le schéma JSON automatiquement depuis la signature Python et la docstring.
 Aucune déclaration manuelle dans un registre.
 
+La docstring ne documente que l'outil dans son ensemble (clé `description` du schéma
+`tools/list`) — un paramètre nu (`text: str`) n'a jamais de clé `description` dans son
+propre schéma, quelle que soit la qualité de la docstring. Pour qu'un paramètre précis
+porte sa propre description, l'annoter avec `Annotated[type, Field(description="...")]`
+(import `from pydantic import Field`, `from typing import Annotated`) — fonctionne aussi
+sous `from __future__ import annotations`. Réservé aux paramètres dont le nom seul ne
+suffit pas (contrainte fine documentée seulement dans la docstring globale : exclusivité
+avec un autre paramètre, cap non levé par une plage, clamp silencieux, format dépendant du
+type de document) — ne pas annoter systématiquement tous les paramètres, l'info doit
+migrer d'un endroit à l'autre, pas se dupliquer. Exemples appliqués : `mcp_docs.read`
+(`selector`, `char_start`/`char_end` vs `line_start`/`line_end`), `mcp_bench.reverse_dns.ip`
+(accepte aussi un hostname), `mcp_web.fetch_url.max_bytes` (clamp silencieux au plafond).
+
 Chaque serveur appelle `self.finalize_tools()` (défini dans `mcp_base.py`) en dernière
 ligne de son `__init__`, après l'enregistrement de tous les outils — à conserver en
 ajoutant un outil ou un serveur. Cet appel normalise ce que `tools/list` expose :
