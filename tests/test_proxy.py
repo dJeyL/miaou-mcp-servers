@@ -13,6 +13,8 @@ for p in (_ROOT, _SERVERS):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
+import mcp.types as types
+
 import mcp_proxy
 from mcp_proxy import (
     InProcessUpstream,
@@ -34,9 +36,9 @@ from mcp_proxy import (
 
 def test_load_config_nominal(tmp_path):
     cfg_file = tmp_path / "config.json"
-    cfg_file.write_text('{"port": 8767, "mcpServers": {}}')
+    cfg_file.write_text('{"port": 8765, "mcpServers": {}}')
     cfg = load_config(cfg_file)
-    assert cfg["port"] == 8767
+    assert cfg["port"] == 8765
 
 
 def test_load_config_missing_port(tmp_path):
@@ -61,7 +63,7 @@ def test_load_config_invalid_json_raises_clear_error(tmp_path):
 
 def test_build_upstreams_inprocess():
     cfg = {
-        "port": 8767,
+        "port": 8765,
         "mcpServers": {"bench": {"type": "inprocess", "module": "mcp_bench"}},
     }
     upstreams = build_upstreams(cfg)
@@ -71,7 +73,7 @@ def test_build_upstreams_inprocess():
 
 def test_build_upstreams_stdio():
     cfg = {
-        "port": 8767,
+        "port": 8765,
         "mcpServers": {
             "ext": {"command": "uv", "args": ["run", "something.py"]}
         },
@@ -82,7 +84,7 @@ def test_build_upstreams_stdio():
 
 def test_build_upstreams_unknown_type():
     cfg = {
-        "port": 8767,
+        "port": 8765,
         "mcpServers": {"bad": {"type": "grpc"}},
     }
     with pytest.raises(ValueError, match="grpc"):
@@ -91,7 +93,7 @@ def test_build_upstreams_unknown_type():
 
 def test_build_upstreams_inprocess_missing_module():
     cfg = {
-        "port": 8767,
+        "port": 8765,
         "mcpServers": {"oops": {"type": "inprocess"}},
     }
     with pytest.raises(ValueError, match="module"):
@@ -100,7 +102,7 @@ def test_build_upstreams_inprocess_missing_module():
 
 def test_build_upstreams_disabled_skipped():
     cfg = {
-        "port": 8767,
+        "port": 8765,
         "mcpServers": {
             "bench": {"type": "inprocess", "module": "mcp_bench"},
             "off": {"_disabled": True, "command": "uv", "args": []},
@@ -113,7 +115,7 @@ def test_build_upstreams_disabled_skipped():
 
 def test_build_upstreams_stdio_missing_command():
     cfg = {
-        "port": 8767,
+        "port": 8765,
         "mcpServers": {"oops": {"args": ["run"]}},
     }
     with pytest.raises(ValueError, match="command"):
@@ -240,7 +242,7 @@ async def test_proxy_call_tool_routes_correctly():
 def test_build_upstreams_inprocess_env_stored():
     """L'entrée env de config.json est transmise à InProcessUpstream."""
     cfg = {
-        "port": 8767,
+        "port": 8765,
         "mcpServers": {
             "brave": {
                 "type": "inprocess",
@@ -359,7 +361,7 @@ def test_merge_proxy_env_overrides_noproxy_removes_config_env():
 
 def test_build_upstreams_stdio_applies_proxy_overrides():
     cfg = {
-        "port": 8767,
+        "port": 8765,
         "mcpServers": {
             "external": {
                 "type": "stdio",
@@ -384,7 +386,7 @@ def test_build_upstreams_stdio_applies_proxy_overrides():
 def test_build_upstreams_inprocess_config_stored():
     """L'entrée config de config.json est transmise à InProcessUpstream."""
     cfg = {
-        "port": 8767,
+        "port": 8765,
         "mcpServers": {
             "ibm_prod": {
                 "type": "inprocess",
@@ -666,7 +668,7 @@ def test_proxy_without_docs_does_not_import_mcp_docs(tmp_path):
         sys.path.insert(0, {str(_SERVERS)!r})
         from mcp_proxy import build_upstreams, build_proxy_server
 
-        cfg = {{"port": 8767, "mcpServers": {{"bench": {{"type": "inprocess", "module": "mcp_bench"}}}}}}
+        cfg = {{"port": 8765, "mcpServers": {{"bench": {{"type": "inprocess", "module": "mcp_bench"}}}}}}
         upstreams = build_upstreams(cfg)
 
         async def go():
@@ -684,3 +686,87 @@ def test_proxy_without_docs_does_not_import_mcp_docs(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert "OK" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Lifespan — un upstream qui refuse de démarrer n'empêche pas les autres
+# ---------------------------------------------------------------------------
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _run_lifespan(asgi_app):
+    """Déclenche le lifespan Starlette d'une app construite par build_app()."""
+    import anyio
+
+    receive_send = anyio.create_memory_object_stream(10)
+    startup_done = anyio.Event()
+    shutdown = anyio.Event()
+    errors: list[BaseException] = []
+
+    messages: list[dict] = []
+
+    async def receive():
+        if not startup_done.is_set():
+            startup_done.set()
+            return {"type": "lifespan.startup"}
+        await shutdown.wait()
+        return {"type": "lifespan.shutdown"}
+
+    async def send(message):
+        messages.append(message)
+        if message["type"] == "lifespan.startup.failed":
+            errors.append(RuntimeError(message.get("message", "")))
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(lambda: asgi_app({"type": "lifespan"}, receive, send))
+        # Laisse le startup s'exécuter
+        while not any(m["type"].startswith("lifespan.startup.") for m in messages):
+            await anyio.sleep(0.01)
+        if errors:
+            raise errors[0]
+        try:
+            yield
+        finally:
+            shutdown.set()
+
+
+class _FailingUpstream(InProcessUpstream):
+    """Upstream dont start() lève, comme mcp_brave sans clef d'API."""
+
+    def __init__(self, message: str = "clef d'API absente") -> None:
+        super().__init__("mcp_bench")
+        self._message = message
+
+    async def start(self) -> None:
+        raise RuntimeError(self._message)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_skips_upstream_that_fails_to_start(capsys):
+    """Un upstream en échec est écarté ; les autres démarrent et restent servis."""
+    upstreams = {
+        "bench": InProcessUpstream("mcp_bench"),
+        "broken": _FailingUpstream(),
+    }
+    server = build_proxy_server(upstreams, {})
+    app = build_app(server, upstreams)
+
+    # build_app renvoie un wrapper ASGI ; le lifespan vit sur l'app Starlette
+    # interne, qu'on atteint via le routeur du wrapper.
+    async with _run_lifespan(app):
+        assert "bench" in upstreams
+        # Retiré de la table de routage : sinon _resolve_via_prefix le verrait
+        # encore et un appel d'outil échouerait de façon obscure.
+        assert "broken" not in upstreams
+        tools = await server.request_handlers[types.ListToolsRequest](
+            types.ListToolsRequest(method="tools/list")
+        )
+        names = [t.name for t in tools.root.tools]
+        assert any(n.startswith("bench__") for n in names)
+        assert not any(n.startswith("broken__") for n in names)
+
+    out = capsys.readouterr().err
+    assert "unavailable" in out
+    assert "clef d'API absente" in out

@@ -13,15 +13,15 @@ Outils exposés :
   - get_weather(city, state?, country?) : météo actuelle via wttr.in (JSON allégé)
 
 Lancement :
-    uv run servers/mcp_weather.py                          # HTTP sur 127.0.0.1:8766
+    uv run servers/mcp_weather.py                          # HTTP sur 127.0.0.1:8767
     uv run servers/mcp_weather.py --transport stdio        # stdin/stdout
     uv run servers/mcp_weather.py --host 0.0.0.0           # HTTP sur toutes interfaces
-    uv run servers/mcp_weather.py --host 0.0.0.0 --port 8766
-    uv run servers/mcp_weather.py 0.0.0.0 8766             # syntaxe positionnelle (compat)
+    uv run servers/mcp_weather.py --host 0.0.0.0 --port 8767
+    uv run servers/mcp_weather.py 0.0.0.0 8767             # syntaxe positionnelle (compat)
 
 Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
     Nom       : weather
-    URL       : http://127.0.0.1:8766/mcp
+    URL       : http://127.0.0.1:8767/mcp
     Transport : streamable-http   (deviné depuis /mcp)
     Activé    : oui
 """
@@ -47,7 +47,7 @@ def _fetch_weather_bytes(url: str) -> bytes:
 
 class WeatherServer(MiaouMCPBase):
     def __init__(self) -> None:
-        super().__init__("miaou-weather", default_port=8766)
+        super().__init__("miaou-weather", default_port=8767)
 
         @self.mcp.tool()
         async def get_weather(

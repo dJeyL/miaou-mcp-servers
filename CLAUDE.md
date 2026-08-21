@@ -19,8 +19,8 @@ miaou-mcp-servers/
 ├── mcp_proxy.py          # serveur proxy (racine, point d'entrée principal)
 ├── servers/
 │   ├── mcp_base.py       # classe de base partagée (MiaouMCPBase + make_opener)
-│   ├── mcp_bench.py      # banc d'essai général (port 8765)
-│   ├── mcp_weather.py    # météo réelle via wttr.in (port 8766)
+│   ├── mcp_bench.py      # banc d'essai général (port 8766)
+│   ├── mcp_weather.py    # météo réelle via wttr.in (port 8767)
 │   ├── mcp_web/          # téléchargement d'URL (port 8768), package (voir plus bas)
 │   ├── mcp_ddg.py        # recherche DuckDuckGo HTML (port 8769)
 │   ├── mcp_brave.py      # recherche Brave Search API (port 8770)
@@ -45,7 +45,7 @@ miaou-mcp-servers/
 
 ## Les serveurs
 
-### `servers/mcp_bench.py` — banc d'essai général (port 8765)
+### `servers/mcp_bench.py` — banc d'essai général (port 8766)
 
 Sert à exercer les différents chemins de traitement des résultats dans MIAOU :
 
@@ -62,7 +62,7 @@ Les outils ont un `asyncio.sleep(2)` intentionnel pour simuler la latence résea
 vérifier que le patienteur animé et les acks MCP (`mcp_call`) s'affichent correctement
 pendant le round-trip.
 
-### `servers/mcp_weather.py` — météo réelle (port 8766)
+### `servers/mcp_weather.py` — météo réelle (port 8767)
 
 Un seul outil `get_weather(city, state?, country?)` qui interroge wttr.in et renvoie
 un `EmbeddedResource` texte JSON. Sert à tester un outil avec données réelles et
@@ -164,9 +164,26 @@ Un seul outil `ddg_search(query, max_results=5)`. POST sur l'endpoint HTML de DD
 
 ### `servers/mcp_brave.py` — recherche Brave Search (port 8770)
 
-Deux outils. Requièrent `BRAVE_API_KEY` dans l'environnement (ou via `env` dans
-`config.json` pour le mode inprocess). Clef absente ou invalide → message d'erreur
-clair sans stack trace.
+Deux outils. Requièrent une clef d'API, résolue par `resolve_api_key()` dans cet
+ordre : clé `api_key` du bloc `config` de l'entrée `config.json` (mode inprocess),
+sinon `BRAVE_API_KEY` dans l'environnement. Le bloc `config` prime pour permettre
+plusieurs entrées du même module avec des clefs différentes — `os.environ` est
+partagé par tout le process et ne peut pas les distinguer (cf. pattern
+`build(config)`). Une clef vide ou blanche compte comme absente.
+
+**Refus d'initialisation sans clef.** Le serveur ne s'initialise pas sans clef,
+plutôt que d'exposer deux outils qui échoueraient à chaque appel : `build(config)`
+lève `MissingAPIKeyError`, et le lancement standalone sort en code 1 avec un message
+clair. Côté proxy, l'upstream est signalé au démarrage puis **retiré de la table de
+routage** — les autres serveurs démarrent normalement et `tools/list` ne contient
+alors aucun outil `brave__*`. Le singleton `server`/`mcp` du module reste construit
+sans clef (`require_api_key=False`) : `import mcp_brave` doit rester possible sans
+clef, sinon un simple import casserait. Clef présente mais invalide → toujours un
+message d'erreur clair par appel (401), sans stack trace.
+
+Les descriptions d'outils exposées aux clients MCP ne mentionnent pas la clef d'API :
+c'est une affaire d'exploitation, pas une information actionnable pour le modèle
+appelant, qui ne peut rien en faire — un outil visible est un outil configuré.
 
 - `brave_search(query, count=5)` : recherche web. Renvoie `TextResourceContents`
   `application/json` — tableau `[{title, url, description}]`.
@@ -356,8 +373,9 @@ Deux types d'upstream supportés :
 - **stdio** : subprocess externe communiquant via stdin/stdout
 
 Les entrées inprocess acceptent un champ `env` pour injecter des variables d'environnement
-avant l'import du module (`os.environ.setdefault`) — utilisé par `mcp_brave` pour
-`BRAVE_API_KEY`.
+avant l'import du module (`os.environ.setdefault`). `mcp_brave` lit sa clef en priorité
+dans le bloc `config` de son entrée (voir sa section), et retombe sur `BRAVE_API_KEY`
+dans l'environnement.
 
 ### Override du proxy réseau vu par les upstreams (`--proxy` / `--noproxy`)
 
@@ -395,7 +413,7 @@ Pour connecter les serveurs depuis MIAOU → Paramètres → Serveurs MCP :
 | Champ | bench | weather | web | ddg | brave | docs | proxy |
 |---|---|---|---|---|---|---|---|
 | Nom | `bench` | `weather` | `web` | `duckduckgo` | `brave` | `docs` | `proxy` |
-| URL | `:8765/mcp` | `:8766/mcp` | `:8768/mcp` | `:8769/mcp` | `:8770/mcp` | `:8771/mcp` | `:8767/mcp` |
+| URL | `:8766/mcp` | `:8767/mcp` | `:8768/mcp` | `:8769/mcp` | `:8770/mcp` | `:8771/mcp` | `:8765/mcp` |
 | Transport | `streamable-http` | idem | idem | idem | idem | idem | idem |
 
 (préfixe `http://127.0.0.1` pour toutes les URLs)
@@ -412,11 +430,11 @@ automatiquement par `uv run` dans un venv isolé.
 
 ```bash
 # Serveurs unitaires
-uv run servers/mcp_bench.py                          # HTTP 127.0.0.1:8765
+uv run servers/mcp_bench.py                          # HTTP 127.0.0.1:8766
 uv run servers/mcp_bench.py --transport stdio        # mode stdio
 uv run servers/mcp_bench.py --host 0.0.0.0           # toutes interfaces
 
-uv run servers/mcp_weather.py                        # HTTP 127.0.0.1:8766
+uv run servers/mcp_weather.py                        # HTTP 127.0.0.1:8767
 uv run servers/mcp_ddg.py                            # HTTP 127.0.0.1:8769
 BRAVE_API_KEY=<key> uv run servers/mcp_brave.py      # HTTP 127.0.0.1:8770
 
@@ -427,7 +445,7 @@ uv run --directory servers python -m mcp_docs        # HTTP 127.0.0.1:8771
 # Proxy (agrège tout sur un seul port)
 cp config.sample.json config.json     # puis éditer config.json (BRAVE_API_KEY, etc.)
 uv run mcp_proxy.py                   # port défini dans config.json
-uv run mcp_proxy.py --port 8767       # override port
+uv run mcp_proxy.py --port 8765       # override port
 uv run mcp_proxy.py --config autre.json
 uv run mcp_proxy.py --proxy 10.0.0.1:3128   # force le proxy réseau vu par les upstreams
 uv run mcp_proxy.py --noproxy               # force l'absence de proxy vu par les upstreams
@@ -471,7 +489,7 @@ sans redirection.
 
 ```json
 {
-  "port": 8767,
+  "port": 8765,
   "host": "127.0.0.1",
   "mcpServers": {
     "bench": { "type": "inprocess", "module": "mcp_bench" },
@@ -480,7 +498,7 @@ sans redirection.
     "brave": {
       "type": "inprocess",
       "module": "mcp_brave",
-      "env": { "BRAVE_API_KEY": "your-key-here" }
+      "config": { "api_key": "your-key-here" }
     },
     "docs": { "type": "inprocess", "module": "mcp_docs" },
     "_example_stdio": {

@@ -12,10 +12,12 @@ pour permettre au navigateur de l'atteindre directement depuis dist/miaou.html.
 Outils exposés :
   - brave_search(query, count=5) : recherche web via l'API Brave Search.
     Résultats : JSON array {title, url, description}.
-    Requiert BRAVE_API_KEY dans l'environnement (ou via config.json → env).
   - brave_image_search(query, count=5) : recherche d'images via l'API Brave Search.
     Résultats : JSON array {title, page_url, image_url, thumbnail_url, source}.
-    Requiert BRAVE_API_KEY dans l'environnement (ou via config.json → env).
+
+Clef d'API : BRAVE_API_KEY dans l'environnement, ou clé "api_key" du bloc
+"config" de l'entrée config.json (mode inprocess). Le serveur refuse de
+s'initialiser sans clef — voir build() plus bas.
 
 Lancement :
     BRAVE_API_KEY=<key> uv run servers/mcp_brave.py       # HTTP sur 127.0.0.1:8770
@@ -31,12 +33,14 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 import asyncio
 import json
 import os
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Annotated
 
 from mcp import types
+from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from mcp_base import MiaouMCPBase, make_opener
@@ -56,14 +60,26 @@ def _fetch_brave_bytes(req: urllib.request.Request) -> bytes:
         return resp.read(2 * 1024 * 1024)
 
 
-async def _brave_call(api_url: str, query: str, count: int, label: str) -> bytes | str:
-    """Requête GET commune à brave_search/brave_image_search : clé API,
-    construction de la requête, chaîne d'erreurs réseau. Renvoie le corps brut
-    en cas de succès, ou un message d'erreur clair en français en cas d'échec."""
-    api_key = os.environ.get("BRAVE_API_KEY", "")
-    if not api_key:
-        return "Erreur : BRAVE_API_KEY absent ou vide. Configurer la variable d'environnement (ou via config.json → env pour le mode inprocess)."
+def resolve_api_key(config: dict | None = None) -> str:
+    """Clef d'API Brave : bloc "config" de l'entrée config.json d'abord, sinon
+    l'environnement. Chaîne vide si aucune des deux sources n'en fournit une.
 
+    Le bloc config prime pour permettre plusieurs entrées inprocess du même
+    module avec des clefs différentes (cf. pattern build(config) du proxy) :
+    os.environ est partagé par tout le process, il ne peut pas les distinguer."""
+    if config:
+        key = config.get("api_key")
+        if isinstance(key, str) and key.strip():
+            return key.strip()
+    return os.environ.get("BRAVE_API_KEY", "").strip()
+
+
+async def _brave_call(
+    api_url: str, query: str, count: int, label: str, api_key: str
+) -> bytes | str:
+    """Requête GET commune à brave_search/brave_image_search : construction de
+    la requête et chaîne d'erreurs réseau. Renvoie le corps brut en cas de
+    succès, ou un message d'erreur clair en français en cas d'échec."""
     params = urllib.parse.urlencode({"q": query, "count": count})
     req = urllib.request.Request(
         f"{api_url}?{params}",
@@ -88,9 +104,20 @@ async def _brave_call(api_url: str, query: str, count: int, label: str) -> bytes
         return f"Erreur inattendue ({type(e).__name__}: {e}) — {label}"
 
 
+class MissingAPIKeyError(RuntimeError):
+    """Clef d'API Brave absente à l'initialisation du serveur."""
+
+
 class BraveServer(MiaouMCPBase):
-    def __init__(self) -> None:
-        super().__init__("miaou-brave", default_port=8770)
+    def __init__(self, config: dict | None = None, *, require_api_key: bool = True) -> None:
+        super().__init__("miaou-brave", default_port=8770, config=config)
+        self.api_key = resolve_api_key(self.config)
+        if require_api_key and not self.api_key:
+            raise MissingAPIKeyError(
+                "clef d'API Brave absente : renseigner BRAVE_API_KEY dans "
+                "l'environnement, ou la clé \"api_key\" du bloc \"config\" de "
+                "l'entrée brave dans config.json."
+            )
 
         @self.mcp.tool()
         async def brave_search(
@@ -100,8 +127,10 @@ class BraveServer(MiaouMCPBase):
                 Field(description="Nombre de résultats, silencieusement ramené dans [1, 20]."),
             ] = 5,
         ) -> str | types.EmbeddedResource:
-            """Recherche web via l'API Brave Search. Renvoie un tableau JSON [{title, url, description}]. count borné à [1, 20]. Requiert BRAVE_API_KEY dans l'environnement."""
-            raw = await _brave_call(_BRAVE_API_URL, query, _clamp_count(count), "Brave Search")
+            """Recherche web via l'API Brave Search. Renvoie un tableau JSON [{title, url, description}]. count borné à [1, 20]."""
+            raw = await _brave_call(
+                _BRAVE_API_URL, query, _clamp_count(count), "Brave Search", self.api_key
+            )
             if isinstance(raw, str):
                 return raw
 
@@ -141,9 +170,13 @@ class BraveServer(MiaouMCPBase):
                 Field(description="Nombre d'images, silencieusement ramené dans [1, 20]."),
             ] = 5,
         ) -> str | types.EmbeddedResource:
-            """Recherche d'images via l'API Brave Search. Renvoie un tableau JSON [{title, page_url, image_url, thumbnail_url, source}] — index d'URLs seulement, pas les données binaires. count borné à [1, 20]. Requiert BRAVE_API_KEY dans l'environnement."""
+            """Recherche d'images via l'API Brave Search. Renvoie un tableau JSON [{title, page_url, image_url, thumbnail_url, source}] — index d'URLs seulement, pas les données binaires. count borné à [1, 20]."""
             raw = await _brave_call(
-                _BRAVE_IMAGES_API_URL, query, _clamp_count(count), "Brave Image Search"
+                _BRAVE_IMAGES_API_URL,
+                query,
+                _clamp_count(count),
+                "Brave Image Search",
+                self.api_key,
             )
             if isinstance(raw, str):
                 return raw
@@ -180,8 +213,31 @@ class BraveServer(MiaouMCPBase):
         self.finalize_tools()
 
 
-server = BraveServer()
+def build(config: dict | None = None) -> FastMCP:
+    """Factory appelée par InProcessUpstream.start() du proxy.
+
+    Lève MissingAPIKeyError si aucune clef n'est disponible : le serveur refuse
+    de s'initialiser plutôt que d'exposer des outils qui échoueraient à chaque
+    appel. Le proxy rattrape cette erreur au démarrage et continue de servir les
+    autres upstreams.
+    """
+    return BraveServer(config).mcp
+
+
+# Singleton de compatibilité (import direct, mode standalone, tests). Contrairement
+# à build(), il ne lève pas à l'import : `import mcp_brave` doit rester possible
+# sans clef, sinon un simple import — y compris depuis un autre serveur ou un test —
+# casserait. Le refus sans clef est porté par build() côté proxy et par main()
+# côté standalone.
+server = BraveServer(require_api_key=False)
 mcp = server.mcp  # exposé pour le proxy in-process
 
 if __name__ == "__main__":
+    if not server.api_key:
+        print(
+            "Erreur : clef d'API Brave absente. Renseigner BRAVE_API_KEY dans "
+            "l'environnement avant de lancer le serveur.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     server.main()

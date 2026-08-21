@@ -18,7 +18,7 @@ Lancement :
     uv run mcp_proxy.py                            # lit config.json, port dedans
     uv run mcp_proxy.py --config mon_config.json   # config alternative
     uv run mcp_proxy.py --host 0.0.0.0             # override host
-    uv run mcp_proxy.py --port 8767                # override port
+    uv run mcp_proxy.py --port 8765                # override port
 
 Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
     Nom       : proxy
@@ -461,6 +461,23 @@ def _wrap_ref_unknown_sentinel(server: Server, upstreams: dict[str, Upstream]) -
 # App factory
 # ---------------------------------------------------------------------------
 
+def _log(message: str) -> None:
+    """Ligne de log au format uvicorn (préfixe `INFO:` vert), sur stderr.
+
+    Couleur seulement si stderr est un TTY : redirigé vers un fichier ou un
+    pipe, on ne veut pas d'échappements ANSI dans le log.
+    """
+    levelname = "INFO"
+    if sys.stderr.isatty():
+        # Comme uvicorn.logging.ColourizedFormatter : seul le levelname est
+        # colorisé (vert pour INFO), le ':' et le séparateur restent neutres.
+        levelname = f"\033[32m{levelname}\033[0m"
+    # uvicorn : séparateur de (8 - len(levelname)) espaces dans levelprefix,
+    # plus l'espace du format "%(levelprefix)s %(message)s" — soit 5 pour INFO.
+    separator = " " * (8 - len("INFO")) + " "
+    print(f"{levelname}:{separator}{message}", file=sys.stderr)
+
+
 def build_app(
     mcp_server: Server,
     upstreams: dict[str, Upstream],
@@ -477,9 +494,36 @@ def build_app(
     async def lifespan(app: Starlette):
         started: list[Upstream] = []
         try:
-            for upstream in upstreams.values():
-                await upstream.start()
+            _log(f"Upstream servers ({len(upstreams)}):")
+            # Un upstream qui refuse de démarrer (clef d'API absente, module
+            # introuvable, subprocess qui ne répond pas) ne doit pas empêcher le
+            # proxy de servir les autres : on le signale, on le retire de la table
+            # de routage, et on continue. Retrait indispensable — un upstream resté
+            # dans la table serait visible de _resolve_via_prefix et un appel
+            # d'outil échouerait de façon obscure au lieu d'être simplement absent
+            # de tools/list.
+            failed: list[str] = []
+            for name, upstream in list(upstreams.items()):
+                try:
+                    await upstream.start()
+                except Exception as e:
+                    failed.append(name)
+                    _log(f"  {name:<12} unavailable — {e}")
+                    continue
                 started.append(upstream)
+                # Le nombre d'outils n'est connu qu'après start() : un upstream
+                # inprocess n'a pas encore son _tool_manager avant, et un stdio
+                # n'a pas fait son handshake. Un upstream qui démarre mais dont
+                # list_tools() échoue ne doit pas empêcher le proxy de servir les
+                # autres — on le signale sans propager.
+                try:
+                    count = len(await upstream.list_tools())
+                    detail = f"{count} tool{'s' if count != 1 else ''}"
+                except Exception as e:
+                    detail = f"tools unavailable ({type(e).__name__})"
+                _log(f"  {name:<12} {detail}")
+            for name in failed:
+                del upstreams[name]
             # session_manager.run() initialise le task group interne requis pour
             # traiter les requêtes MCP (sans ça : RuntimeError "Task group is not initialized").
             async with session_manager.run():

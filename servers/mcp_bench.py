@@ -18,15 +18,15 @@ Outils exposés :
   - get_json_resource()   : une resource texte JSON (cascade D8.2, surlignée UI)
 
 Lancement :
-    uv run servers/mcp_bench.py                          # HTTP sur 127.0.0.1:8765
+    uv run servers/mcp_bench.py                          # HTTP sur 127.0.0.1:8766
     uv run servers/mcp_bench.py --transport stdio        # stdin/stdout
     uv run servers/mcp_bench.py --host 0.0.0.0           # HTTP sur toutes interfaces
-    uv run servers/mcp_bench.py --host 0.0.0.0 --port 8765
-    uv run servers/mcp_bench.py 0.0.0.0 8765             # syntaxe positionnelle (compat)
+    uv run servers/mcp_bench.py --host 0.0.0.0 --port 8766
+    uv run servers/mcp_bench.py 0.0.0.0 8766             # syntaxe positionnelle (compat)
 
 Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
     Nom       : bench
-    URL       : http://127.0.0.1:8765/mcp
+    URL       : http://127.0.0.1:8766/mcp
     Transport : streamable-http   (deviné depuis /mcp)
     Activé    : oui
 """
@@ -50,7 +50,7 @@ _SAMPLE_PNG_B64 = (
 
 class BenchServer(MiaouMCPBase):
     def __init__(self) -> None:
-        super().__init__("miaou-bench", default_port=8765)
+        super().__init__("miaou-bench", default_port=8766)
 
         @self.mcp.tool()
         async def echo(text: str) -> str:

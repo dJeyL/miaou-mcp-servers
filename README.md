@@ -8,8 +8,8 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 
 | Serveur | Port | Description |
 |---|---|---|
-| `servers/mcp_bench.py` | 8765 | Banc d'essai : echo, add, DNS, image PNG, resource JSON |
-| `servers/mcp_weather.py` | 8766 | Météo réelle via wttr.in (resource JSON) |
+| `servers/mcp_bench.py` | 8766 | Banc d'essai : echo, add, DNS, image PNG, resource JSON |
+| `servers/mcp_weather.py` | 8767 | Météo réelle via wttr.in (resource JSON) |
 | `servers/mcp_web/` | 8768 | Téléchargement d'URL (HTML→texte, text/* et JSON/XML, binaire base64), package |
 | `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API |
 | `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) |
@@ -33,8 +33,8 @@ pip install -r requirements.txt
 ### Serveurs unitaires
 
 ```bash
-uv run servers/mcp_bench.py                   # HTTP 127.0.0.1:8765
-uv run servers/mcp_weather.py                 # HTTP 127.0.0.1:8766
+uv run servers/mcp_bench.py                   # HTTP 127.0.0.1:8766
+uv run servers/mcp_weather.py                 # HTTP 127.0.0.1:8767
 uv run servers/mcp_ddg.py                     # HTTP 127.0.0.1:8769
 BRAVE_API_KEY=<key> uv run servers/mcp_brave.py  # HTTP 127.0.0.1:8770
 
@@ -54,20 +54,21 @@ uv run mcp_proxy.py
 ```
 
 `config.sample.json` active bench, weather, web, duckduckgo et docs par défaut en
-inprocess. brave est désactivé jusqu'à ce que `BRAVE_API_KEY` soit renseigné.
+inprocess. brave est désactivé jusqu'à ce qu'une clef d'API soit renseignée : sans
+clef il refuse de démarrer, et le proxy l'écarte en servant les autres serveurs.
 
 ## Configuration MIAOU
 
 Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 
 ```
-bench       → http://127.0.0.1:8765/mcp   (streamable-http)
-weather     → http://127.0.0.1:8766/mcp   (streamable-http)
+bench       → http://127.0.0.1:8766/mcp   (streamable-http)
+weather     → http://127.0.0.1:8767/mcp   (streamable-http)
 web         → http://127.0.0.1:8768/mcp   (streamable-http)
 duckduckgo  → http://127.0.0.1:8769/mcp   (streamable-http)
 brave       → http://127.0.0.1:8770/mcp   (streamable-http)
 docs        → http://127.0.0.1:8771/mcp   (streamable-http)
-proxy       → http://127.0.0.1:8767/mcp   (streamable-http)
+proxy       → http://127.0.0.1:8765/mcp   (streamable-http)
 ```
 
 Via le proxy, les outils apparaissent préfixés : `bench__echo`, `web__fetch_url`,
@@ -99,7 +100,7 @@ Le proxy accepte en plus :
 
 ```json
 {
-  "port": 8767,
+  "port": 8765,
   "host": "127.0.0.1",
   "mcpServers": {
     "bench":      { "type": "inprocess", "module": "mcp_bench" },
@@ -108,7 +109,7 @@ Le proxy accepte en plus :
     "brave": {
       "type": "inprocess",
       "module": "mcp_brave",
-      "env": { "BRAVE_API_KEY": "your-key-here" }
+      "config": { "api_key": "your-key-here" }
     },
     "docs": { "type": "inprocess", "module": "mcp_docs" }
   }
@@ -128,6 +129,56 @@ Pour un serveur externe (subprocess stdio) :
   }
 }
 ```
+
+Les chemins relatifs des `args` sont résolus depuis le répertoire de travail du proxy.
+Pour un serveur qui vit dans **un autre dépôt**, passer son dossier à uv avec
+`--directory` :
+
+```json
+{
+  "external": {
+    "command": "uv",
+    "args": [
+      "run", "--directory", "/chemin/vers/autre-projet",
+      "mon_serveur.py", "--transport", "stdio"
+    ]
+  }
+}
+```
+
+soit la commande complète `uv run --directory /chemin/vers/autre-projet mon_serveur.py`.
+`--directory` fait deux choses d'un coup :
+
+- uv y découvre le projet (`pyproject.toml` / `uv.lock`) et utilise donc **ses**
+  dépendances et son venv, pas ceux du proxy ;
+- le subprocess y voit son répertoire de travail — ce dont dépend tout serveur à cache
+  disque relatif, comme `MIAOU_DOCS_WORKDIR` (`./miaou-docs`) ou `MIAOU_WEB_WORKDIR`
+  (`./miaou-web`), qui se créeraient sinon dans le dossier du proxy.
+
+Une entrée stdio accepte aussi `cwd`, qui pose le répertoire de travail du subprocess
+sans rien passer à uv — celui-ci découvre alors le projet depuis ce même répertoire, ce
+qui revient au même pour un lancement `uv` (vérifié : même venv, même cwd). `cwd` reste
+utile pour une commande qui n'est pas uv (`python`, `node`, un binaire) :
+
+```json
+{
+  "external": {
+    "command": "python",
+    "args": ["mon_serveur.py", "--transport", "stdio"],
+    "cwd": "/chemin/vers/autre-projet"
+  }
+}
+```
+
+Corollaire à ne pas manquer : le projet externe résout **ses** versions, indépendamment
+de celles du proxy. Un serveur bâti sur `mcp.server.fastmcp` doit donc borner sa
+dépendance (`"mcp>=1.28.1,<2"`) — un `mcp>=1.28.1` non borné y installe mcp 2.x, où ce
+module n'existe plus, et le subprocess meurt au démarrage (le proxy le signale alors
+`unavailable — Connection closed`).
+
+Rappel de périmètre : un subprocess stdio n'hérite qu'une whitelist restreinte de
+variables d'environnement (`HOME`, `PATH`, `SHELL`, …). Tout ce dont le serveur externe
+a besoin — clefs d'API, `MIAOU_*_WORKDIR` — doit être posé explicitement dans son `env`.
 
 ## Tests
 
@@ -152,8 +203,8 @@ miaou-mcp-servers/
 ├── mcp_proxy.py          # proxy (point d'entrée principal)
 ├── servers/
 │   ├── mcp_base.py       # classe de base + make_opener() proxy-aware
-│   ├── mcp_bench.py      # banc d'essai (port 8765)
-│   ├── mcp_weather.py    # météo wttr.in (port 8766)
+│   ├── mcp_bench.py      # banc d'essai (port 8766)
+│   ├── mcp_weather.py    # météo wttr.in (port 8767)
 │   ├── mcp_web/          # fetch URL (port 8768), package
 │   ├── mcp_ddg.py        # recherche DDG (port 8769)
 │   ├── mcp_brave.py      # recherche Brave (port 8770)

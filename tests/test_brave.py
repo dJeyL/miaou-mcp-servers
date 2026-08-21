@@ -11,9 +11,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "servers"))
 
 from mcp import types
+import mcp_brave
 from mcp_brave import server as brave_server
 
 _TM = brave_server.mcp._tool_manager
+
+# Le singleton est construit à l'import avec require_api_key=False : sans clef
+# dans l'environnement à ce moment-là, self.api_key serait vide et les tests qui
+# patchent os.environ après coup ne la verraient pas (elle n'est plus relue à
+# chaque appel). On la pose explicitement pour que les mocks d'opener soient
+# exercés avec une clef présente.
+brave_server.api_key = "test-key"
 
 _BRAVE_RESPONSE = {
     "web": {
@@ -42,13 +50,42 @@ def _make_mock_resp(data: dict):
     return mock
 
 
-@pytest.mark.asyncio
-async def test_brave_missing_key_returns_error():
+def test_build_without_key_raises():
+    """Sans clef, le serveur refuse de s'initialiser au lieu d'exposer des outils
+    qui échoueraient à chaque appel."""
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("BRAVE_API_KEY", None)
-        result = await _TM.call_tool("brave_search", {"query": "python"})
-    assert isinstance(result, str)
-    assert "BRAVE_API_KEY" in result
+        with pytest.raises(mcp_brave.MissingAPIKeyError):
+            mcp_brave.build(None)
+
+
+def test_build_with_key_from_config_succeeds():
+    """La clef du bloc config d'une entrée config.json suffit, sans variable
+    d'environnement (multi-instance : os.environ ne peut pas distinguer
+    plusieurs entrées du même module)."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("BRAVE_API_KEY", None)
+        built = mcp_brave.build({"api_key": "cfg-key"})
+    assert built is not None
+
+
+def test_build_with_key_from_env_succeeds():
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "env-key"}):
+        built = mcp_brave.build(None)
+    assert built is not None
+
+
+def test_config_key_takes_precedence_over_env():
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "env-key"}):
+        assert mcp_brave.resolve_api_key({"api_key": "cfg-key"}) == "cfg-key"
+
+
+def test_blank_key_is_treated_as_missing():
+    """Une clef vide ou uniquement des espaces ne doit pas passer pour une clef."""
+    with patch.dict(os.environ, {"BRAVE_API_KEY": "   "}):
+        assert mcp_brave.resolve_api_key(None) == ""
+        with pytest.raises(mcp_brave.MissingAPIKeyError):
+            mcp_brave.build({"api_key": "  "})
 
 
 @pytest.mark.asyncio
@@ -205,15 +242,6 @@ _BRAVE_IMAGES_RESPONSE = {
         },
     ]
 }
-
-
-@pytest.mark.asyncio
-async def test_image_search_missing_key_returns_error():
-    with patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("BRAVE_API_KEY", None)
-        result = await _TM.call_tool("brave_image_search", {"query": "python"})
-    assert isinstance(result, str)
-    assert "BRAVE_API_KEY" in result
 
 
 @pytest.mark.asyncio
