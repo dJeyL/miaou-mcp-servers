@@ -24,7 +24,7 @@ miaou-mcp-servers/
 │   ├── mcp_web/          # téléchargement d'URL (port 8768), package (voir plus bas)
 │   ├── mcp_ddg.py        # recherche DuckDuckGo HTML (port 8769)
 │   ├── mcp_brave.py      # recherche Brave Search API (port 8770)
-│   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package (voir plus bas)
+│   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — OBSOLÈTE, désactivé par défaut
 ├── tests/
 │   ├── test_base.py
 │   ├── test_bench.py
@@ -198,6 +198,16 @@ plafonne aussi à 20 au-delà, 422). Les deux outils partagent un helper commun
 diffère.
 
 ### `servers/mcp_docs/` — extraction de documents (port 8771)
+
+> **Obsolète, désactivé par défaut.** MIAOU ouvre désormais ces cinq formats
+> lui-même (zip, PDF, Excel, Word, PowerPoint), sans serveur. Ce serveur reste en
+> place et intact pour un seul usage, qui reste réel : le travail **hors
+> connexion**, l'ouverture native de MIAOU téléchargeant ses moteurs depuis un CDN.
+> `config.sample.json` porte `_disabled: true` sur son entrée `docs` ; le retirer
+> suffit à le réveiller. Rien n'a été supprimé ici — ne pas « faire le ménage »
+> dans ce package au motif qu'il ne sert plus par défaut. Détail et raisons dans
+> le README (section « `mcp_docs` : obsolète, mais conservé pour le
+> hors-connexion »).
 
 Serveur d'extraction (lecture seule, pas de génération/modification) pour PDF, Office
 (docx/xlsx/pptx) et Zip. Conçu autour d'un cache de session côté serveur (répertoire

@@ -34,10 +34,10 @@
       "_comment": "Recherche Brave Search. Renseigner config.api_key (ou BRAVE_API_KEY dans l'environnement) puis retirer _disabled. Sans clef, ce serveur refuse de démarrer et le proxy l'écarte en servant les autres."
     },
     "docs": {
-      "_disabled": false,
+      "_disabled": true,
       "type": "inprocess",
       "module": "mcp_docs",
-      "_comment": "Extraction PDF/Office/Zip. Cache sur disque dans ./miaou-docs (sous-dossier du répertoire de travail)."
+      "_comment": "Extraction PDF/Office/Zip. DÉSACTIVÉ PAR DÉFAUT depuis que MIAOU ouvre ces formats lui-même (zip, PDF, Excel, Word, PowerPoint) : ce serveur n'est plus la voie normale. Il garde un usage réel — le travail HORS CONNEXION, l'ouverture native de MIAOU téléchargeant ses moteurs depuis un CDN. Retirer _disabled pour le réveiller. Cache sur disque dans ./miaou-docs (sous-dossier du répertoire de travail)."
     },
     "_example_stdio": {
       "_disabled": true,

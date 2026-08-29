@@ -13,8 +13,34 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 | `servers/mcp_web/` | 8768 | Téléchargement d'URL (HTML→texte, text/* et JSON/XML, binaire base64), package |
 | `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API |
 | `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) |
-| `servers/mcp_docs/` | 8771 | Extraction PDF/Office/Zip, paginée, sessions par conversation |
+| `servers/mcp_docs/` | 8771 | Extraction PDF/Office/Zip, paginée, sessions par conversation — **obsolète, désactivé par défaut** ([pourquoi](#mcp_docs--obsolète-mais-conservé-pour-le-hors-connexion)) |
 | `mcp_proxy.py` | configurable | Proxy qui agrège les serveurs ci-dessus |
+
+### `mcp_docs` : obsolète, mais conservé pour le hors-connexion
+
+**MIAOU ouvre désormais tous ces formats lui-même** — archives zip, PDF, classeurs
+Excel, documents Word et présentations PowerPoint — sans aucun serveur. Ce serveur
+n'est donc plus la voie normale d'ouverture d'un document, et il est **désactivé
+par défaut** dans `config.sample.json` depuis ce constat.
+
+Il n'est pas retiré pour autant, et ce n'est pas du conservatisme : l'ouverture
+native de MIAOU télécharge ses moteurs (pdf.js, mammoth, SheetJS, fflate) depuis
+un CDN au premier document d'un format donné. **Hors connexion, elle ne peut pas
+s'amorcer** — là où ce serveur, tournant en local, le fait très bien. C'est le
+seul usage qui lui reste, et il est réel : quiconque travaille déconnecté a une
+raison de le réactiver, en retirant `_disabled` de son entrée `docs`.
+
+Sur deux points, le natif fait d'ailleurs mieux que ce serveur, et les réactiver
+ensemble ne les met pas à égalité : `python-docx` détecte les titres par le **nom
+d'affichage** du style (cinq locales codées en dur — un document polonais ou aux
+styles renommés passe pour « sans structure »), là où MIAOU lit le `styleId`
+OOXML, invariant ; et `python-pptx` **n'itère pas dans les formes groupées**, d'où
+la moitié du texte perdue sur un organigramme, que MIAOU retrouve. La doctrine
+côté MIAOU dit donc au modèle de **préférer le natif** quand les deux sont
+branchés.
+
+Rien n'a été supprimé de `servers/mcp_docs/` : le code, les tests et les
+dépendances restent en place. Seul le défaut de configuration a changé.
 
 ## Prérequis
 
@@ -53,9 +79,11 @@ cp config.sample.json config.json
 uv run mcp_proxy.py
 ```
 
-`config.sample.json` active bench, weather, web, duckduckgo et docs par défaut en
+`config.sample.json` active bench, weather, web et duckduckgo par défaut en
 inprocess. brave est désactivé jusqu'à ce qu'une clef d'API soit renseignée : sans
 clef il refuse de démarrer, et le proxy l'écarte en servant les autres serveurs.
+docs est désactivé lui aussi, mais pour une autre raison : il est devenu obsolète
+(voir plus bas). Dans les deux cas, retirer `_disabled` suffit à le réveiller.
 
 ## Configuration MIAOU
 
@@ -67,7 +95,7 @@ weather     → http://127.0.0.1:8767/mcp   (streamable-http)
 web         → http://127.0.0.1:8768/mcp   (streamable-http)
 duckduckgo  → http://127.0.0.1:8769/mcp   (streamable-http)
 brave       → http://127.0.0.1:8770/mcp   (streamable-http)
-docs        → http://127.0.0.1:8771/mcp   (streamable-http)
+docs        → http://127.0.0.1:8771/mcp   (streamable-http, obsolète — voir plus bas)
 proxy       → http://127.0.0.1:8765/mcp   (streamable-http)
 ```
 
@@ -208,7 +236,7 @@ miaou-mcp-servers/
 │   ├── mcp_web/          # fetch URL (port 8768), package
 │   ├── mcp_ddg.py        # recherche DDG (port 8769)
 │   ├── mcp_brave.py      # recherche Brave (port 8770)
-│   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package
+│   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — obsolète
 ├── tests/
 │   ├── __init__.py
 │   ├── test_base.py
