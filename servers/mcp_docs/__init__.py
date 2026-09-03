@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1", "uvicorn", "starlette", "pymupdf", "python-docx", "openpyxl", "python-pptx"]
+# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "pymupdf", "python-docx", "openpyxl", "python-pptx"]
 # ///
 """
 Serveur MCP d'extraction de documents pour MIAOU (PDF, Office, Zip).

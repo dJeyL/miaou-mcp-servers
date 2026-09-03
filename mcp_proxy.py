@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1", "uvicorn", "starlette", "anyio", "html2text", "pymupdf", "python-docx", "openpyxl", "python-pptx"]
+# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "anyio", "html2text", "pymupdf", "python-docx", "openpyxl", "python-pptx"]
 # ///
 """
 Serveur MCP proxy pour MIAOU — agrège plusieurs serveurs MCP upstream.

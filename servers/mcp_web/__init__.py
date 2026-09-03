@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1", "uvicorn", "starlette", "html2text"]
+# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "html2text"]
 # ///
 """
 Serveur MCP fetch pour MIAOU.
