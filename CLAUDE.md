@@ -26,6 +26,7 @@ miaou-mcp-servers/
 │   ├── mcp_brave.py      # recherche Brave Search API (port 8770)
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — OBSOLÈTE, désactivé par défaut
 ├── tests/
+│   ├── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
 │   ├── test_base.py
 │   ├── test_bench.py
 │   ├── test_weather.py
@@ -623,6 +624,30 @@ pas seulement l'appel direct à l'outil.
 Les tests de mcp_web monkeypatchent `mcp_web.cache.WORKDIR` (fixture `tmp_path`, autouse)
 pour la même raison ; `tests/test_web_structure.py` exerce `mcp_web.structure.extract_structure`
 en isolation (pas de HTTP, pas de cache) sur des fragments HTML construits à la main.
+
+### `tests/live_call.py` — appel réel d'un outil
+
+Script PEP 723 (dépendance unique : `mcp`), **pas un test pytest** : son nom ne commence
+pas par `test_`, il n'est donc jamais collecté malgré sa place dans `tests/`. Il parle le
+vrai transport streamable-http, comme MIAOU (`initialize`, `notifications/initialized`,
+`tools/call`) — c'est le chemin que le stack in-process des tests unitaires ne couvre pas
+(cf. mémoire « Vérifier le transport HTTP réel »). Le serveur visé doit déjà tourner.
+
+```bash
+uv run tests/live_call.py brave__brave_search '{"query": "blabla"}'   # proxy, port 8765
+uv run tests/live_call.py --port 8769 ddg_search '{"query": "chat"}'  # serveur unitaire
+uv run tests/live_call.py --list                                      # outils exposés
+uv run tests/live_call.py --url http://host:8765/mcp echo '{"text": "hi"}'
+```
+
+`--port` défaut 8765 (le proxy), `--host` défaut `127.0.0.1`, `--url` prime sur les deux.
+Arguments JSON optionnels. L'outil est vérifié contre `tools/list` avant l'appel (nom
+inconnu → liste des disponibles, code 2). Rendu des trois familles de blocs : `text` brut,
+`image`/`resource` binaire résumés (mime + taille base64, jamais le base64 lui-même),
+`resource` texte avec son URI, plus `structuredContent` s'il existe. Codes de sortie : 0
+succès, 1 `isError` ou échec de connexion, 2 erreur d'usage. Les `ExceptionGroup` d'anyio
+sont aplatis avant affichage (`_flatten`) — sans ça, un serveur injoignable ne produit que
+« unhandled errors in a TaskGroup », sans la cause.
 
 ## Contrat partagé `mcp_docs` ↔ MIAOU (dispatcher, lot A/D6)
 

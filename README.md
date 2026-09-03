@@ -224,6 +224,32 @@ pytest tests/ -v
 
 Tous les tests sont unitaires et mockent les appels réseau — aucune clef API requise.
 
+### Appel réel d'un outil (`tests/live_call.py`)
+
+Les tests unitaires ne touchent pas le transport HTTP. Pour appeler un outil sur un
+serveur **réellement lancé**, en parlant le vrai streamable-http comme MIAOU
+(`initialize`, `notifications/initialized`, `tools/call`) :
+
+```bash
+uv run tests/live_call.py brave__brave_search '{"query": "blabla"}'   # proxy, port 8765
+uv run tests/live_call.py --port 8769 ddg_search '{"query": "chat"}'  # serveur unitaire
+uv run tests/live_call.py --list                                      # outils exposés
+uv run tests/live_call.py --url http://192.168.42.10:8765/mcp echo '{"text": "hi"}'
+```
+
+`--port` vaut 8765 (le proxy) par défaut, `--host` vaut `127.0.0.1` ; `--url` prime sur
+les deux. Les arguments JSON sont optionnels (sans eux, appel sans arguments). L'outil est
+vérifié contre `tools/list` avant l'appel — un nom inconnu affiche la liste des outils
+disponibles plutôt que de partir sur le wire.
+
+Le rendu couvre les trois familles de blocs : `text` brut, `image` et `resource` binaire
+résumés (mime + taille base64, jamais le base64 lui-même dans le terminal), `resource`
+texte affiché avec son URI, plus le `structuredContent` s'il existe. Codes de sortie :
+`0` succès, `1` résultat `isError` ou échec de connexion, `2` erreur d'usage.
+
+Ce script n'est **pas** collecté par pytest : son nom ne commence pas par `test_`. Il vit
+dans `tests/` parce que c'est un outil de vérification, pas un module du produit.
+
 ## Structure
 
 ```
@@ -247,7 +273,8 @@ miaou-mcp-servers/
 │   ├── test_ddg.py
 │   ├── test_brave.py
 │   ├── test_docs.py
-│   └── test_proxy.py
+│   ├── test_proxy.py
+│   └── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
 ├── config.sample.json
 ├── requirements.txt
 ├── pyproject.toml        # métadonnées + config pytest (asyncio_mode=auto) + groupe dev
