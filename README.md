@@ -122,6 +122,13 @@ Le proxy accepte en plus :
 --noproxy                   Force l'absence de proxy pour tous les serveurs servis,
                              même si http_proxy/https_proxy sont définis ailleurs
                              (incompatible avec --proxy)
+--auth                      Force l'activation de l'auth OAuth entrante (exige la
+                             clé "auth" dans config.json)
+--no-auth                   Force sa désactivation, même si config.json porte une
+                             clé "auth" (incompatible avec --auth)
+--with-dev-auth [PORT]      Lance aussi le serveur d'autorisation de développement
+                             dans ce process (défaut 8787) et pointe l'auth dessus
+--dev-auth-auto-approve     Avec --with-dev-auth : pas d'écran de consentement
 ```
 
 ## Configuration du proxy (`config.json`)
@@ -147,6 +154,13 @@ Le proxy accepte en plus :
 `type` absent → `stdio`. `port` est obligatoire, `host` optionnel.
 `"_disabled": true` sur une entrée → upstream ignoré au démarrage.
 `env` sur une entrée inprocess → variables d'environnement injectées avant l'import.
+`"type": "http"` + `url` → serveur MCP **distant** en streamable-http (cf. `CLAUDE.md`).
+Un bloc `auth` sur une entrée `http` → le proxy devient **client OAuth** de ce
+serveur et détient les jetons à la place de MIAOU (parcours à dérouler une fois,
+via `/authorize/<nom>` ; jetons dans un fichier séparé, jamais dans `config.json`).
+Tant qu'un tel serveur n'est pas autorisé, ses outils restent **listés** et
+refusent à l'appel en indiquant le lien d'autorisation ; l'outil `status` fait le
+point sur tous les serveurs agrégés.
 
 Pour un serveur externe (subprocess stdio) :
 ```json
@@ -207,6 +221,134 @@ module n'existe plus, et le subprocess meurt au démarrage (le proxy le signale 
 Rappel de périmètre : un subprocess stdio n'hérite qu'une whitelist restreinte de
 variables d'environnement (`HOME`, `PATH`, `SHELL`, …). Tout ce dont le serveur externe
 a besoin — clefs d'API, `MIAOU_*_WORKDIR` — doit être posé explicitement dans son `env`.
+
+### Exiger une autorisation OAuth (clé `auth`)
+
+Absente par défaut : le proxy ne demande alors aucun jeton, exactement comme avant.
+La renseigner fait de lui un *Resource Server* OAuth 2.1 — il refuse les appels sans
+jeton valide et indique où s'authentifier.
+
+```json
+{
+  "auth": {
+    "issuer_url": "http://127.0.0.1:8787",
+    "resource_url": "http://127.0.0.1:8765/mcp",
+    "authorization_servers": ["http://127.0.0.1:8787"],
+    "required_scopes": []
+  }
+}
+```
+
+Seul `issuer_url` (le serveur d'autorisation dont on accepte les jetons) est
+obligatoire. `resource_url` est l'identité publique de ce proxy, celle que le client
+renvoie et à laquelle son jeton doit être destiné ; dérivée de l'adresse d'écoute si
+omise. `_disabled: true` neutralise le bloc sans le supprimer, et `--no-auth` fait
+de même à la volée.
+
+Un jeton présenté est vérifié pour de bon : signature contre les clefs publiques de
+l'émetteur, expiration, et **destinataire** — un jeton parfaitement valide mais émis
+pour un autre serveur est refusé, ce qui empêche qu'un jeton obtenu ailleurs serve
+ici. `jwks_uri` et `algorithms` (défaut `RS256`) permettent de forcer la clef et les
+algorithmes acceptés ; sans eux, les clefs sont découvertes auprès de l'émetteur.
+
+### Éprouver le parcours en local (`dev_auth_server.py`)
+
+Exiger une autorisation suppose un serveur qui en délivre. `dev_auth_server.py` en
+fournit un, utilisable en local, pour voir tourner le parcours complet — un client
+s'enregistre, on l'autorise, il obtient un jeton et appelle les outils :
+
+```bash
+uv run dev_auth_server.py                  # port 8787, écran de consentement
+uv run dev_auth_server.py --auto-approve   # sans écran, pour les tests automatisés
+```
+
+Puis, dans `config.json` du proxy : `"auth": {"issuer_url": "http://127.0.0.1:8787"}`.
+
+Pour éviter deux terminaux, le proxy sait le lancer lui-même — il tourne alors dans
+le même process, sur son propre port, et la clé `auth` devient inutile :
+
+```bash
+uv run mcp_proxy.py --with-dev-auth                  # AS sur 8787
+uv run mcp_proxy.py --with-dev-auth 9001 --dev-auth-auto-approve
+```
+
+> **Serveur de développement — jamais en production.** Il n'authentifie personne :
+> aucun compte, aucun mot de passe. Toute demande approuvée est accordée, ses clefs
+> sont régénérées à chaque démarrage et rien n'est conservé. Face à un vrai service,
+> c'est son serveur d'autorisation à lui qu'on renseigne — celui-ci ne sert qu'à
+> éprouver le mécanisme.
+
+### Agréger un serveur tiers qui exige une autorisation (clé `auth` d'un upstream)
+
+Les deux sections précédentes protègent *ce* proxy. Celle-ci fait l'inverse : le
+proxy devient **client** OAuth d'un serveur MCP distant qui, lui, exige un jeton.
+C'est le cas d'un service tiers hébergé qu'on veut agréger au même titre que les
+serveurs locaux.
+
+Une clé `auth` posée sur l'upstream suffit. Elle n'a de sens que sur un upstream
+`http`, et le proxy refuse de démarrer si on l'écrit ailleurs :
+
+```json
+{
+  "mcpServers": {
+    "acme": {
+      "type": "http",
+      "url": "https://mcp.acme.example/mcp",
+      "auth": {}
+    }
+  }
+}
+```
+
+Un objet **vide** est le cas nominal : le proxy découvre le serveur d'autorisation
+depuis l'URL du service, s'y **enregistre dynamiquement** (RFC 7591) et mène le
+parcours seul. Rien à créer à la main.
+
+Beaucoup d'AS réels ne font pas d'enregistrement dynamique — GitHub notamment, où il
+faut déclarer une application et récupérer ses identifiants. On les fournit alors
+explicitement, et c'est la **seule** différence entre les deux saveurs :
+
+```json
+"auth": {
+  "client_id": "Iv1.0123456789abcdef",
+  "client_secret": "…",
+  "scope": "repo read:org",
+  "redirect_uri": "http://127.0.0.1:8765/callback"
+}
+```
+
+`client_secret` est facultatif : sans lui le client est public et la méthode
+d'authentification devient `none` au lieu de `client_secret_post`. `redirect_uri` ne
+sert que si l'AS impose une URL déclarée chez lui plutôt que celle du proxy.
+`_disabled: true` neutralise le bloc sans le supprimer, comme pour l'`auth`
+entrante.
+
+`scope`, lui, vaut pour **les deux saveurs** : il demande des droits précis et
+s'écrit aussi bien dans un bloc par ailleurs vide. C'est également le champ à
+corriger devant un 403 (voir plus bas).
+
+Nuance qui évite une surprise : fournir des identifiants ne supprime pas
+l'enregistrement dynamique éventuellement déjà mémorisé. Si l'override disparaît de
+la config, le proxy retombe dessus plutôt que d'en refaire un.
+
+**Les jetons ne vivent pas dans `config.json`** mais dans un fichier distinct,
+`<config>-tokens.json` à côté d'elle, réglable par `--tokens-file`. La config reste
+donc partageable, et les jetons survivent aux redémarrages — l'autorisation n'est à
+accorder qu'une fois.
+
+Le parcours est déclenché **par l'utilisateur, jamais par le modèle**. Tant que
+l'autorisation n'est pas accordée, les outils de cet upstream sont listés
+normalement mais refusent à l'appel avec le code `AUTHORIZATION_REQUIRED`, en
+portant le lien à ouvrir. `--open` ouvre ce lien dans le navigateur par défaut de
+l'OS ; le lien affiché reste le mécanisme de référence, l'OS ne garantissant ni le
+bon navigateur ni le bon profil.
+
+L'outil `status` rend l'état de chaque upstream et distingue deux échecs qu'on
+confond volontiers : une **autorisation manquante**, que relancer le parcours
+répare, et un **403 par scopes insuffisants** — là le jeton a bien été obtenu, c'est
+le service qui refuse ce qu'il permet. Relancer l'autorisation n'y change rien ;
+c'est `scope` qu'il faut corriger, dans la limite de ce que l'émetteur sait
+accorder.
 
 ## Tests
 
@@ -283,8 +425,13 @@ miaou-mcp-servers/
 
 ## Sécurité
 
-CORS ouvert, pas d'authentification — usage local uniquement. En production, placer
-derrière un reverse proxy (Caddy, nginx) avec authentification côté serveur.
+CORS ouvert, usage local uniquement. En production, placer derrière un reverse proxy
+(Caddy, nginx) avec authentification côté serveur.
+
+Le proxy sait exiger une **autorisation OAuth 2.1** de ses clients (clé `auth` de
+`config.json`, désactivée par défaut) : sans jeton valide, il répond 401 en indiquant
+où s'authentifier, comme l'attend un client MCP conforme. Il vérifie les jetons, il
+n'en émet jamais — c'est le rôle d'un serveur d'autorisation distinct.
 
 `mcp_docs` applique en plus des gardes propres à l'extraction d'archives (zip-slip,
 tailles, chiffrement, imbrication) et un contrat d'erreur `REF_UNKNOWN` partagé avec le

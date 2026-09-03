@@ -6,6 +6,7 @@ mcp>=1.28.1,<2
 uvicorn
 starlette
 anyio
+pyjwt[crypto]
 html2text
 pymupdf
 python-docx

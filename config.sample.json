@@ -1,6 +1,17 @@
 {
   "port": 8765,
   "host": "127.0.0.1",
+  "_comment_auth": "Bloc 'auth' FACULTATIF (absent = aucune authentification exigée, comportement par défaut). Le renseigner fait du proxy un Resource Server OAuth 2.1 : il refuse les appels sans jeton valide et indique où s'authentifier. Il VÉRIFIE des jetons, il n'en émet jamais — cela appartient à un serveur d'autorisation distinct. Seul 'issuer_url' est obligatoire ; 'resource_url' (identité publique de ce proxy, ce à quoi le jeton doit être destiné) est dérivé de l'adresse d'écoute si omis. '_disabled': true neutralise le bloc sans le supprimer ; --no-auth fait de même à la volée.",
+  "_auth_example": {
+    "_disabled": true,
+    "issuer_url": "http://127.0.0.1:8787",
+    "resource_url": "http://127.0.0.1:8765/mcp",
+    "authorization_servers": ["http://127.0.0.1:8787"],
+    "required_scopes": [],
+    "_comment_keys": "jwks_uri et algorithms sont facultatifs : sans eux, les clefs publiques sont decouvertes aupres de l'emetteur et seul RS256 est accepte.",
+    "jwks_uri": "http://127.0.0.1:8787/jwks",
+    "algorithms": ["RS256"]
+  },
   "mcpServers": {
     "bench": {
       "type": "inprocess",
@@ -38,6 +49,26 @@
       "type": "inprocess",
       "module": "mcp_docs",
       "_comment": "Extraction PDF/Office/Zip. DÉSACTIVÉ PAR DÉFAUT depuis que MIAOU ouvre ces formats lui-même (zip, PDF, Excel, Word, PowerPoint) : ce serveur n'est plus la voie normale. Il garde un usage réel — le travail HORS CONNEXION, l'ouverture native de MIAOU téléchargeant ses moteurs depuis un CDN. Retirer _disabled pour le réveiller. Cache sur disque dans ./miaou-docs (sous-dossier du répertoire de travail)."
+    },
+    "_example_http": {
+      "_disabled": true,
+      "type": "http",
+      "url": "http://127.0.0.1:8798/mcp",
+      "_comment": "Serveur MCP DISTANT en streamable-http. 'url' pointe l'endpoint /mcp du serveur. 'headers' (optionnel) porte des en-tetes statiques, pour un serveur tiers qui exige une clef d'API sans OAuth. 'timeout' (optionnel, defaut 30 s) borne le handshake initialize : un serveur qui accepte la connexion puis ne repond jamais bloquerait sinon le demarrage du proxy.",
+      "headers": {},
+      "timeout": 30
+    },
+    "_example_http_oauth": {
+      "_disabled": true,
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "_comment": "Serveur MCP distant exigeant OAuth. Le bloc 'auth' fait du proxy un CLIENT OAuth : il obtient et detient les jetons a la place de MIAOU (qui tourne en file:// et ne peut pas etre client OAuth). Au demarrage l'upstream reste liste mais non autorise ; ouvrir http://127.0.0.1:<port>/authorize/<nom> pour derouler le parcours. Les jetons vont dans <config>-tokens.json, jamais ici. Sans client_id, l'enregistrement est dynamique (RFC 7591) ; avec, ce sont des credentials pre-provisionnes pour un AS qui ne fait pas de DCR.",
+      "auth": {
+        "scope": "mcp:read",
+        "_comment_creds": "Facultatifs : client_id, client_secret, redirect_uri, token_endpoint_auth_method.",
+        "client_id": "",
+        "client_secret": ""
+      }
     },
     "_example_stdio": {
       "_disabled": true,

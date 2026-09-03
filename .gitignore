@@ -1,4 +1,6 @@
 config.json
+*-tokens.json
+*-tools.json
 __pycache__/
 *.pyc
 *.pyo

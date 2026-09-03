@@ -770,3 +770,155 @@ async def test_lifespan_skips_upstream_that_fails_to_start(capsys):
     out = capsys.readouterr().err
     assert "unavailable" in out
     assert "clef d'API absente" in out
+
+
+# ---------------------------------------------------------------------------
+# HttpUpstream — serveur MCP distant (lot AB-2.1)
+# ---------------------------------------------------------------------------
+
+def test_build_upstreams_http():
+    cfg = {
+        "port": 8765,
+        "mcpServers": {
+            "remote": {"type": "http", "url": "https://example.test/mcp"}
+        },
+    }
+    upstreams = build_upstreams(cfg)
+    up = upstreams["remote"]
+    assert isinstance(up, mcp_proxy.HttpUpstream)
+    assert up._url == "https://example.test/mcp"
+    assert up._headers is None
+    # Aucune auth à cette étape : un upstream HTTP sans auth doit rester
+    # parfaitement fonctionnel contre un serveur ouvert.
+    assert up._auth is None
+
+
+def test_build_upstreams_http_headers_and_timeout():
+    cfg = {
+        "port": 8765,
+        "mcpServers": {
+            "remote": {
+                "type": "http",
+                "url": "https://example.test/mcp",
+                "headers": {"X-Api-Key": "secret"},
+                "timeout": 5,
+            }
+        },
+    }
+    up = build_upstreams(cfg)["remote"]
+    assert up._headers == {"X-Api-Key": "secret"}
+    assert up._timeout == 5
+
+
+def test_build_upstreams_http_missing_url():
+    cfg = {
+        "port": 8765,
+        "mcpServers": {"remote": {"type": "http"}},
+    }
+    with pytest.raises(ValueError, match="url"):
+        build_upstreams(cfg)
+
+
+def test_http_upstream_default_timeout_is_its_own_constant():
+    """La borne HTTP ne doit pas être celle des subprocess stdio.
+
+    Les deux mesurent des choses différentes (subprocess qui ne démarre pas vs
+    serveur distant injoignable). Partager la constante ferait bouger l'une en
+    croyant ne toucher qu'à l'autre.
+    """
+    up = mcp_proxy.HttpUpstream("https://example.test/mcp")
+    assert up._timeout == mcp_proxy._HTTP_HANDSHAKE_TIMEOUT_S
+    assert mcp_proxy._HTTP_HANDSHAKE_TIMEOUT_S is not mcp_proxy._STDIO_HANDSHAKE_TIMEOUT_S
+
+
+async def test_http_upstream_start_times_out(monkeypatch):
+    """Un serveur distant qui accepte puis ne répond jamais ne doit pas bloquer
+    le démarrage du proxy entier : erreur claire, bornée.
+
+    Le stub dort BEAUCOUP plus longtemps que la borne, et le test doit finir en
+    quelques centièmes : c'est la borne qui le termine, pas le stub. S'il se
+    mettait à durer, c'est que la borne ne s'applique plus.
+    """
+    import anyio
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _never_responds(*a, **kw):
+        await anyio.sleep_forever()
+        yield (None, None, None)  # pragma: no cover
+
+    monkeypatch.setattr(
+        "mcp.client.streamable_http.streamablehttp_client", _never_responds
+    )
+    up = mcp_proxy.HttpUpstream("https://example.test/mcp", timeout=0.05)
+    async with anyio.create_task_group() as tg:
+        up.host_tasks_in(tg)
+        with anyio.fail_after(5):
+            with pytest.raises(RuntimeError, match="handshake"):
+                await up.start()
+        tg.cancel_scope.cancel()
+
+
+async def test_http_upstream_needs_a_host_task_group():
+    """La tâche de service doit vivre dans un task group qui SURVIT à
+    l'appelant : celui du lifespan.
+
+    Laisser start() créer le sien rendrait le cancel scope propriété de la
+    tâche appelante — or elle peut être éphémère (une requête /authorize/{name}),
+    et le scope resterait ouvert dans une tâche morte. anyio répond alors
+    "Attempted to exit a cancel scope that isn't the current task's current
+    cancel scope", message qui remplace la cause réelle. Défaut trouvé en
+    lançant réellement le parcours, pas en relisant le code.
+    """
+    up = mcp_proxy.HttpUpstream("https://example.test/mcp")
+    with pytest.raises(RuntimeError, match="host_tasks_in"):
+        await up.start()
+
+
+async def test_http_upstream_delegates_to_session():
+    """list_tools/call_tool délèguent à la session, comme StdioUpstream."""
+    up = mcp_proxy.HttpUpstream("https://example.test/mcp")
+    session = MagicMock()
+    tool = types.Tool(name="echo", description="d", inputSchema={})
+    session.list_tools = AsyncMock(return_value=MagicMock(tools=[tool]))
+    session.call_tool = AsyncMock(return_value=MagicMock(content=["block"]))
+    up._session = session
+
+    assert await up.list_tools() == [tool]
+    assert await up.call_tool("echo", {"text": "hi"}) == ["block"]
+    session.call_tool.assert_awaited_once_with("echo", {"text": "hi"})
+
+
+def test_mcp_sdk_http_client_still_trusts_env():
+    """Le contrat --proxy/--noproxy vaut pour un upstream HTTP UNIQUEMENT parce
+    que le client httpx du SDK garde trust_env=True (défaut httpx) : il lit alors
+    os.environ, que main() a déjà modifié avant build_upstreams().
+
+    C'est une propriété d'une bibliothèque tierce, pas de notre code — d'où ce
+    test : si un jour le SDK passait trust_env=False, --noproxy deviendrait
+    silencieusement inopérant sur ce seul type d'upstream.
+    """
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    client = create_mcp_http_client()
+    assert client.trust_env is True
+
+
+def test_noproxy_overrides_reach_http_upstream_via_process_env(monkeypatch):
+    """--noproxy efface les variables du process, donc le client httpx d'un
+    HttpUpstream ne voit plus de proxy. Le chemin est indirect (os.environ),
+    d'où la vérification de bout en bout plutôt que sur un attribut."""
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    monkeypatch.setenv("http_proxy", "http://from-env:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://from-env:3128")
+
+    overrides = compute_proxy_env_overrides(proxy=None, noproxy=True)
+    apply_proxy_env_overrides_to_process(overrides)
+
+    for key in mcp_proxy._PROXY_ENV_KEYS:
+        assert key not in os.environ
+
+    # trust_env=True + environnement nettoyé = aucun proxy monté.
+    client = create_mcp_http_client()
+    assert client.trust_env is True
