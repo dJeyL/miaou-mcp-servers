@@ -13,6 +13,7 @@ dependencies = [
     "python-docx",
     "openpyxl",
     "python-pptx",
+    "truststore",
 ]
 
 [project.optional-dependencies]

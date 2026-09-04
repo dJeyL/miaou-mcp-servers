@@ -12,6 +12,7 @@ pymupdf
 python-docx
 openpyxl
 python-pptx
+truststore
 
 # Dépendances de test
 pytest

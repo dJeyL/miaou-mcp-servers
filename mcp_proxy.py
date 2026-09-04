@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "anyio", "pyjwt[crypto]", "html2text", "pymupdf", "python-docx", "openpyxl", "python-pptx"]
+# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "anyio", "pyjwt[crypto]", "html2text", "pymupdf", "python-docx", "openpyxl", "python-pptx", "truststore"]
 # ///
 """
 Serveur MCP proxy pour MIAOU — agrège plusieurs serveurs MCP upstream.
@@ -53,6 +53,12 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 from starlette.routing import Mount, Route
+
+# Importé après l'insertion de servers/ dans sys.path (plus haut) : c'est ce qui
+# rend `mcp_base` atteignable. Le proxy ne réimplémente pas l'activation du
+# magasin de confiance système — même code que les serveurs standalone, pour que
+# les deux modes de lancement se comportent identiquement face à une AC interne.
+from mcp_base import enable_system_trust_store
 
 
 # ---------------------------------------------------------------------------
@@ -2362,6 +2368,16 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    # Avant TOUT : avant build_upstreams (qui importe les modules de serveurs, et
+    # donc peut construire un contexte SSL), et avant le premier handshake TLS
+    # d'un upstream http. truststore remplace ssl.SSLContext lui-même, donc cet
+    # unique appel couvre aussi bien httpx (HttpUpstream, client OAuth du SDK)
+    # qu'urllib (make_opener, dans les serveurs inprocess) : un upstream HTTPS
+    # dont le certificat est signé par une AC d'entreprise interne cesse
+    # d'échouer en CERTIFICATE_VERIFY_FAILED. Un contexte déjà construit
+    # garderait l'ancienne classe — d'où la position en tête de main().
+    enable_system_trust_store()
 
     if args.proxy and args.noproxy:
         print("Erreur : --proxy et --noproxy sont mutuellement exclusifs.", file=sys.stderr)

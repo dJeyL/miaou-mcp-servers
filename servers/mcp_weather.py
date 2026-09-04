@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette"]
+# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "truststore"]
 # ///
 """
 Serveur MCP météo pour MIAOU.

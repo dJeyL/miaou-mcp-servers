@@ -125,3 +125,81 @@ def test_make_opener_without_proxy_env_has_no_proxy_mapping(monkeypatch):
     # (build_opener n'installe le handler que s'il a au moins un scheme géré) ;
     # dans les deux cas, aucune requête http/https ne doit être proxifiée.
     assert not any(h.proxies.get("http") or h.proxies.get("https") for h in proxy_handlers)
+
+
+# ---------------------------------------------------------------------------
+# Magasin de confiance système (truststore) — AC d'entreprise interne
+# ---------------------------------------------------------------------------
+
+def test_system_trust_store_patches_ssl_context_class():
+    """L'injection doit remplacer ssl.SSLContext lui-même.
+
+    C'est la propriété qui rend un seul appel suffisant pour tout le process :
+    urllib comme httpx construisent leur contexte via ssl.create_default_context(),
+    donc via la classe patchée. Un test qui se contenterait de vérifier « ça ne
+    lève pas » ne dirait rien de cette portée.
+
+    L'injection est globale et irréversible dans un process, donc exécutée dans
+    un sous-process : la poser dans celui de pytest contaminerait les autres
+    tests (et le mock d'OpenerDirector.open de test_weather/test_ddg)."""
+    import subprocess
+
+    code = (
+        "import ssl, sys; sys.path.insert(0, 'servers');"
+        "from mcp_base import enable_system_trust_store;"
+        "before = ssl.SSLContext;"
+        "ok = enable_system_trust_store();"
+        "print(ok, before is not ssl.SSLContext,"
+        " isinstance(ssl.create_default_context(), ssl.SSLContext))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True,
+        cwd=str(Path(__file__).parent.parent),
+    )
+    assert out.returncode == 0, out.stderr
+    injected, class_replaced, default_ctx_ok = out.stdout.split()
+    assert injected == "True", out.stderr
+    assert class_replaced == "True"
+    # Le contexte par défaut (celui qu'utilisent urllib et httpx) est bien une
+    # instance de la classe injectée, pas de l'implémentation stdlib d'origine.
+    assert default_ctx_ok == "True"
+
+
+def test_system_trust_store_absent_does_not_raise(monkeypatch, capsys):
+    """truststore absent (installation pip minimale) doit dégrader, pas planter.
+
+    Sur un poste sans AC interne la vérification par bundle CA fonctionne déjà :
+    faire échouer le démarrage y serait une régression pure."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **kw):
+        if name == "truststore":
+            raise ImportError("No module named 'truststore'")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    from mcp_base import enable_system_trust_store
+
+    assert enable_system_trust_store() is False
+    assert "truststore" in capsys.readouterr().err
+
+
+def test_server_main_enables_system_trust_store(monkeypatch):
+    """Le lancement standalone d'un serveur doit activer le magasin système.
+
+    Point d'entrée unique des six serveurs : s'il cessait d'appeler le helper,
+    chacun repartirait silencieusement sur le bundle CA."""
+    import mcp_base
+
+    calls = []
+    monkeypatch.setattr(mcp_base, "enable_system_trust_store", lambda: calls.append(True))
+    monkeypatch.setattr(sys, "argv", ["srv", "--transport", "stdio"])
+
+    srv = MiaouMCPBase("t", default_port=9999)
+    monkeypatch.setattr(srv, "run_stdio", lambda: None)
+    srv.main()
+
+    assert calls == [True]

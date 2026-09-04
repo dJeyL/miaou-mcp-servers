@@ -922,3 +922,69 @@ def test_noproxy_overrides_reach_http_upstream_via_process_env(monkeypatch):
     # trust_env=True + environnement nettoyé = aucun proxy monté.
     client = create_mcp_http_client()
     assert client.trust_env is True
+
+
+# ---------------------------------------------------------------------------
+# Magasin de confiance système — le chemin qui a motivé le besoin (AC interne)
+# ---------------------------------------------------------------------------
+
+def test_main_enables_system_trust_store_before_building_upstreams(tmp_path, monkeypatch):
+    """`main()` doit activer le magasin système AVANT build_upstreams.
+
+    C'est ici que se joue le cas réel : un upstream `http` en HTTPS dont le
+    certificat est signé par une AC d'entreprise interne. L'ordre compte —
+    build_upstreams importe les modules de serveurs, et un contexte SSL déjà
+    construit garderait la classe stdlib d'origine, donc ignorerait le magasin
+    système. Un test qui vérifierait seulement « le helper est appelé » laisserait
+    passer un appel placé trop tard."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text('{"port": 8765, "mcpServers": {}}')
+
+    order = []
+    monkeypatch.setattr(
+        mcp_proxy, "enable_system_trust_store", lambda: order.append("trust")
+    )
+    real_build = mcp_proxy.build_upstreams
+    monkeypatch.setattr(
+        mcp_proxy,
+        "build_upstreams",
+        lambda *a, **kw: (order.append("upstreams"), real_build(*a, **kw))[1],
+    )
+    monkeypatch.setattr(sys, "argv", ["mcp_proxy.py", "--config", str(cfg)])
+
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: order.append("serve"))
+    mcp_proxy.main()
+
+    assert order == ["trust", "upstreams", "serve"]
+
+
+def test_sdk_http_client_uses_injected_ssl_context():
+    """Le client httpx du SDK doit construire son contexte SSL via ssl.SSLContext.
+
+    C'est le maillon qui fait tenir toute la migration pour un upstream `http` :
+    on n'injecte rien dans ce client, on remplace la classe qu'il utilise. S'il
+    se mettait un jour à construire un contexte autrement (ssl_context explicite,
+    bundle certifi câblé en dur), `enable_system_trust_store()` deviendrait
+    silencieusement inopérant sur le seul type d'upstream qui a motivé le
+    changement — même raison d'être que le test sur trust_env juste au-dessus.
+
+    Sous-process : l'injection est globale et irréversible dans un process."""
+    import subprocess
+
+    code = (
+        "import ssl, truststore;"
+        "truststore.inject_into_ssl();"
+        "from mcp.shared._httpx_utils import create_mcp_http_client;"
+        "c = create_mcp_http_client();"
+        "ctx = c._transport._pool._ssl_context;"
+        "print(isinstance(ctx, ssl.SSLContext), type(ctx).__module__)"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    is_instance, module = out.stdout.split()
+    assert is_instance == "True"
+    assert module == "truststore._api", (
+        "le client httpx du SDK ne passe plus par la classe ssl.SSLContext injectée"
+    )

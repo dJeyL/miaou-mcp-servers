@@ -24,6 +24,50 @@ from starlette.middleware.cors import CORSMiddleware
 ArgModelBase.model_config["extra"] = "forbid"
 
 
+def enable_system_trust_store() -> bool:
+    """Fait vérifier les certificats TLS avec le magasin de confiance du système
+    d'exploitation, au lieu du bundle CA figé qu'embarquent certifi/OpenSSL.
+
+    Motivation : un upstream HTTPS dont le certificat est signé par une AC
+    d'entreprise interne échoue sinon en CERTIFICATE_VERIFY_FAILED, alors que le
+    même hôte s'ouvre sans erreur dans un navigateur — l'AC est bien installée,
+    mais dans le magasin du système (schannel sous Windows, Keychain sous macOS,
+    ca-certificates sous Linux), que Python ne consulte pas.
+
+    `truststore.inject_into_ssl()` remplace `ssl.SSLContext` par sa propre
+    implémentation, adossée au magasin système. C'est ce qui rend cet appel
+    unique suffisant pour TOUTE la sortie HTTPS du process, quelle que soit la
+    bibliothèque : urllib (make_opener, utilisé par weather/ddg/brave/web) comme
+    httpx (HttpUpstream du proxy, et le client OAuth du SDK MCP) construisent
+    leur contexte via `ssl.create_default_context()`, donc via la classe
+    patchée. Aucun appel HTTP n'est à réécrire, et rien n'est à passer
+    explicitement à un client — c'est précisément pourquoi le point d'injection
+    est ici et pas dans chaque serveur.
+
+    Doit être appelé AVANT que le premier contexte SSL ne soit construit (donc
+    au démarrage, avant tout appel réseau) : un contexte déjà créé garde la
+    classe d'origine et continue d'ignorer le magasin système.
+
+    Best-effort volontaire : renvoie False sans lever si `truststore` est absent
+    (installation pip minimale) ou si la plateforme n'est pas supportée. Sur un
+    poste sans AC interne, la vérification par le bundle CA fonctionne déjà — un
+    crash au démarrage y serait une régression pure, pour un bénéfice nul.
+    """
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+        return True
+    except Exception as e:  # ImportError, ou plateforme non supportée
+        print(
+            f"Avertissement : magasin de confiance système non activé ({e}). "
+            "Les certificats signés par une AC interne peuvent échouer à la "
+            "vérification ; installer `truststore` corrige ce cas.",
+            file=sys.stderr,
+        )
+        return False
+
+
 def _strip_schema_titles(schema: object) -> None:
     """Supprime récursivement les clés "title" auto-générées par Pydantic dans un
     schéma JSON de paramètres ("Char Start", "readArguments", ...) : elles ne portent
@@ -133,7 +177,14 @@ class MiaouMCPBase:
         Supports two syntaxes for backward compat:
             server.py [host] [port]                  (legacy positional)
             server.py [--transport http|stdio] [--host H] [--port P]
+
+        Active le magasin de confiance système ici plutôt que dans chaque
+        serveur : c'est le seul point traversé par les six lancements
+        standalone. Le mode inprocess ne passe pas par là — le proxy fait le
+        même appel de son côté, avant d'importer le moindre module de serveur.
         """
+        enable_system_trust_store()
+
         # Detect legacy positional syntax: first arg looks like a host (no "--")
         args_raw = sys.argv[1:]
         positional = args_raw and not args_raw[0].startswith("--")
