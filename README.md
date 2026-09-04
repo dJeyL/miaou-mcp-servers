@@ -338,10 +338,15 @@ accorder qu'une fois.
 
 Le parcours est déclenché **par l'utilisateur, jamais par le modèle**. Tant que
 l'autorisation n'est pas accordée, les outils de cet upstream sont listés
-normalement mais refusent à l'appel avec le code `AUTHORIZATION_REQUIRED`, en
-portant le lien à ouvrir. `--open` ouvre ce lien dans le navigateur par défaut de
+normalement mais refusent à l'appel avec le code `AUTHORIZATION_REQUIRED`, qui
+indique où l'accorder. `--open` ouvre le lien dans le navigateur par défaut de
 l'OS ; le lien affiché reste le mécanisme de référence, l'OS ne garantissant ni le
 bon navigateur ni le bon profil.
+
+Pour qu'un client n'ait pas à faire échouer un appel pour découvrir ce besoin,
+`tools/list` signale les upstreams à autoriser dans son `_meta` — un client qui
+ne connaît pas cette clé l'ignore sans dommage (cf. `CLAUDE.md`, « Où l'on
+autorise, et à qui on le dit »).
 
 L'outil `status` rend l'état de chaque upstream et distingue deux échecs qu'on
 confond volontiers : une **autorisation manquante**, que relancer le parcours

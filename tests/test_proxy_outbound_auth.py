@@ -650,6 +650,14 @@ def _unauthorized_upstream():
     return mcp_proxy.HttpUpstream("https://example.test/mcp")
 
 
+class _LiveUpstream:
+    """Upstream qui répond : ni HttpUpstream, ni session — `upstream_is_live`
+    rend True pour tout ce qui n'est pas un HttpUpstream."""
+
+    async def list_tools(self):
+        return [_tool()]
+
+
 def _tool(name="echo", description="Renvoie le texte."):
     import mcp.types as types
 
@@ -682,6 +690,174 @@ def test_catalog_keeps_upstreams_apart(tmp_path):
     cat.remember("beta", [_tool("b")])
     assert [t.name for t in cat.recall("alpha")[0]] == ["a"]
     assert [t.name for t in cat.recall("beta")[0]] == ["b"]
+
+
+# --- la dérivation du chemin d'autorisation (AB-4.1) ----------------------
+
+def test_authorize_path_is_relative():
+    """Le proxy ne connaît que son adresse d'écoute : publier une URL absolue
+    donnerait un lien injoignable à un client qui l'atteint par un reverse
+    proxy. C'est au client de composer l'origine."""
+    path = mcp_proxy.authorize_path("jira")
+    assert path == "/authorize/jira"
+    assert "://" not in path
+
+
+def test_authorize_path_matches_the_route_actually_served():
+    """Épingle la dérivation sur le pattern de la route : renommer /authorize
+    doit casser un test, pas le parcours.
+
+    Sans ça, la seule chose qui lie les deux est qu'on ait écrit deux fois la
+    même chaîne — exactement le genre de couplage qui se défait en silence."""
+    route = mcp_proxy.build_authorize_route({}, {})
+    from starlette.routing import Match
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": mcp_proxy.authorize_path("jira"),
+        "path_params": {},
+        "headers": [],
+    }
+    match, child = route.matches(scope)
+    assert match == Match.FULL
+    assert child["path_params"]["name"] == "jira"
+
+
+# --- la surface machine : _meta sur tools/list (AB-4.2) --------------------
+
+UNAUTHORIZED_META_KEY = mcp_proxy.UNAUTHORIZED_UPSTREAMS_META_KEY
+"""La constante du module, pas une copie : la clé est le contrat lu par MIAOU,
+et deux littéraux dériveraient sans que rien ne le signale. Sa valeur exacte
+est épinglée une fois, juste en dessous."""
+
+
+def test_the_meta_key_is_namespaced():
+    """`_meta` est un espace partagé : une clé nue collisionnerait avec une
+    extension future du SDK ou d'un autre agrégateur."""
+    assert UNAUTHORIZED_META_KEY == "miaou/unauthorized_upstreams"
+
+
+async def _list_tools_result(server):
+    """Passe par le vrai handler de requête du SDK, pas par la fonction
+    décorée : c'est lui qui enveloppe un retour de style ancien, et donc lui
+    qui décide si un `_meta` survit."""
+    import mcp.types as types
+
+    req = types.ListToolsRequest(method="tools/list")
+    return (await server.request_handlers[types.ListToolsRequest](req)).root
+
+
+async def test_unauthorized_upstreams_reach_the_wire_under_the_meta_key(tmp_path):
+    """Le test qui compte, et le seul qui puisse échouer sur le défaut visé.
+
+    Pydantic ne sérialise sous l'alias que si le champ a été peuplé PAR
+    l'alias : `ListToolsResult(meta={...})` produit la clé `meta`, pas `_meta`
+    — silencieusement invalide, silencieusement ignoré par le client. Les deux
+    formes rendent le même `result.meta` côté Python, donc un test qui
+    assertionne sur l'objet passe sur la mauvaise. Il faut regarder la CHAÎNE
+    JSON réellement émise.
+    """
+    cat = mcp_proxy.ToolCatalogCache(tmp_path / "c.json")
+    cat.remember("remote", [_tool()])
+    server = mcp_proxy.build_proxy_server(
+        {"remote": _unauthorized_upstream()},
+        {},
+        authorizers={"remote": _FakeAuthorizer()},
+        catalog=cat,
+    )
+
+    result = await _list_tools_result(server)
+    wire = result.model_dump_json(by_alias=True, exclude_none=True)
+
+    assert '"_meta"' in wire
+    assert '"meta"' not in wire
+
+    payload = json.loads(wire)["_meta"][UNAUTHORIZED_META_KEY]
+    assert payload == [{"name": "remote", "authorize_path": "/authorize/remote"}]
+
+
+async def test_meta_round_trips_back_into_a_client_side_model(tmp_path):
+    """Ce que fait un client conforme : re-valider le JSON reçu. Sans ce
+    round-trip, on épinglerait la sérialisation sans savoir si elle se relit."""
+    import mcp.types as types
+
+    cat = mcp_proxy.ToolCatalogCache(tmp_path / "c.json")
+    cat.remember("remote", [_tool()])
+    server = mcp_proxy.build_proxy_server(
+        {"remote": _unauthorized_upstream()},
+        {},
+        authorizers={"remote": _FakeAuthorizer()},
+        catalog=cat,
+    )
+
+    wire = (await _list_tools_result(server)).model_dump_json(
+        by_alias=True, exclude_none=True
+    )
+    client_side = types.ListToolsResult.model_validate(json.loads(wire))
+
+    assert client_side.meta[UNAUTHORIZED_META_KEY][0]["name"] == "remote"
+
+
+async def test_no_meta_key_when_every_upstream_answers():
+    """Absence de clé plutôt que tableau vide : un client lit « rien à
+    signaler » pareil dans les deux cas, et un proxy sain n'a pas à publier un
+    `_meta` à chaque tools/list."""
+    server = mcp_proxy.build_proxy_server(
+        {"bench": _LiveUpstream()}, {}, authorizers={}, catalog=None
+    )
+    wire = (await _list_tools_result(server)).model_dump_json(
+        by_alias=True, exclude_none=True
+    )
+    assert UNAUTHORIZED_META_KEY not in wire
+
+
+async def test_several_unauthorized_upstreams_all_appear(tmp_path):
+    """N upstreams d'un même proxy peuvent être non autorisés simultanément :
+    la surface porte un tableau dès la première version."""
+    server = mcp_proxy.build_proxy_server(
+        {
+            "jira": _unauthorized_upstream(),
+            "confluence": _unauthorized_upstream(),
+        },
+        {},
+        authorizers={
+            "jira": _FakeAuthorizer(),
+            "confluence": _FakeAuthorizer(),
+        },
+        catalog=None,
+    )
+    wire = (await _list_tools_result(server)).model_dump_json(
+        by_alias=True, exclude_none=True
+    )
+    entries = json.loads(wire)["_meta"][UNAUTHORIZED_META_KEY]
+
+    assert {e["name"] for e in entries} == {"jira", "confluence"}
+    assert {e["authorize_path"] for e in entries} == {
+        "/authorize/jira",
+        "/authorize/confluence",
+    }
+
+
+async def test_an_unreachable_upstream_without_authorizer_is_not_listed():
+    """Un HttpUpstream sans session mais sans bloc `auth` est injoignable, pas
+    non autorisé : il n'a aucun parcours à proposer, et le publier enverrait le
+    client sur un /authorize/{name} qui répond 404."""
+    server = mcp_proxy.build_proxy_server(
+        {"dead": _unauthorized_upstream()}, {}, authorizers={}, catalog=None
+    )
+    wire = (await _list_tools_result(server)).model_dump_json(
+        by_alias=True, exclude_none=True
+    )
+    assert UNAUTHORIZED_META_KEY not in wire
+
+
+async def test_listing_a_healthy_proxy_is_unchanged_by_the_migration():
+    """Non-régression de la migration du handler au style nouveau : mêmes
+    outils, même préfixage."""
+    server = mcp_proxy.build_proxy_server({"bench": _LiveUpstream()}, {})
+    result = await _list_tools_result(server)
+    assert [t.name for t in result.tools] == ["bench__echo"]
 
 
 # --- le marquage des outils resservis -------------------------------------
@@ -750,7 +926,9 @@ async def test_calling_an_unauthorized_tool_raises_the_contract(tmp_path):
     data = excinfo.value.error.data
     assert data["code"] == mcp_proxy.AUTHORIZATION_REQUIRED
     assert data["upstream"] == "remote"
-    assert data["authorization_url"] == "https://as.test/authorize?state=s1"
+    # Chemin RELATIF, dérivé par authorize_path — et non plus l'URL d'un
+    # parcours avorté, qui menait à un callback orphelin.
+    assert data["authorization_url"] == "/authorize/remote"
 
 
 async def test_refusal_message_does_not_leak_the_internal_sentinel(tmp_path):
@@ -828,14 +1006,30 @@ async def test_status_is_routed_despite_having_no_prefix(tmp_path):
     assert "remote" in result.root.content[0].text
 
 
-def test_status_report_names_the_authorization_url():
+def test_status_report_names_who_can_authorize():
+    """Ce rapport est lu par un modèle : il ne peut pas ouvrir un lien ni
+    résoudre un chemin relatif. Il doit apprendre QUI peut agir, et pouvoir
+    citer le chemin à cette personne."""
     upstreams = {"remote": _unauthorized_upstream()}
     report = mcp_proxy.build_status_report(
         upstreams, {"remote": _FakeAuthorizer()}, catalog=None
     )
     assert "NON AUTORISÉ" in report
-    assert "https://as.test/authorize?state=s1" in report
+    assert "utilisateur" in report
+    assert "/authorize/remote" in report
     assert mcp_proxy.AUTHORIZATION_REQUIRED in report
+
+
+def test_status_report_never_publishes_the_aborted_url():
+    """`last_authorization_url` reste utile en diagnostic mais cesse d'être
+    publiée comme cible d'action : elle porte le state d'une transaction que le
+    provider a abandonnée, et la suivre mène à /callback sans pending."""
+    report = mcp_proxy.build_status_report(
+        {"remote": _unauthorized_upstream()},
+        {"remote": _FakeAuthorizer("https://as.test/authorize?state=s1")},
+        catalog=None,
+    )
+    assert "state=s1" not in report
 
 
 def test_status_report_counts_remembered_tools(tmp_path):

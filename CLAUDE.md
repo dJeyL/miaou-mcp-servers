@@ -770,9 +770,11 @@ silencieusement de `tools/list` — un outil absent ne donne au modèle aucune
 piste, un outil qui refuse en donne une actionnable.
 
 Le prédicat est unique : `upstream_is_live()`, partagé par le listing, le refus
-d'appel et le rapport de `status`. Trois endroits qui doivent répondre la même
-chose, sous peine d'annoncer un outil qu'on refuse ensuite pour une raison qu'on
-ne rapporte pas.
+d'appel, le rapport de `status` et le `_meta` de `tools/list` — des endroits qui
+doivent répondre la même chose, sous peine d'annoncer un outil qu'on refuse
+ensuite pour une raison qu'on ne rapporte pas. Un prédicat n'est unique que si
+tous ses consommateurs y passent : ajouter une surface, c'est y brancher un
+consommateur de plus, jamais réécrire le filtre sur place.
 
 **Cache d'outils** (`ToolCatalogCache`, `<config>-tools.json`) : sans lui, un
 upstream non autorisé serait muet, `tools/list` répondant 401 avant de rien
@@ -783,12 +785,17 @@ une liste périmée comme vivante serait mentir au modèle, qui n'a aucun autre
 moyen de le savoir. La date est **absolue** — un texte qui changerait à chaque
 tour invaliderait le cache KV du modèle.
 
-**Contrat d'erreur `AUTHORIZATION_REQUIRED`** — c'est l'unique surface de contact
-avec MIAOU (lot AB-3), sur le motif déjà éprouvé de `REF_UNKNOWN` : le code
+**Contrat d'erreur `AUTHORIZATION_REQUIRED`** — surface de contact avec MIAOU
+(lot AB-3), sur le motif déjà éprouvé de `REF_UNKNOWN` : le code
 applicatif voyage dans `error.data.code` d'une vraie erreur JSON-RPC (`code` au
 niveau de l'erreur reste l'entier protocolaire), accompagné de `upstream` et
 `authorization_url`. **Le client teste par ÉGALITÉ de constante, jamais par
 sous-chaîne** dans le message — un message est de la prose, il se reformule.
+
+`authorization_url` porte un **chemin relatif** (`/authorize/{name}`), pas une
+URL absolue : cf. « Où l'on autorise » ci-dessous. Le nom du champ est conservé
+malgré le changement de forme — c'est le contrat publié, le renommer casserait
+davantage.
 
 Détail d'implémentation non négociable, trouvé à l'exécution : le refus est levé
 comme exception par le handler d'outil, mais le SDK pose un `except Exception`
@@ -799,6 +806,69 @@ client), que `_wrap_authorization_required` reconnaît — même mécanique que
 `_wrap_ref_unknown_sentinel`. Les deux wrappers restent **séparés** : l'un
 inspecte un résultat après exécution, l'autre un refus posé avant tout appel ;
 les fondre imposerait un mécanisme qui fait les deux mal.
+
+#### Où l'on autorise, et à qui on le dit (lot AB-4)
+
+**`authorize_path(name)` est la source unique du chemin d'autorisation**
+(`/authorize/{name}`). Ses trois consommateurs — le contrat d'erreur, le rapport
+`status` et le `_meta` de `tools/list` — passent tous par elle : recomposer la
+chaîne ailleurs laisserait deux natures de lien pour une même action. Un test
+(`test_authorize_path_matches_the_route_actually_served`) la fait matcher contre
+l'objet `Route` réellement servi, pour qu'un renommage de route casse un test
+plutôt que le parcours.
+
+**Le chemin est relatif, jamais absolu.** Le proxy ne connaît que son adresse
+d'écoute (`build_callback_url` replie `0.0.0.0` sur `127.0.0.1`) : derrière un
+reverse proxy, une URL absolue serait injoignable. Composer l'origine appartient
+au client, seul à savoir comment il joint réellement le proxy.
+
+**Ne pas publier `last_authorization_url` comme cible d'action.** Elle est
+peuplée dès le démarrage à froid — la branche non interactive de `_on_redirect`
+la mémorise avant de lever — mais elle porte le `state` et le PKCE challenge
+d'une transaction que le provider a abandonnée : la suivre mène à `/callback`
+sans `pending`, donc à une `RuntimeError`. Bonne à afficher en diagnostic,
+mauvaise à suivre. Elle reste stockée pour cette seule raison.
+
+**Deux publics, deux canaux, et ils ne disent pas la même chose.** La
+description marquée et le rapport `status` s'adressent au **modèle**, qui ne peut
+ni ouvrir un lien ni résoudre un chemin relatif : ils nomment donc l'utilisateur
+comme seul capable d'autoriser, et citent le chemin pour qu'il puisse le lui
+transmettre — jamais une adresse présentée comme ouvrable par lui. Le `_meta` de
+`tools/list` s'adresse au **client**, qui lui peut composer l'origine et rendre
+une affordance. Ne pas fondre les deux : un champ pour deux destinataires ment à
+l'un des deux.
+
+**`_meta` sur `tools/list`** (`UNAUTHORIZED_UPSTREAMS_META_KEY`,
+`miaou/unauthorized_upstreams`) — contrat lu par MIAOU (lot AB-5) :
+
+```json
+{"miaou/unauthorized_upstreams": [
+  {"name": "jira", "authorize_path": "/authorize/jira"}
+]}
+```
+
+Une **liste** dès la première version (N upstreams d'un même proxy peuvent être
+non autorisés en même temps). **Clé absente**, jamais liste vide, quand il n'y a
+rien à signaler. Préfixe `miaou/` délibéré : `_meta` est un espace partagé, une
+clé nue collisionnerait avec une extension du SDK ou d'un autre agrégateur.
+
+Un upstream non vivant **sans authorizer** n'y figure pas : il est injoignable,
+pas non autorisé, n'a aucun parcours à proposer, et le publier enverrait le
+client sur un `/authorize/{name}` qui répond 404.
+
+**Piège de construction.** `types.ListToolsResult(meta={...})` sérialise la clé
+en `meta`, pas `_meta` — pydantic ne sérialise sous l'alias que si le champ a
+été peuplé PAR l'alias. La forme correcte est `**{"_meta": {...}}`. La version
+actuelle du SDK refuse `meta=` d'un `TypeError`, mais **la propriété à garder
+n'est pas ce refus** : c'est que la clé arrive sur le fil en `_meta`. Le test
+assertionne donc sur la **chaîne JSON émise**, jamais sur l'objet Python —
+`result.meta` rend la même chose dans les deux cas, donc un test sur l'objet
+passerait aussi bien sur une sortie invalide.
+
+`handle_list_tools` rend un `ListToolsResult` (style nouveau) et non une
+`list[types.Tool]` : le SDK enveloppe un retour de style ancien **sans `_meta`**,
+il n'existe aucun moyen d'en porter un sans migrer. Le dispatch se fait sur la
+**signature** du handler (`create_call_wrapper`), pas sur son type de retour.
 
 **Outil `status`** — nom **nu**, sans préfixe : MIAOU préfixe déjà par le nom de
 la carte serveur, donc `proxy__status` donnerait `miaou-proxy__proxy__status`.

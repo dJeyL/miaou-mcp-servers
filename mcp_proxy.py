@@ -533,6 +533,48 @@ reformule, et un test par sous-chaîne casse sans prévenir.
 """
 
 
+def authorize_path(upstream_name: str) -> str:
+    """Chemin à ouvrir pour (ré)autoriser un upstream. Source UNIQUE.
+
+    Ses trois consommateurs — le contrat d'erreur, le rapport `status` et le
+    `_meta` de `tools/list` — passent tous par ici : recomposer la chaîne
+    ailleurs laisserait deux natures de lien pour une même action.
+
+    **Relatif, jamais absolu.** Le proxy ne connaît que son adresse d'écoute
+    (`build_callback_url` replie même `0.0.0.0` sur `127.0.0.1`) : un proxy
+    atteint derrière un reverse proxy donnerait une URL injoignable. C'est au
+    client de composer l'origine depuis l'URL qu'il a lui-même configurée — la
+    seule valeur qui décrive comment il joint réellement le proxy.
+
+    À ne pas confondre avec `UpstreamAuthorizer.last_authorization_url`, qui
+    porte l'URL de l'AS pour une transaction ABANDONNÉE (le `state` et le PKCE
+    challenge d'un parcours non interactif interrompu au démarrage) : bonne à
+    afficher en diagnostic, mauvaise à suivre — la suivre mène à `/callback`
+    sans `pending`, donc à une erreur. Le chemin rendu ici, lui, lance un
+    parcours frais.
+    """
+    return f"/authorize/{upstream_name}"
+
+
+UNAUTHORIZED_UPSTREAMS_META_KEY = "miaou/unauthorized_upstreams"
+"""Clé du `_meta` de `tools/list` énumérant les upstreams non autorisés.
+
+Surface adressée au CLIENT, là où la description marquée
+(`format_stale_description`) et le rapport `status` s'adressent au modèle : sans
+elle, un client ne peut pas savoir qu'un upstream est dégradé sans faire appeler
+un outil par un modèle, ce qui condamne l'utilisateur à découvrir le besoin
+d'autorisation par un échec.
+
+Valeur : une liste d'objets `{"name": …, "authorize_path": …}`. Une liste dès la
+première version — N upstreams d'un même proxy peuvent être non autorisés
+simultanément, et un objet singulier serait à refaire. Clé absente, jamais liste
+vide, quand il n'y a rien à signaler.
+
+Le préfixe `miaou/` est délibéré : `_meta` est un espace partagé, une clé nue
+collisionnerait avec une extension future du SDK ou d'un autre agrégateur.
+"""
+
+
 class ToolCatalogCache:
     """Se souvient des outils d'un upstream, pour les servir quand il ne répond
     plus.
@@ -616,8 +658,8 @@ def format_stale_description(description: str | None, known_at: float | None) ->
         ) + ")"
     notice = (
         f"[Serveur non autorisé — cet outil n'est PAS appelable pour l'instant{when}. "
-        f"L'appeler renvoie une erreur {AUTHORIZATION_REQUIRED} portant le lien "
-        f"d'autorisation.]"
+        f"L'appeler renvoie une erreur {AUTHORIZATION_REQUIRED} indiquant comment "
+        f"l'utilisateur peut l'autoriser.]"
     )
     return f"{notice} {base}".strip()
 
@@ -655,19 +697,26 @@ class UpstreamNotAuthorized(Exception):
     produite par _wrap_authorization_required.
     """
 
-    def __init__(self, upstream_name: str, authorization_url: str | None) -> None:
+    def __init__(self, upstream_name: str) -> None:
         # Le sentinel voyage DANS le message : c'est la seule voie qui traverse
         # le `except Exception` du SDK (cf. _wrap_authorization_required). Il
         # est retiré du message avant que celui-ci n'atteigne le client.
+        #
+        # Le message nomme QUI peut agir, et ne donne pas d'adresse à suivre :
+        # il est lu par un modèle, qui ne peut ni ouvrir un lien ni résoudre un
+        # chemin relatif contre l'origine du proxy. Le chemin y figure en
+        # diagnostic — pour que le modèle puisse le citer à l'utilisateur, seul
+        # capable de l'ouvrir. L'affordance cliquable, elle, passe par le
+        # `_meta` de `tools/list`, adressé au client.
         message = (
             f"{_AUTHORIZATION_SENTINEL} Le serveur '{upstream_name}' exige une "
-            f"autorisation OAuth qui n'a pas encore été accordée."
+            f"autorisation OAuth qui n'a pas encore été accordée. Seul "
+            f"l'utilisateur peut l'accorder, depuis son client MCP "
+            f"(chemin {authorize_path(upstream_name)} sur ce proxy)."
         )
-        if authorization_url:
-            message += f" Ouvrir ce lien pour l'accorder : {authorization_url}"
         super().__init__(message)
         self.upstream_name = upstream_name
-        self.authorization_url = authorization_url
+        self.authorization_path = authorize_path(upstream_name)
 
 
 def _wrap_authorization_required(
@@ -712,7 +761,6 @@ def _wrap_authorization_required(
 
         name = req.params.name
         prefix = name.split("__", 1)[0] if "__" in name else None
-        authorizer = authorizers.get(prefix) if prefix else None
         raise McpError(
             ErrorData(
                 code=INVALID_REQUEST,
@@ -720,11 +768,17 @@ def _wrap_authorization_required(
                 # Slot applicatif : `code` au niveau de l'erreur reste l'entier
                 # protocolaire. Le client teste data.code par ÉGALITÉ de
                 # constante, jamais par sous-chaîne du message.
+                #
+                # `authorization_url` porte désormais un CHEMIN RELATIF
+                # (cf. authorize_path) là où il portait une URL absolue : celle
+                # d'un parcours avorté, qui menait à un callback orphelin. Le
+                # nom du champ est conservé — c'est le contrat publié à MIAOU,
+                # le renommer casserait davantage que le changement de forme.
                 data={
                     "code": AUTHORIZATION_REQUIRED,
                     "upstream": prefix,
                     "authorization_url": (
-                        authorizer.last_authorization_url if authorizer else None
+                        authorize_path(prefix) if prefix else None
                     ),
                 },
             )
@@ -768,13 +822,18 @@ def build_status_report(
         kind = type(upstream).__name__.replace("Upstream", "").lower()
         authorizer = authorizers.get(name)
         if authorizer is not None and not upstream_is_live(upstream):
-            url = authorizer.last_authorization_url
             lines.append(
                 f"- {name} ({kind}) : NON AUTORISÉ. Ses outils sont listés mais "
                 f"refusent à l'appel avec {AUTHORIZATION_REQUIRED}."
             )
-            if url:
-                lines.append(f"  Autoriser en ouvrant : {url}")
+            # Ce rapport est lu par un MODÈLE : il ne peut ouvrir aucun lien, et
+            # un chemin relatif ne se résout pas sans l'origine du proxy, que le
+            # proxy lui-même ne connaît pas. On nomme donc qui peut agir, et on
+            # cite le chemin pour que le modèle puisse le transmettre.
+            lines.append(
+                f"  À autoriser par l'utilisateur depuis son client MCP "
+                f"(chemin {authorize_path(name)} sur ce proxy)."
+            )
             failure = getattr(authorizer, "last_error", None)
             if failure:
                 lines.append(f"  Dernière tentative en échec : {failure}")
@@ -836,10 +895,27 @@ def build_proxy_server(
     authorizers = authorizers or {}
 
     @server.list_tools()
-    async def handle_list_tools() -> list[types.Tool]:
+    async def handle_list_tools() -> types.ListToolsResult:
+        # Style NOUVEAU (retour ListToolsResult) et non `list[types.Tool]` :
+        # le SDK enveloppe un retour de style ancien en
+        # `ListToolsResult(tools=result)`, SANS `_meta`, donc il n'existe aucun
+        # moyen d'en porter un sans migrer. Le dispatch du SDK se fait sur la
+        # SIGNATURE du handler (`create_call_wrapper`), pas sur son type de
+        # retour : l'appelant est inchangé.
         tools: list[types.Tool] = []
+        unauthorized: list[dict[str, str]] = []
         for prefix, upstream in upstreams.items():
             live = upstream_is_live(upstream)
+            if not live and prefix in authorizers:
+                # Un upstream non vivant SANS authorizer est injoignable, pas
+                # non autorisé : il n'a aucun parcours à proposer, et le
+                # publier enverrait le client sur un /authorize/{name} qui
+                # répond 404. Même prédicat d'appartenance que
+                # build_status_report, et il passe par upstream_is_live, seul
+                # juge de « cet upstream répond-il ? ».
+                unauthorized.append(
+                    {"name": prefix, "authorize_path": authorize_path(prefix)}
+                )
             if live:
                 upstream_tools = await upstream.list_tools()
                 if catalog is not None:
@@ -867,7 +943,25 @@ def build_proxy_server(
                 )
         if authorizers:
             tools.append(_status_tool())
-        return tools
+
+        # `**{"_meta": ...}` et non `meta=...` : pydantic ne sérialise sous
+        # l'alias que si le champ a été peuplé PAR l'alias. La version du SDK
+        # installée refuse `meta=` d'un TypeError, mais ce n'était pas le cas
+        # partout, et la propriété qui compte n'est pas ce refus : c'est que la
+        # clé arrive sur le fil en `_meta`. Un test le vérifie sur la CHAÎNE
+        # JSON émise, pas sur l'objet Python — `result.meta` rend la même chose
+        # quelle que soit la clé sérialisée, donc un test sur l'objet passerait
+        # aussi bien sur une sortie invalide.
+        #
+        # Clé ABSENTE quand il n'y a rien à signaler, plutôt qu'un tableau
+        # vide : un client lit pareil dans les deux cas, et un proxy sain n'a
+        # pas à publier un `_meta` à chaque tools/list.
+        if not unauthorized:
+            return types.ListToolsResult(tools=tools)
+        return types.ListToolsResult(
+            tools=tools,
+            **{"_meta": {UNAUTHORIZED_UPSTREAMS_META_KEY: unauthorized}},
+        )
 
     @server.call_tool()
     async def handle_call_tool(
@@ -900,12 +994,7 @@ def build_proxy_server(
             # ne peut être reconnu qu'une fois l'outil exécuté. Levée ici, elle
             # serait avalée par le SDK en isError — d'où _wrap_authorization_
             # required, qui la relève en vraie erreur JSON-RPC.
-            raise UpstreamNotAuthorized(
-                upstream_name,
-                authorizers[upstream_name].last_authorization_url
-                if upstream_name in authorizers
-                else None,
-            )
+            raise UpstreamNotAuthorized(upstream_name)
         return await upstream.call_tool(orig_name, arguments or {})
 
     # Deux wrappers indépendants, chacun sur son propre sentinel : ils
@@ -1948,7 +2037,7 @@ def build_app(
                     await upstream.start()
                 except AuthorizationRequired as e:
                     _log(f"  {name:<12} unauthorized — {e}")
-                    _log(f"  {'':<12} autoriser : /authorize/{name}")
+                    _log(f"  {'':<12} autoriser : {authorize_path(name)}")
                     continue
                 except Exception as e:
                     failed.append(name)
