@@ -154,7 +154,7 @@ Le proxy accepte en plus :
 `type` absent → `stdio`. `port` est obligatoire, `host` optionnel.
 `"_disabled": true` sur une entrée → upstream ignoré au démarrage.
 `env` sur une entrée inprocess → variables d'environnement injectées avant l'import.
-`"type": "http"` + `url` → serveur MCP **distant** en streamable-http (cf. `CLAUDE.md`).
+`"type": "http"` + `url` → serveur MCP **distant** en streamable-http (cf. `docs/proxy.md`).
 Un bloc `auth` sur une entrée `http` → le proxy devient **client OAuth** de ce
 serveur et détient les jetons à la place de MIAOU (parcours à dérouler une fois,
 via `/authorize/<nom>` ; jetons dans un fichier séparé, jamais dans `config.json`).
@@ -345,7 +345,7 @@ bon navigateur ni le bon profil.
 
 Pour qu'un client n'ait pas à faire échouer un appel pour découvrir ce besoin,
 `tools/list` signale les upstreams à autoriser dans son `_meta` — un client qui
-ne connaît pas cette clé l'ignore sans dommage (cf. `CLAUDE.md`, « Où l'on
+ne connaît pas cette clé l'ignore sans dommage (cf. `docs/auth.md`, « Où l'on
 autorise, et à qui on le dit »).
 
 L'outil `status` rend l'état de chaque upstream et distingue deux échecs qu'on
@@ -402,6 +402,7 @@ dans `tests/` parce que c'est un outil de vérification, pas un module du produi
 ```
 miaou-mcp-servers/
 ├── mcp_proxy.py          # proxy (point d'entrée principal)
+├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
 │   ├── mcp_base.py       # classe de base + make_opener() proxy-aware
 │   ├── mcp_bench.py      # banc d'essai (port 8766)
@@ -410,6 +411,13 @@ miaou-mcp-servers/
 │   ├── mcp_ddg.py        # recherche DDG (port 8769)
 │   ├── mcp_brave.py      # recherche Brave (port 8770)
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — obsolète
+├── docs/                 # documentation par domaine, pour qui modifie le code
+│   ├── servers.md        # les six serveurs en détail (outils, contrats, env)
+│   ├── proxy.md          # upstreams, config.json, override de proxy réseau
+│   ├── auth.md           # auth OAuth entrante et sortante
+│   ├── miaou-contract.md # surface de contact avec MIAOU (transport, REF_UNKNOWN)
+│   ├── tls.md            # magasin de confiance système (truststore)
+│   └── tests.md          # ce que couvre chaque suite
 ├── tests/
 │   ├── __init__.py
 │   ├── test_base.py
@@ -421,12 +429,18 @@ miaou-mcp-servers/
 │   ├── test_brave.py
 │   ├── test_docs.py
 │   ├── test_proxy.py
+│   ├── test_proxy_auth.py           # auth OAuth entrante
+│   ├── test_proxy_outbound_auth.py  # auth OAuth sortante
+│   ├── test_dev_auth_server.py      # serveur d'autorisation de développement
 │   └── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
 ├── config.sample.json
 ├── requirements.txt
 ├── pyproject.toml        # métadonnées + config pytest (asyncio_mode=auto) + groupe dev
 └── uv.lock               # lock uv, versionné
 ```
+
+`CLAUDE.md` (à la racine) est le point d'entrée pour travailler dans le dépôt : forme
+du projet, lancement, conventions, et un index des domaines détaillés de `docs/`.
 
 ## Sécurité
 
@@ -440,4 +454,4 @@ n'en émet jamais — c'est le rôle d'un serveur d'autorisation distinct.
 
 `mcp_docs` applique en plus des gardes propres à l'extraction d'archives (zip-slip,
 tailles, chiffrement, imbrication) et un contrat d'erreur `REF_UNKNOWN` partagé avec le
-dispatcher MIAOU — détails dans `CLAUDE.md`.
+dispatcher MIAOU — détails dans `docs/servers.md` et `docs/miaou-contract.md`.

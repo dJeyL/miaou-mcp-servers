@@ -326,7 +326,7 @@ async def test_drop_session_idempotent_when_absent(workdir):
 
 @pytest.mark.asyncio
 async def test_drop_session_sweeps_other_expired_sessions(workdir):
-    """DD3/DOC7 : CLAUDE.md affirme le sweep TTL 'en tête de chaque appel
+    """DD3/DOC7 : docs/servers.md affirme le sweep TTL 'en tête de chaque appel
     d'outil' — drop_session doit désormais le faire aussi, pas seulement
     list/read/search/extract."""
     from mcp_docs import server as docs_server
@@ -1108,7 +1108,7 @@ def _make_corrupt_zip(tmp_path):
 
 
 def test_zip_list_corrupt_archive_raises_clear_error(tmp_path):
-    """F3 : BadZipFile ne doit jamais fuiter brute — CLAUDE.md promet une
+    """F3 : BadZipFile ne doit jamais fuiter brute — docs/servers.md promet une
     erreur claire pour toute incohérence de zip (R5)."""
     path = _make_corrupt_zip(tmp_path)
     with pytest.raises(ToolError, match="corrompue"):

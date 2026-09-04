@@ -101,7 +101,7 @@ __all__ = [
 def _drop_session_blocking(session_id: str) -> None:
     """Sweep + validation + rmtree groupés pour un seul asyncio.to_thread (le
     rmtree peut porter sur MAX_SESSION_MB de fichiers). Le sweep en tête rend
-    vraie la phrase CLAUDE.md « sweep opportuniste en tête de chaque appel
+    vraie la phrase docs/servers.md « sweep opportuniste en tête de chaque appel
     d'outil » (DD3/DOC7) — inoffensif ici, la session ciblée est de toute
     façon supprimée juste après, sweepée ou non."""
     sweep_expired_sessions()

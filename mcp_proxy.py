@@ -252,7 +252,7 @@ class HttpUpstream(Upstream):
     httpx du SDK est construit avec le défaut trust_env=True, donc il lit les
     variables d'environnement du process, que main() a déjà posées avant
     build_upstreams(). Attention, httpx lit AUSSI ALL_PROXY et NO_PROXY, que
-    _PROXY_ENV_KEYS ne gère pas — limite documentée dans CLAUDE.md.
+    _PROXY_ENV_KEYS ne gère pas — limite documentée dans docs/proxy.md.
 
     **Le transport vit dans SA propre tâche, du début à la fin.** Les contextes
     asynchrones du SDK (streamablehttp_client, ClientSession) portent des cancel
