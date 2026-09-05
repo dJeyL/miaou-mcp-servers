@@ -28,6 +28,13 @@ Un seul outil `get_weather(city, state?, country?)` qui interroge wttr.in et ren
 un `EmbeddedResource` texte JSON. Sert à tester un outil avec données réelles et
 paramètres optionnels, ainsi que le chemin resource inline (D8.2).
 
+Le format `j1` de wttr.in ne renvoie pas que l'instantané : `current_condition` plus
+un tableau `weather` de trois entrées (le jour même et les deux suivants). La docstring
+de l'outil le dit explicitement — sans ça, un modèle à qui on demande les prochains
+jours conclut que l'outil ne sait faire que la météo actuelle et renonce (constaté en
+usage). Elle précise aussi que le retrait de `hourly` supprime le découpage horaire,
+pas les prévisions : ce qui reste par jour, ce sont les min/max et moyennes.
+
 ## `servers/mcp_web/` — téléchargement d'URL (port 8768)
 
 Package (pas un fichier plat, même seuil que `mcp_docs` : plusieurs responsabilités

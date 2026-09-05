@@ -10,7 +10,7 @@ Transport streamable-http (single endpoint POST, réponses en SSE). CORS ouvert
 pour permettre au navigateur de l'atteindre directement depuis dist/miaou.html.
 
 Outils exposés :
-  - get_weather(city, state?, country?) : météo actuelle via wttr.in (JSON allégé)
+  - get_weather(city, state?, country?) : météo actuelle + prévisions J..J+2 via wttr.in (JSON allégé)
 
 Lancement :
     uv run servers/mcp_weather.py                          # HTTP sur 127.0.0.1:8767
@@ -65,7 +65,10 @@ class WeatherServer(MiaouMCPBase):
                 ),
             ] = None,
         ) -> str | types.EmbeddedResource:
-            """Renvoie la météo actuelle pour une ville via wttr.in (JSON allégé sans astronomy ni hourly). Attention : heures UTC."""
+            """Renvoie la météo d'une ville via wttr.in : conditions actuelles et prévisions
+            du jour même plus les deux jours suivants (JSON allégé, sans astronomy ni hourly —
+            donc sans découpage horaire, seulement les min/max et moyennes journalières).
+            Attention : heures UTC."""
             parts = [city]
             if state:
                 parts.append(state)
