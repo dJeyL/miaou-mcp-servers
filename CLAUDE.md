@@ -58,7 +58,7 @@ Six serveurs de banc d'essai plus un proxy qui les agrège. Le détail de chacun
 | Serveur | Port | Rôle | Outils |
 |---|---|---|---|
 | `mcp_bench.py` | 8766 | Banc d'essai général : exerce les chemins de résultat de MIAOU (texte, image, resource) | `echo`, `add`, `dns_lookup`, `reverse_dns`, `get_image`, `get_json_resource` |
-| `mcp_weather.py` | 8767 | Météo réelle via wttr.in | `get_weather` |
+| `mcp_weather.py` | 8767 | Météo réelle via wttr.in | `get_weather` (`astronomy`, `hourly`, `extract`) |
 | `mcp_web/` | 8768 | Téléchargement d'URL, cache disque par checksum, pagination | `fetch_url`, `fetch_read`, `fetch_list`, `fetch_resource` |
 | `mcp_ddg.py` | 8769 | Recherche DuckDuckGo (HTML scrapé) | `ddg_search` |
 | `mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) | `brave_search`, `brave_image_search` |
@@ -259,7 +259,9 @@ lots — piège déjà payé côté MIAOU.
 
 - **`docs/servers.md`** — les six serveurs en détail : outils exposés, contrats,
   variables d'environnement, décisions de conception. `mcp_bench` (chemins de
-  résultat D8/D9), `mcp_weather`, `mcp_web` (cache par checksum d'URL, caps
+  résultat D8/D9), `mcp_weather` (`astronomy`/`hourly` séparés et pourquoi, `extract`
+  et le nom de ressource `weather-<lieu>-<yyyymmdd>.json`), `mcp_web` (cache par
+  checksum d'URL, caps
   `READ_CAP`/`LIST_CAP`, `fetch_resource` et le canal bytes→client), `mcp_ddg`,
   `mcp_brave` (`resolve_api_key`, refus d'init sans clef), `mcp_docs` (obsolète mais
   conservé pour le hors-connexion : sessions, pagination, `search`, `extract` hors

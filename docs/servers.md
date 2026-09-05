@@ -24,9 +24,37 @@ pendant le round-trip.
 
 ## `servers/mcp_weather.py` — météo réelle (port 8767)
 
-Un seul outil `get_weather(city, state?, country?)` qui interroge wttr.in et renvoie
-un `EmbeddedResource` texte JSON. Sert à tester un outil avec données réelles et
-paramètres optionnels, ainsi que le chemin resource inline (D8.2).
+Un seul outil `get_weather(city, state?, country?, astronomy?, hourly?, extract?)` qui
+interroge wttr.in et renvoie un `EmbeddedResource` JSON. Sert à tester un outil avec
+données réelles et paramètres optionnels, ainsi que le chemin resource inline (D8.2) —
+et, avec `extract`, le chemin resource binaire (D8.1) sur un contenu textuel.
+
+Les trois booléens sont indépendants et valent `false` par défaut ; sans eux, le
+comportement est celui d'avant leur ajout, à l'octet près.
+
+- **`astronomy`** et **`hourly`** réintègrent chacun le bloc du même nom, que la
+  réponse allégée retire de chaque jour. Ils sont séparés plutôt que réunis sous un
+  seul `full` (première forme livrée, remplacée) parce que leurs coûts n'ont rien de
+  comparable — mesuré sur Paris, en caractères de JSON : 1535 sans rien, 2045 avec
+  `astronomy` seul (+510), 25221 avec `hourly` seul (+23686), 25731 avec les deux.
+  `hourly` pèse donc ~46 fois plus qu'`astronomy` : sous un booléen unique, demander
+  les heures de lever du soleil coûtait le découpage horaire des trois jours.
+- **`extract`** bascule du canal `resource.text` (store_inline, JSON réinjecté au
+  modèle) vers `resource.blob` (store_binary, matérialisation en `res_…` **hors
+  contexte du modèle**), accompagné d'un `TextContent` descripteur — même patron que
+  `fetch_resource` de `mcp_web`, cf. le tableau des trois actions dans
+  `docs/miaou-contract.md`. Le JSON est encodé en base64 bien qu'il soit du texte :
+  c'est précisément ce qui le route en `store_binary`. Le descripteur nomme les blocs
+  effectivement inclus (« allégée », « avec astronomy », « avec astronomy et hourly ») :
+  c'est la seule chose que le modèle reçoit, il n'a aucun autre moyen de vérifier qu'il
+  a obtenu le niveau de détail demandé.
+
+Le nom de la ressource est `weather-<lieu slugifié>-<yyyymmdd>.json`. Le slug passe le
+lieu en ASCII minuscule à tirets (`Saint-Étienne,France` → `saint-etienne-france`) —
+sans ça accents, espaces et virgule se retrouveraient dans un nom de fichier côté
+client. La date est celle du premier jour du bulletin (`weather[0].date`) quand elle
+est au format attendu, sinon la date locale du serveur : un nom de ressource ne doit
+pas dépendre de la bonne volonté du champ renvoyé par wttr.in.
 
 Le format `j1` de wttr.in ne renvoie pas que l'instantané : `current_condition` plus
 un tableau `weather` de trois entrées (le jour même et les deux suivants). La docstring

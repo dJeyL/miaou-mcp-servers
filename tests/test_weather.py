@@ -164,3 +164,145 @@ async def test_get_weather_weather_entry_not_dict_skipped():
         tm = weather_server.mcp._tool_manager
         result = await tm.call_tool("get_weather", {"city": "Paris"})
     assert isinstance(result, types.EmbeddedResource)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args, expect_astronomy, expect_hourly",
+    [
+        ({}, False, False),
+        ({"astronomy": True}, True, False),
+        ({"hourly": True}, False, True),
+        ({"astronomy": True, "hourly": True}, True, True),
+    ],
+)
+async def test_get_weather_astronomy_and_hourly_are_independent(
+    args, expect_astronomy, expect_hourly
+):
+    """Les deux blocs se demandent séparément : demander l'un ne ramène pas l'autre."""
+    mock_resp = _make_mock_resp(_WTTR_SAMPLE)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris", **args})
+    day = json.loads(result.resource.text)["weather"][0]
+    assert ("astronomy" in day) is expect_astronomy
+    assert ("hourly" in day) is expect_hourly
+    if expect_astronomy:
+        assert day["astronomy"] == [{"sunrise": "06:00 AM"}]
+    if expect_hourly:
+        assert day["hourly"] == [{"time": "0", "tempC": "10"}]
+
+
+@pytest.mark.asyncio
+async def test_get_weather_extract_returns_blob_and_descriptor():
+    """extract=true : descripteur au modèle + blob binaire hors contexte (store_binary)."""
+    import base64
+
+    mock_resp = _make_mock_resp(_WTTR_SAMPLE)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris", "extract": True})
+
+    assert isinstance(result, list) and len(result) == 2
+    descripteur, resource = result
+    assert isinstance(descripteur, types.TextContent)
+    assert "weather-paris-20260628.json" in descripteur.text
+    assert isinstance(resource, types.EmbeddedResource)
+    assert isinstance(resource.resource, types.BlobResourceContents)
+    assert resource.resource.mimeType == "application/json"
+    data = json.loads(base64.b64decode(resource.resource.blob).decode())
+    assert "astronomy" not in data["weather"][0]
+    assert str(resource.resource.uri).endswith("weather-paris-20260628.json")
+
+
+@pytest.mark.asyncio
+async def test_get_weather_extract_name_slugifies_location():
+    """Accents, espaces et virgule du lieu ne doivent pas fuiter dans le nom de ressource."""
+    mock_resp = _make_mock_resp(_WTTR_SAMPLE)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool(
+            "get_weather",
+            {"city": "Saint-Étienne", "country": "France", "extract": True},
+        )
+    uri = str(result[1].resource.uri)
+    assert "weather-saint-etienne-france-20260628.json" in uri
+
+
+@pytest.mark.asyncio
+async def test_get_weather_extract_falls_back_to_today_without_date():
+    """Sans date exploitable dans la réponse, le nom retombe sur la date locale."""
+    import datetime
+
+    mock_resp = _make_mock_resp({"weather": [{"maxtempC": "15"}], "current_condition": []})
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris", "extract": True})
+    today = datetime.date.today().strftime("%Y%m%d")
+    assert f"weather-paris-{today}.json" in str(result[1].resource.uri)
+
+
+@pytest.mark.asyncio
+async def test_get_weather_blocks_and_extract_combine():
+    """Les paramètres de contenu sont orthogonaux à extract : blob binaire complet."""
+    import base64
+
+    mock_resp = _make_mock_resp(_WTTR_SAMPLE)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool(
+            "get_weather",
+            {"city": "Paris", "astronomy": True, "hourly": True, "extract": True},
+        )
+    data = json.loads(base64.b64decode(result[1].resource.blob).decode())
+    assert "hourly" in data["weather"][0]
+    assert "astronomy" in data["weather"][0]
+    assert "avec astronomy et hourly" in result[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        ({}, "allégée"),
+        ({"astronomy": True}, "avec astronomy"),
+        ({"hourly": True}, "avec hourly"),
+    ],
+)
+async def test_get_weather_extract_descriptor_states_content(args, expected):
+    """Le descripteur dit littéralement ce que la ressource contient — le modèle
+    n'a que lui pour savoir s'il a demandé le bon niveau de détail."""
+    mock_resp = _make_mock_resp(_WTTR_SAMPLE)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool(
+            "get_weather", {"city": "Paris", "extract": True, **args}
+        )
+    assert expected in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_get_weather_defaults_unchanged():
+    """Sans les nouveaux paramètres, le comportement d'avant à l'octet près :
+    TextResourceContents, uri sur le lieu brut, astronomy/hourly retirés."""
+    mock_resp = _make_mock_resp(_WTTR_SAMPLE)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris"})
+    assert isinstance(result, types.EmbeddedResource)
+    assert isinstance(result.resource, types.TextResourceContents)
+    assert str(result.resource.uri) == "miaou://weather/Paris"
+
+
+@pytest.mark.asyncio
+async def test_get_weather_non_dict_json_returns_clear_string():
+    """wttr.in renvoyant un JSON de type liste ne doit pas fuiter d'AttributeError."""
+    mock = MagicMock()
+    mock.__enter__ = lambda s: s
+    mock.__exit__ = MagicMock(return_value=False)
+    mock.read.return_value = b"[1, 2, 3]"
+    with patch("urllib.request.OpenerDirector.open", return_value=mock):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris"})
+    assert isinstance(result, str)
+    assert "invalide" in result.lower()

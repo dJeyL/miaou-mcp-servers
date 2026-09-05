@@ -10,7 +10,9 @@ Transport streamable-http (single endpoint POST, réponses en SSE). CORS ouvert
 pour permettre au navigateur de l'atteindre directement depuis dist/miaou.html.
 
 Outils exposés :
-  - get_weather(city, state?, country?) : météo actuelle + prévisions J..J+2 via wttr.in (JSON allégé)
+  - get_weather(city, state?, country?, astronomy?, hourly?, extract?) : météo actuelle +
+    prévisions J..J+2 via wttr.in (JSON allégé par défaut, astronomy/hourly réintégrables
+    séparément ; ressource hors contexte si extract)
 
 Lancement :
     uv run servers/mcp_weather.py                          # HTTP sur 127.0.0.1:8767
@@ -27,7 +29,11 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 """
 
 import asyncio
+import base64
+import datetime
 import json
+import re
+import unicodedata
 import urllib.error
 import urllib.parse
 from typing import Annotated, Optional
@@ -43,6 +49,26 @@ def _fetch_weather_bytes(url: str) -> bytes:
     sans ça, chaque appel gèle l'event loop pendant tout le round-trip réseau."""
     with make_opener().open(url, timeout=10) as resp:
         return resp.read(2 * 1024 * 1024)
+
+
+def _slug(text: str) -> str:
+    """Réduit un libellé de lieu à un identifiant de nom de fichier : ASCII, minuscules,
+    tirets. Sans ça, « Saint-Étienne, France » produirait un nom de ressource contenant
+    accents, espaces et virgule."""
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_text).strip("-").lower()
+    return slug or "lieu"
+
+
+def _resource_date(data: dict) -> str:
+    """Date yyyymmdd du bulletin : celle du premier jour renvoyé par wttr.in quand elle
+    est exploitable, sinon la date locale du serveur."""
+    weather = data.get("weather")
+    if isinstance(weather, list) and weather and isinstance(weather[0], dict):
+        date = weather[0].get("date")
+        if isinstance(date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            return date.replace("-", "")
+    return datetime.date.today().strftime("%Y%m%d")
 
 
 class WeatherServer(MiaouMCPBase):
@@ -64,11 +90,30 @@ class WeatherServer(MiaouMCPBase):
                     description="Pays pour désambiguïser la ville en cas d'homonymie (optionnel, nom en anglais recommandé)."
                 ),
             ] = None,
-        ) -> str | types.EmbeddedResource:
+            astronomy: Annotated[
+                bool,
+                Field(
+                    description="Ajoute par jour le bloc astronomy : lever/coucher du soleil et de la lune, phase et illumination lunaires. Coût faible (~500 caractères pour les trois jours)."
+                ),
+            ] = False,
+            hourly: Annotated[
+                bool,
+                Field(
+                    description="Ajoute par jour le bloc hourly : découpage horaire en 8 tranches de 3 h (température, vent, précipitations, ressenti par tranche) au lieu des seules min/max et moyennes journalières. Coût élevé : multiplie la réponse par ~16."
+                ),
+            ] = False,
+            extract: Annotated[
+                bool,
+                Field(
+                    description="Transfère le JSON au client comme ressource binaire nommée weather-<ville>-<yyyymmdd>.json, hors du contexte du modèle : celui-ci ne reçoit alors qu'un descripteur (lieu, date, taille), pas les données."
+                ),
+            ] = False,
+        ) -> str | types.EmbeddedResource | list[types.ContentBlock]:
             """Renvoie la météo d'une ville via wttr.in : conditions actuelles et prévisions
-            du jour même plus les deux jours suivants (JSON allégé, sans astronomy ni hourly —
-            donc sans découpage horaire, seulement les min/max et moyennes journalières).
-            Attention : heures UTC."""
+            du jour même plus les deux jours suivants. JSON allégé par défaut : sans les
+            blocs astronomy ni hourly, donc sans découpage horaire, seulement les min/max
+            et moyennes journalières. Les paramètres astronomy et hourly, indépendants,
+            réintègrent chacun le sien. Attention : heures UTC."""
             parts = [city]
             if state:
                 parts.append(state)
@@ -94,22 +139,53 @@ class WeatherServer(MiaouMCPBase):
             except json.JSONDecodeError as e:
                 return f"Réponse invalide de wttr.in (JSON malformé : {e})."
 
+            if not isinstance(data, dict):
+                return "Réponse invalide de wttr.in (JSON malformé : objet attendu)."
+
             weather = data.get("weather", [])
             if not isinstance(weather, list):
                 return "Réponse invalide de wttr.in (JSON malformé : champ 'weather' inattendu)."
+            dropped = [
+                key
+                for key, keep in (("astronomy", astronomy), ("hourly", hourly))
+                if not keep
+            ]
             for day in weather:
                 if isinstance(day, dict):
-                    day.pop("astronomy", None)
-                    day.pop("hourly", None)
+                    for key in dropped:
+                        day.pop(key, None)
 
-            return types.EmbeddedResource(
-                type="resource",
-                resource=types.TextResourceContents(
-                    uri=f"miaou://weather/{location}",  # type: ignore[arg-type]
-                    mimeType="application/json",
-                    text=json.dumps(data, ensure_ascii=False),
-                ),
+            payload = json.dumps(data, ensure_ascii=False)
+
+            if not extract:
+                return types.EmbeddedResource(
+                    type="resource",
+                    resource=types.TextResourceContents(
+                        uri=f"miaou://weather/{location}",  # type: ignore[arg-type]
+                        mimeType="application/json",
+                        text=payload,
+                    ),
+                )
+
+            raw_payload = payload.encode("utf-8")
+            name = f"weather-{_slug(location)}-{_resource_date(data)}.json"
+            kept = [k for k in ("astronomy", "hourly") if k not in dropped]
+            contenu = f"avec {' et '.join(kept)}" if kept else "allégée"
+            descripteur = (
+                f"Météo de {location} transférée au client comme ressource {name} "
+                f"({len(raw_payload)} octets, {contenu})."
             )
+            return [
+                types.TextContent(type="text", text=descripteur),
+                types.EmbeddedResource(
+                    type="resource",
+                    resource=types.BlobResourceContents(
+                        uri=f"miaou://weather/{name}",  # type: ignore[arg-type]
+                        mimeType="application/json",
+                        blob=base64.b64encode(raw_payload).decode(),
+                    ),
+                ),
+            ]
 
         self.finalize_tools()
 
