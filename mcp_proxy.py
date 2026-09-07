@@ -1879,25 +1879,70 @@ class UpstreamAuthorizer:
             self.pending = None
 
     async def authorize(self, upstream: Upstream) -> None:
-        """Déroule le parcours interactif et (re)démarre l'upstream.
+        """Déroule le parcours interactif, puis (re)démarre l'upstream.
 
         À n'appeler qu'une fois le port ouvert : c'est la condition qui rend le
         /callback atteignable. Le drapeau `interactive` n'est levé que pour la
         durée du parcours, pour qu'un échec ultérieur au démarrage ne rouvre
         pas un parcours à l'insu de tout le monde.
+
+        **Le parcours est PROVOQUÉ, jamais espéré comme effet de bord d'un
+        `start()`.** C'est la correction du 2026-09-07 : `start()` ouvre une
+        session, et sur un upstream dont `initialize` (voire `tools/list`)
+        passe sans jeton, il réussit sans qu'aucune requête ne soit refusée —
+        donc sans déclencher l'OAuth. `authorize()` retournait alors sans rien
+        avoir fait, on annonçait « autorisation accordée », et aucun jeton
+        n'était jamais écrit : sur le terrain, ni fichier de jetons ni le
+        moindre appel à l'AS, pour une page qui disait le contraire.
+
+        On émet donc une requête à nous sur l'URL de l'upstream, à travers un
+        client httpx portant le provider en `auth`. Le 401 attendu fait dérouler
+        au SDK son chemin NOMINAL — découverte des métadonnées, enregistrement
+        si besoin, redirection, échange du code, écriture du jeton. Rien n'est
+        réimplémenté ici : mener le flow à la main dupliquerait la moitié du
+        SDK, et deux chemins d'autorisation finiraient par diverger.
+
+        Si l'upstream répond sans exiger d'autorisation, il n'y avait rien à
+        accorder — pas une erreur, mais pas non plus un jeton : c'est
+        `has_usable_token` qui tranche ensuite, jamais le seul fait d'être
+        arrivé ici sans exception.
         """
+        import httpx
+
         self.interactive = True
         try:
-            await upstream.start()
+            async with httpx.AsyncClient(
+                auth=self.provider(), timeout=self.wait_timeout, follow_redirects=False
+            ) as client:
+                # Le corps de la réponse n'a aucun intérêt : seul compte le
+                # passage par le flow d'authentification, que httpx exécute
+                # AVANT de nous rendre la main.
+                await client.post(
+                    self.server_url,
+                    json={"jsonrpc": "2.0", "id": 0, "method": "ping"},
+                    headers={"Accept": "application/json, text/event-stream"},
+                )
+        except AuthorizationRequired:
+            # Ne peut pas arriver ici (`interactive` est vrai), mais si le
+            # parcours est inhibé pour une raison qu'on n'a pas prévue, ne
+            # surtout pas le présenter comme un succès.
+            raise
         except Exception:
             # L'autorisation reste due : un parcours qui échoue ne doit pas
             # faire croire aux surfaces que le problème est réglé.
             raise
-        else:
-            self.authorization_pending = False
         finally:
             self.interactive = False
             self.pending = None
+
+        # Le témoin est le JETON, jamais l'absence d'exception. Un upstream qui
+        # répond 200 sans rien exiger n'a pas « accordé » quoi que ce soit.
+        if await self._storage.has_usable_token():
+            self.authorization_pending = False
+            # La session courante a été ouverte SANS jeton : la rouvrir est ce
+            # qui la fait porter l'en-tête Authorization.
+            await upstream.stop()
+            await upstream.start()
 
     def provider(self) -> Any:
         """Construit le provider AU PREMIER APPEL, puis le rend tel quel."""
@@ -2126,6 +2171,27 @@ def build_authorize_route(
                         f"Retourner à MIAOU et relancer la demande."
                     ),
                 )
+            )
+
+        # Ni redirection, ni jeton, ni erreur : l'upstream a répondu sans rien
+        # exiger. Le dire tel quel — annoncer une autorisation accordée serait
+        # le faux positif payé le 2026-09-07, où la page confirmait un succès
+        # pendant qu'aucun jeton n'était écrit et qu'aucun appel ne partait
+        # vers l'AS.
+        if authorizer.last_error is None:
+            return HTMLResponse(
+                _CALLBACK_PAGE.format(
+                    cls="ko",
+                    title="Rien à autoriser",
+                    message=(
+                        f"L'upstream <code>{escape(name)}</code> a répondu sans "
+                        f"demander d'autorisation, et aucun jeton n'a été "
+                        f"obtenu. Si ses outils refusent malgré tout, "
+                        f"l'autorisation se joue ailleurs que sur ce parcours "
+                        f"— voir la sortie du proxy."
+                    ),
+                ),
+                status_code=409,
             )
 
         # `last_error` dit POURQUOI quand le parcours a échoué (scope refusé,

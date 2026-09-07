@@ -313,6 +313,44 @@ def test_storage_satisfies_sdk_token_storage_protocol():
 # Parcours OAuth : lien copiable, /callback, unicité du provider (AB-2.3)
 # ---------------------------------------------------------------------------
 
+class _NoopUpstream:
+    """`authorize()` ne redémarre l'upstream que s'il a obtenu un jeton."""
+
+    def __init__(self):
+        self.started = 0
+        self.stopped = 0
+
+    async def start(self):
+        self.started += 1
+
+    async def stop(self):
+        self.stopped += 1
+
+
+def _patch_authorize_transport(monkeypatch, handler):
+    """Intercepte la requête d'amorçage d'`authorize()` — aucun réseau.
+
+    `authorize()` provoque désormais le parcours par une vraie requête HTTP
+    portant le provider en `auth` (c'est ce qui fait dérouler au SDK son chemin
+    nominal). Les tests remplacent donc le transport, jamais `start()`.
+    """
+    import httpx
+
+    original = httpx.AsyncClient.__init__
+
+    def _init(self, *args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", _init)
+
+
+def _unauthorized(request):
+    import httpx
+
+    return httpx.Response(401)
+
+
 def _authorizer(tmp_path, name="remote", interactive=True, **kw):
     """`interactive=True` par défaut ICI seulement : ces tests exercent le
     parcours. En vrai le drapeau est faux au démarrage (cf.
@@ -604,33 +642,36 @@ async def test_boot_refuses_instead_of_waiting_for_a_click(tmp_path, capsys):
     assert authorizer.last_authorization_url == "https://as.test/authorize?state=s1"
 
 
-async def test_authorize_lifts_the_flag_only_for_the_attempt(tmp_path):
-    """Un échec plus tard ne doit pas rouvrir un parcours à l'insu de tous."""
+async def test_authorize_lifts_the_flag_only_for_the_attempt(tmp_path, monkeypatch):
+    """Un échec plus tard ne doit pas rouvrir un parcours à l'insu de tous.
+
+    Le drapeau doit être vrai PENDANT la requête d'amorçage — c'est lui qui
+    autorise `_on_redirect` à ouvrir un parcours plutôt qu'à refuser."""
     authorizer = _authorizer(tmp_path, interactive=False)
+    seen = []
 
-    class _Upstream:
-        def __init__(self):
-            self.seen = None
+    def _handler(request):
+        import httpx
 
-        async def start(self):
-            self.seen = authorizer.interactive
+        seen.append(authorizer.interactive)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
 
-    upstream = _Upstream()
-    await authorizer.authorize(upstream)
+    _patch_authorize_transport(monkeypatch, _handler)
+    await authorizer.authorize(_NoopUpstream())
 
-    assert upstream.seen is True
+    assert seen == [True]
     assert authorizer.interactive is False
 
 
-async def test_authorize_lowers_the_flag_even_on_failure(tmp_path):
-    authorizer = _authorizer(tmp_path, interactive=False)
+async def test_authorize_lowers_the_flag_even_on_failure(tmp_path, monkeypatch):
+    def _boom(request):
+        raise RuntimeError("boom")
 
-    class _Failing:
-        async def start(self):
-            raise RuntimeError("boom")
+    authorizer = _authorizer(tmp_path, interactive=False)
+    _patch_authorize_transport(monkeypatch, _boom)
 
     with pytest.raises(RuntimeError):
-        await authorizer.authorize(_Failing())
+        await authorizer.authorize(_NoopUpstream())
     assert authorizer.interactive is False
 
 
@@ -1261,7 +1302,48 @@ async def test_an_inhibited_redirect_marks_the_authorization_as_due(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_a_completed_authorization_clears_the_flag(tmp_path):
+async def test_a_completed_authorization_clears_the_flag(tmp_path, monkeypatch):
+    """Le témoin est le JETON, jamais l'absence d'exception."""
+    path = tmp_path / "t.json"
+    authorizer = mcp_proxy.UpstreamAuthorizer(
+        "jira", "https://example.test/mcp",
+        UpstreamTokenStorage(path, "jira"),
+        "http://127.0.0.1:8765/callback",
+    )
+    authorizer.authorization_pending = True
+
+    def _grant(request):
+        import httpx
+
+        # Ce que fait un parcours abouti : le jeton est en stockage.
+        path.write_text(json.dumps({
+            "jira": {
+                "tokens": {
+                    "access_token": "AT", "token_type": "Bearer",
+                    "expires_in": 3600,
+                },
+                "expires_at": time.time() + 3600,
+            }
+        }))
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
+
+    _patch_authorize_transport(monkeypatch, _grant)
+    upstream = _NoopUpstream()
+    await authorizer.authorize(upstream)
+
+    assert authorizer.authorization_pending is False
+    # La session courante a été ouverte SANS jeton : elle doit être rouverte,
+    # sans quoi elle continue de ne porter aucun en-tête Authorization.
+    assert upstream.stopped == 1
+    assert upstream.started == 1
+
+
+@pytest.mark.anyio
+async def test_an_upstream_that_asks_for_nothing_grants_nothing(tmp_path, monkeypatch):
+    """LE cas payé en production : `start()` réussissait sans qu'aucune requête
+    ne soit refusée, donc sans déclencher l'OAuth, et l'on annonçait une
+    autorisation accordée pendant qu'aucun jeton n'était écrit ni aucun appel
+    émis vers l'AS. Répondre 200 n'accorde rien."""
     authorizer = mcp_proxy.UpstreamAuthorizer(
         "jira", "https://example.test/mcp",
         UpstreamTokenStorage(tmp_path / "t.json", "jira"),
@@ -1269,16 +1351,21 @@ async def test_a_completed_authorization_clears_the_flag(tmp_path):
     )
     authorizer.authorization_pending = True
 
-    class _Ok:
-        async def start(self):
-            return None
+    def _ok(request):
+        import httpx
 
-    await authorizer.authorize(_Ok())
-    assert authorizer.authorization_pending is False
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
+
+    _patch_authorize_transport(monkeypatch, _ok)
+    upstream = _NoopUpstream()
+    await authorizer.authorize(upstream)
+
+    assert authorizer.authorization_pending is True
+    assert upstream.started == 0
 
 
 @pytest.mark.anyio
-async def test_a_failed_authorization_keeps_the_flag(tmp_path):
+async def test_a_failed_authorization_keeps_the_flag(tmp_path, monkeypatch):
     """Un parcours qui échoue ne doit pas faire croire que c'est réglé."""
     authorizer = mcp_proxy.UpstreamAuthorizer(
         "jira", "https://example.test/mcp",
@@ -1287,12 +1374,13 @@ async def test_a_failed_authorization_keeps_the_flag(tmp_path):
     )
     authorizer.authorization_pending = True
 
-    class _Boom:
-        async def start(self):
-            raise RuntimeError("scope refusé")
+    def _boom(request):
+        raise RuntimeError("scope refusé")
+
+    _patch_authorize_transport(monkeypatch, _boom)
 
     with pytest.raises(RuntimeError):
-        await authorizer.authorize(_Boom())
+        await authorizer.authorize(_NoopUpstream())
     assert authorizer.authorization_pending is True
 
 
@@ -1418,7 +1506,7 @@ def test_a_flow_that_succeeds_without_redirecting_is_not_an_error():
     assert "n'a pas répondu à temps" not in response.text
 
 
-def test_the_redirect_is_served_without_waiting_for_the_callback(tmp_path):
+def test_the_redirect_is_served_without_waiting_for_the_callback(tmp_path, monkeypatch):
     """`authorize()` bloque sur le retour du navigateur APRÈS avoir produit son
     URL. La route doit répondre dès l'URL connue, pas à la fin du parcours —
     sinon elle tient jusqu'à sa borne pour une redirection déjà décidée.
@@ -1441,18 +1529,12 @@ def test_the_redirect_is_served_without_waiting_for_the_callback(tmp_path):
         "http://127.0.0.1:8765/callback",
     )
 
-    class _Upstream:
-        async def start(self):
-            # Ce que fait le SDK : il redirige, puis attend le callback.
-            await authorizer._on_redirect("https://as.test/authorize?state=s1")
-            await anyio.sleep(30)
+    async def _handler(request):
+        # Ce que fait le SDK au 401 : il redirige, puis attend le callback.
+        await authorizer._on_redirect("https://as.test/authorize?state=s1")
+        await anyio.sleep(30)  # pragma: no cover - jamais atteint
 
-    original = authorizer.authorize
-
-    async def _authorize(_upstream):
-        await original(_Upstream())
-
-    authorizer.authorize = _authorize
+    _patch_authorize_transport(monkeypatch, _handler)
 
     started = time.monotonic()
     with _authorize_client(authorizer) as client:

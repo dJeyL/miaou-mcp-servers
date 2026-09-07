@@ -199,6 +199,30 @@ pas encore, donc le port n'ouvre jamais, donc le clic ne peut pas aboutir).
 Le drapeau n'est levé que par `authorize()`, appelée depuis `/authorize/{name}`,
 port déjà ouvert.
 
+**Le parcours est PROVOQUÉ, jamais espéré comme effet de bord d'un `start()`.**
+`authorize()` se contentait de (re)démarrer l'upstream, en comptant sur le 401
+du handshake pour déclencher l'OAuth. Sur un upstream dont `initialize` — voire
+`tools/list` — passe sans jeton, aucune requête n'est refusée : `start()`
+réussit, le flow n'est jamais amorcé, et `authorize()` retourne sans rien avoir
+fait. On annonçait alors « autorisation accordée » alors qu'aucun jeton n'était
+écrit et qu'aucun appel ne partait vers l'AS (payé en production le 2026-09-07 :
+ni fichier de jetons, ni trace réseau, pour une page qui disait le contraire).
+
+`authorize()` émet donc une requête à elle sur l'URL de l'upstream, à travers un
+client httpx portant le provider en `auth`. Le 401 fait dérouler au SDK son
+chemin **nominal** — découverte des métadonnées, enregistrement si besoin,
+redirection, échange du code, écriture du jeton. Rien n'est réimplémenté :
+mener le flow à la main dupliquerait la moitié du SDK, et deux chemins
+d'autorisation divergeraient.
+
+**Le témoin d'un succès est le JETON**, jamais l'absence d'exception :
+`has_usable_token()` tranche après le parcours. Un upstream qui répond sans rien
+exiger n'a rien accordé — la route le dit (« Rien à autoriser »), au lieu de
+confirmer une autorisation qui n'a pas eu lieu. Quand le jeton est bien là,
+`authorize()` **rouvre la session** : celle en cours a été ouverte sans jeton,
+donc elle ne porte aucun en-tête `Authorization` et continuerait à se faire
+refuser.
+
 **Un upstream « pas encore autorisé » n'est PAS retiré de la table de routage**,
 contrairement à un upstream en panne. C'est l'unique exception à la règle du
 lifespan, et elle a sa raison : une panne ne se répare pas toute seule, une
