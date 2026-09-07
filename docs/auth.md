@@ -215,6 +215,27 @@ redirection, échange du code, écriture du jeton. Rien n'est réimplémenté :
 mener le flow à la main dupliquerait la moitié du SDK, et deux chemins
 d'autorisation divergeraient.
 
+**Cette requête doit aller jusqu'à `tools/call`** (`_provoke_refusal`), et c'est
+une mesure, pas une précaution : sur le déploiement d'entreprise qui a servi de
+banc (2026-09-07), `initialize` répond **200** et seul `tools/call` renvoie le
+401 porteur du `WWW-Authenticate`. Une requête d'amorçage arbitraire — un `ping`
+— n'était jamais refusée, donc aucun parcours ne démarrait et la route
+concluait « rien à autoriser ». Or `tools/call` ne s'envoie pas nu : le
+transport streamable-http exige un `Mcp-Session-Id` obtenu à `initialize` et
+rejoué ensuite, faute de quoi il est rejeté hors de toute question
+d'autorisation. La séquence complète est donc déroulée — `initialize`,
+`notifications/initialized`, `tools/call`.
+
+L'outil nommé est **inexistant à dessein** (`_AUTH_PROBE_TOOL`) : le refus
+d'autorisation précède la résolution du nom, et appeler un outil réel pour
+obtenir un jeton exécuterait une action que personne n'a demandée, sans garantie
+qu'elle soit sans effet de bord.
+
+`tests/live_auth_probe.py` (banc manuel, non collecté par pytest) pose la même
+question hors du proxy : ce qu'un upstream répond sans jeton, requête par
+requête. C'est lui qui a établi le 401 ci-dessus, après trois correctifs posés
+sur des suppositions — un banc d'abord, des correctifs ensuite.
+
 **Le témoin d'un succès est le JETON**, jamais l'absence d'exception :
 `has_usable_token()` tranche après le parcours. Un upstream qui répond sans rien
 exiger n'a rien accordé — la route le dit (« Rien à autoriser »), au lieu de

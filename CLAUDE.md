@@ -29,6 +29,7 @@ miaou-mcp-servers/
 ├── docs/                 # domaines détaillés, lus à la demande (voir index en fin de fichier)
 ├── tests/
 │   ├── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
+│   ├── live_auth_probe.py  # ce qu'un upstream répond SANS jeton (non collecté)
 │   ├── test_base.py
 │   ├── test_bench.py
 │   ├── test_weather.py
@@ -174,7 +175,9 @@ pytest tests/
 uv ci-dessus s'appuient dessus, la commande canonique n'a juste pas besoin du lock.
 
 Ce que chaque suite mocke (et pourquoi aucun test ne fait d'appel réseau réel), plus
-`tests/live_call.py` qui parle le vrai transport streamable-http : `docs/tests.md`.
+les deux bancs manuels — `tests/live_call.py`, qui parle le vrai transport
+streamable-http, et `tests/live_auth_probe.py`, qui mesure ce qu'un upstream
+répond sans jeton : `docs/tests.md`.
 
 ## Posture sécurité
 
@@ -294,8 +297,12 @@ lots — piège déjà payé côté MIAOU.
   d'appel (l'ordre contractuel dans `mcp_proxy.main()`, la copie assumée dans
   `tests/live_call.py`), le best-effort assumé.
 - **`docs/tests.md`** — ce que chaque suite mocke (aucun appel réseau réel, aucune
-  clef requise), l'isolation filesystem par `tmp_path`, et `tests/live_call.py` qui
-  parle le vrai transport streamable-http comme MIAOU (`-H/--header`, truststore).
+  clef requise), l'isolation filesystem par `tmp_path`, et les deux bancs manuels
+  non collectés : `tests/live_call.py`, qui parle le vrai transport
+  streamable-http comme MIAOU (`-H/--header`, truststore), et
+  `tests/live_auth_probe.py`, qui mesure ce qu'un upstream répond SANS jeton
+  (séquence complète avec `Mcp-Session-Id`, `--tool`/`--args`, et le filtre
+  `_looks_mutating` qui interdit d'appeler un outil d'écriture pour sonder).
 
 ## Règle d'or
 

@@ -659,8 +659,67 @@ async def test_authorize_lifts_the_flag_only_for_the_attempt(tmp_path, monkeypat
     _patch_authorize_transport(monkeypatch, _handler)
     await authorizer.authorize(_NoopUpstream())
 
-    assert seen == [True]
+    # `interactive` doit être vrai pour TOUTE la séquence : c'est le dernier
+    # appel (tools/call) qui est refusé sur un serveur d'entreprise, donc celui
+    # qui amorce le parcours. Sans session renvoyée par le serveur, la
+    # notification est sautée — d'où deux requêtes ici.
+    assert seen == [True, True]
     assert authorizer.interactive is False
+
+
+@pytest.mark.anyio
+async def test_the_probe_replays_the_session_and_ends_on_a_tool_call(tmp_path, monkeypatch):
+    """La séquence doit aller JUSQU'À `tools/call`, session rejouée.
+
+    Mesuré sur un déploiement d'entreprise : `initialize` répond 200 et seul
+    `tools/call` renvoie le 401 porteur du `WWW-Authenticate`. Une requête
+    d'amorçage arbitraire n'était donc jamais refusée, et aucun parcours ne
+    démarrait. Et `tools/call` ne s'envoie pas nu : sans `Mcp-Session-Id`, il
+    est rejeté hors de toute question d'autorisation."""
+    seen = []
+
+    def _handler(request):
+        import httpx
+
+        body = json.loads(request.content.decode())
+        seen.append((body.get("method"), request.headers.get("mcp-session-id")))
+        return httpx.Response(
+            200,
+            headers={"Mcp-Session-Id": "sess-42"},
+            json={"jsonrpc": "2.0", "id": 1, "result": {}},
+        )
+
+    authorizer = _authorizer(tmp_path, interactive=False)
+    _patch_authorize_transport(monkeypatch, _handler)
+    await authorizer.authorize(_NoopUpstream())
+
+    assert [m for m, _ in seen] == [
+        "initialize", "notifications/initialized", "tools/call",
+    ]
+    # La session obtenue à l'initialize est rejouée sur les suivantes.
+    assert [sid for _, sid in seen] == [None, "sess-42", "sess-42"]
+
+
+@pytest.mark.anyio
+async def test_the_probe_calls_a_tool_that_cannot_exist(tmp_path, monkeypatch):
+    """Le refus précède la résolution du nom, donc on n'appelle JAMAIS un outil
+    réel : obtenir un jeton ne doit pas exécuter une action non demandée."""
+    called = []
+
+    def _handler(request):
+        import httpx
+
+        body = json.loads(request.content.decode())
+        if body.get("method") == "tools/call":
+            called.append(body["params"]["name"])
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    authorizer = _authorizer(tmp_path, interactive=False)
+    _patch_authorize_transport(monkeypatch, _handler)
+    await authorizer.authorize(_NoopUpstream())
+
+    assert called == [mcp_proxy._AUTH_PROBE_TOOL]
+    assert "probe" in mcp_proxy._AUTH_PROBE_TOOL
 
 
 async def test_authorize_lowers_the_flag_even_on_failure(tmp_path, monkeypatch):

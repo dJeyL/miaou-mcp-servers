@@ -54,3 +54,36 @@ Le helper y est **recopié** plutôt qu'importé de `servers/mcp_base.py` — c'
 autonome, et l'import tirerait FastMCP et starlette pour quatre lignes ; le prix est une
 duplication à répercuter (cf. `docs/tls.md`).
 
+### `tests/live_auth_probe.py` — ce qu'un upstream répond SANS jeton
+
+Même statut que son voisin (PEP 723, non collecté), et une seule question : **cet upstream
+refuse-t-il quelque chose, et par quel canal ?** Tout le parcours OAuth sortant repose sur un
+401 porteur d'un `WWW-Authenticate` ; sans lui le SDK n'a aucun AS à découvrir et rien ne
+démarre. Le script pose la question hors du proxy, sans le SDK, sans rien qui puisse masquer
+la réponse : code HTTP et en-têtes d'authentification, requête par requête.
+
+```bash
+uv run tests/live_auth_probe.py https://jira.exemple/mcp
+uv run tests/live_auth_probe.py https://jira.exemple/mcp --tool jira_list_projects --args '{"results": 1}'
+uv run tests/live_auth_probe.py https://jira.exemple/mcp -H 'X-Tenant: acme'
+```
+
+Il déroule la vraie séquence — `initialize`, `notifications/initialized`, `tools/call` — en
+rejouant le `Mcp-Session-Id` : une requête hors session est rejetée pour une raison qui n'a
+rien à voir avec l'autorisation, et la mesure ne dirait rien (défaut de sa première version).
+**Aucun jeton n'est envoyé, rien n'est écrit** : lançable sur un serveur de production.
+
+Deux gardes sur le choix de l'outil appelé. `--tool` le désigne explicitement, ce qui vaut
+mieux derrière un proxy qui agrège : le premier outil de `tools/list` peut venir d'un AUTRE
+upstream, et le diagnostic porterait sur celui-là. À défaut, la découverte automatique écarte
+tout nom évoquant une **écriture** (`_looks_mutating`, comparaison par segments après
+découpage sur séparateurs et casse — `create_issue`, `createIssue`, `add-comment` sortent,
+`list_updates` reste) : sonder une autorisation ne doit jamais créer un ticket. Si tous les
+outils sont écartés, aucun appel n'est fait.
+
+C'est ce script qui a établi le 401 sur `tools/call` d'un Jira d'entreprise (2026-09-07),
+après **trois** correctifs posés sur des suppositions successives, tous publiés, aucun
+efficace — chacun corrigeait un défaut réel sans toucher la cause. La leçon tient en une
+ligne : sur un comportement distant qu'on ne peut pas reproduire, écrire le banc AVANT le
+correctif.
+

@@ -1720,6 +1720,24 @@ class PendingAuthorization:
 # Bornes du parcours interactif. L'attente d'un humain qui clique n'est pas du
 # réseau : cinq minutes est un ordre de grandeur d'attention, pas un timeout
 # technique.
+_MCP_PROTOCOL_VERSION = "2025-06-18"
+"""Version annoncée par la requête d'amorçage d'`UpstreamAuthorizer`.
+
+Ne concerne QUE cette poignée de requêtes : les sessions réelles sont ouvertes
+par le SDK, qui négocie sa propre version. Un serveur qui n'accepterait pas
+celle-ci répondrait une erreur de protocole — laquelle n'empêche pas le 401 de
+`tools/call`, seul événement recherché ici.
+"""
+
+_AUTH_PROBE_TOOL = "__miaou_authorization_probe__"
+"""Nom d'outil de la requête d'amorçage — INEXISTANT à dessein.
+
+Le refus d'autorisation précède la résolution du nom (mesuré sur un déploiement
+d'entreprise le 2026-09-07 : 401 sur `tools/call`, avant tout verdict sur
+l'outil demandé). Appeler un outil RÉEL pour obtenir un jeton exécuterait une
+action que personne n'a demandée, sans garantie qu'elle soit sans effet de bord.
+"""
+
 _AUTHORIZATION_WAIT_S = 300.0
 
 _AUTHORIZE_ROUTE_WAIT_S = 20.0
@@ -1878,6 +1896,68 @@ class UpstreamAuthorizer:
         finally:
             self.pending = None
 
+    async def _provoke_refusal(self, client: Any) -> None:
+        """Émet la séquence MCP jusqu'à obtenir le refus qui amorce l'OAuth.
+
+        `initialize` NE SUFFIT PAS, et c'est tout l'objet de cette méthode : sur
+        un déploiement d'entreprise (passerelle devant un Jira, mesuré le
+        2026-09-07), `initialize` répond 200 et seul `tools/call` renvoie le 401
+        porteur du `WWW-Authenticate`. Une requête d'amorçage arbitraire — un
+        `ping`, la version précédente — n'était donc jamais refusée, et aucun
+        parcours ne démarrait.
+
+        Or `tools/call` ne s'envoie pas nu : le transport streamable-http exige
+        un `Mcp-Session-Id` obtenu à `initialize` et rejoué ensuite. On déroule
+        donc la vraie séquence. Les réponses ne sont pas lues — httpx exécute le
+        flow d'authentification AVANT de nous rendre la main, et c'est ce
+        passage, pas le résultat, qui nous intéresse.
+
+        Le nom d'outil est sans importance : le refus d'autorisation précède la
+        résolution du nom. En inventer un est même préférable — appeler un outil
+        réel pour obtenir un jeton exécuterait une action non demandée, et rien
+        ne garantit qu'elle soit sans effet de bord.
+        """
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        }
+
+        response = await client.post(
+            self.server_url,
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": _MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "miaou-proxy", "version": "1"},
+                },
+            },
+        )
+
+        session_id = response.headers.get("mcp-session-id")
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+            # Le serveur attend la notification avant de servir la suite.
+            await client.post(
+                self.server_url,
+                headers=headers,
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            )
+
+        await client.post(
+            self.server_url,
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": _AUTH_PROBE_TOOL, "arguments": {}},
+            },
+        )
+
     async def authorize(self, upstream: Upstream) -> None:
         """Déroule le parcours interactif, puis (re)démarre l'upstream.
 
@@ -1914,14 +1994,7 @@ class UpstreamAuthorizer:
             async with httpx.AsyncClient(
                 auth=self.provider(), timeout=self.wait_timeout, follow_redirects=False
             ) as client:
-                # Le corps de la réponse n'a aucun intérêt : seul compte le
-                # passage par le flow d'authentification, que httpx exécute
-                # AVANT de nous rendre la main.
-                await client.post(
-                    self.server_url,
-                    json={"jsonrpc": "2.0", "id": 0, "method": "ping"},
-                    headers={"Accept": "application/json, text/event-stream"},
-                )
+                await self._provoke_refusal(client)
         except AuthorizationRequired:
             # Ne peut pas arriver ici (`interactive` est vrai), mais si le
             # parcours est inhibé pour une raison qu'on n'a pas prévue, ne
