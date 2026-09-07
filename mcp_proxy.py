@@ -2575,14 +2575,26 @@ def build_upstream_authorizers(
         storage = UpstreamTokenStorage(
             tokens_path, name, client_info_override=build_client_info_override(auth)
         )
+        # `auth.redirect_uri` gouverne l'URL RÉELLEMENT annoncée à l'AS, pas
+        # seulement celle déclarée au client pré-provisionné : les deux
+        # devaient déjà coïncider, et rien ne l'imposait. L'URL dérivée de
+        # l'adresse d'écoute (`http://127.0.0.1:port/callback`) reste le défaut,
+        # mais elle est refusée par les AS d'entreprise qui n'admettent ni le
+        # loopback ni le `http` en clair, ou qui exigent une URL déclarée
+        # d'avance — cas rencontré en production (WSO2) le 2026-09-07. C'est
+        # alors au déploiement de router cette URL vers `/callback` du proxy.
+        upstream_callback = auth.get("redirect_uri") or callback_url
         authorizer = UpstreamAuthorizer(
             name=name,
             server_url=srv["url"],
             storage=storage,
-            callback_url=callback_url,
+            callback_url=upstream_callback,
             scope=auth.get("scope"),
             open_browser=open_browser,
         )
+        if auth.get("redirect_uri"):
+            _log(f"  {name:<12} redirection OAuth : {upstream_callback} "
+                 f"(depuis la config)")
         authorizers[name] = authorizer
         upstream._auth = authorizer.provider()
     return authorizers

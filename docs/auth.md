@@ -254,6 +254,40 @@ question hors du proxy : ce qu'un upstream répond sans jeton, requête par
 requête. C'est lui qui a établi le 401 ci-dessus, après trois correctifs posés
 sur des suppositions — un banc d'abord, des correctifs ensuite.
 
+## Quand l'AS refuse la `redirect_uri` loopback
+
+`build_callback_url` dérive `http://127.0.0.1:<port>/callback` de l'adresse
+d'écoute. C'est la seule forme qu'un proxy local peut **servir** : le parcours
+revient sur une route qu'il expose lui-même, pas sur un listener éphémère.
+Beaucoup d'AS d'entreprise la refusent pourtant — loopback interdit, `http` en
+clair interdit, ou URL non déclarée dans le client OAuth (WSO2, rencontré en
+production le 2026-09-07).
+
+`auth.redirect_uri` **gouverne désormais l'URL réellement annoncée**, et plus
+seulement celle déclarée dans les credentials pré-provisionnés
+(`build_client_info_override`). Les deux devaient déjà coïncider et rien ne
+l'imposait : une divergence produisait un refus côté AS, loin de sa cause. Un
+test les compare maintenant sur la même configuration.
+
+Trois issues, par coût croissant, et **aucune n'est du code** :
+
+1. **Changer la forme du loopback** : `http://localhost:<port>/callback` plutôt
+   que `127.0.0.1`, ou l'inverse. Certains AS acceptent le nom et refusent l'IP
+   littérale. Une ligne de configuration, rien d'autre — c'est ce que
+   `auth.redirect_uri` rend possible.
+2. **Faire déclarer l'URL côté AS.** La RFC 8252 §7.3 demande à un AS d'accepter
+   le loopback pour un client natif, et d'en ignorer le port. Un refus signale
+   en général un client enregistré comme « web » plutôt que « public/native »,
+   ou une liste blanche incomplète. Se règle côté administration de l'AS.
+3. **Déposer un jeton obtenu ailleurs.** Le parcours interactif n'est pas la
+   seule voie : le fichier de jetons est un simple JSON, et un `access_token`
+   fourni par l'équipe qui administre le service y est relu tel quel. Une entrée
+   `{"<upstream>": {"tokens": {"access_token": "…", "token_type": "Bearer",
+   "expires_in": 3600}, "expires_at": <epoch>}}` suffit :
+   `has_usable_token()` la voit, l'upstream n'est plus marqué « à autoriser », et
+   aucun parcours n'est tenté. Sans `refresh_token`, il faudra le renouveler à
+   l'expiration — c'est le prix de cette voie, et il est explicite.
+
 ## `--debug-auth` : rendre le parcours observable
 
 Un parcours qui n'aboutit pas est **silencieux par construction** : le SDK avale

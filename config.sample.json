@@ -66,6 +66,7 @@
       "auth": {
         "scope": "mcp:read",
         "_comment_creds": "Facultatifs : client_id, client_secret, redirect_uri, token_endpoint_auth_method.",
+        "_comment_redirect": "redirect_uri : URL annoncée à l'AS. Défaut http://127.0.0.1:<port>/callback, dérivé de l'adresse d'écoute. À renseigner quand l'AS refuse le loopback en clair — le déploiement doit alors router cette URL vers /callback du proxy. Cf. docs/auth.md.",
         "client_id": "",
         "client_secret": ""
       }

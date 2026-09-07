@@ -1906,3 +1906,55 @@ def test_debug_mode_never_logs_a_token_value(monkeypatch, tmp_path, capsys):
     err = capsys.readouterr().err
     assert secret not in err
     assert "authorization" in err  # le NOM de l'en-tête, lui, est utile
+
+
+# ---------------------------------------------------------------------------
+# `auth.redirect_uri` gouverne l'URL réellement annoncée
+#
+# Elle existait dans la config et n'alimentait que `build_client_info_override`,
+# donc l'URL DÉCLARÉE au client pré-provisionné. Le parcours, lui, annonçait
+# l'URL dérivée de l'adresse d'écoute : les deux pouvaient se contredire en
+# silence. Un AS d'entreprise qui refuse le loopback en clair (WSO2, rencontré
+# en production) rejette alors la redirection sans que rien ne l'explique.
+# ---------------------------------------------------------------------------
+
+def _authorizers_for(auth_block, tmp_path):
+    cfg = {"mcpServers": {"jira": {
+        "url": "https://jira.test/mcp", "transport": "http", "auth": auth_block,
+    }}}
+    upstreams = {"jira": mcp_proxy.HttpUpstream("https://jira.test/mcp")}
+    return mcp_proxy.build_upstream_authorizers(
+        cfg, upstreams, tmp_path / "t.json", "http://127.0.0.1:8765/callback"
+    )
+
+
+def test_a_configured_redirect_uri_is_the_one_announced(tmp_path):
+    declared = "https://proxy.exemple.fr/callback"
+    authorizers = _authorizers_for({"redirect_uri": declared}, tmp_path)
+
+    assert authorizers["jira"].callback_url == declared
+
+
+def test_without_configuration_the_listening_address_still_wins(tmp_path):
+    """Le défaut ne bouge pas : un déploiement local n'a rien à déclarer."""
+    authorizers = _authorizers_for({}, tmp_path)
+
+    assert authorizers["jira"].callback_url == "http://127.0.0.1:8765/callback"
+
+
+@pytest.mark.anyio
+async def test_the_announced_and_declared_redirect_uris_agree(tmp_path):
+    """Les DEUX endroits doivent dire la même chose.
+
+    L'un est annoncé à l'AS dans la requête d'autorisation, l'autre déclaré
+    dans les credentials pré-provisionnés. Une divergence ne se voit nulle
+    part : elle produit un refus côté AS, loin de sa cause."""
+    declared = "https://proxy.exemple.fr/callback"
+    auth_block = {"client_id": "abc", "redirect_uri": declared}
+    authorizers = _authorizers_for(auth_block, tmp_path)
+
+    announced = authorizers["jira"].callback_url
+    client_info = await authorizers["jira"]._storage.get_client_info()
+
+    assert announced == declared
+    assert [str(u) for u in client_info.redirect_uris] == [declared]
