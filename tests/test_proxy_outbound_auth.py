@@ -1379,3 +1379,86 @@ def test_an_unknown_upstream_name_is_escaped():
 
     assert response.status_code == 404
     assert "<img src=x>" not in response.text
+
+
+# ---------------------------------------------------------------------------
+# Le parcours qui ABOUTIT SANS redirection (2026-09-07, seconde passe)
+#
+# Un `refresh_token` encore valide, ou un AS qui accorde sans interaction, et le
+# SDK obtient son jeton sans passer par `_on_redirect` — donc sans `pending`.
+# La route ne connaissait que « redirige » ou « échoue » : elle répondait « le
+# serveur d'autorisation n'a pas répondu à temps », en moins de deux secondes,
+# une ligne de log après « Upstream autorisé ».
+# ---------------------------------------------------------------------------
+
+class _SilentlyGrantedAuthorizer:
+    """`authorize()` réussit sans jamais rediriger."""
+
+    def __init__(self, name="jira"):
+        self.name = name
+        self.pending = None
+        self.last_error = None
+        self.last_authorization_url = None
+        self.authorization_pending = True
+        self.redirect_ready = None
+
+    async def authorize(self, upstream):
+        import anyio
+
+        await anyio.sleep(0.05)
+        self.authorization_pending = False   # ce que fait le vrai authorize()
+
+
+def test_a_flow_that_succeeds_without_redirecting_is_not_an_error():
+    with _authorize_client(_SilentlyGrantedAuthorizer()) as client:
+        response = client.get("/authorize/jira", follow_redirects=False)
+
+    assert response.status_code == 200
+    assert "autorisé" in response.text
+    assert "n'a pas répondu à temps" not in response.text
+
+
+def test_the_redirect_is_served_without_waiting_for_the_callback(tmp_path):
+    """`authorize()` bloque sur le retour du navigateur APRÈS avoir produit son
+    URL. La route doit répondre dès l'URL connue, pas à la fin du parcours —
+    sinon elle tient jusqu'à sa borne pour une redirection déjà décidée.
+
+    Le VRAI `UpstreamAuthorizer` est utilisé ici, pas un double : c'est
+    `_on_redirect` qui doit signaler l'événement, et un stub qui le signale à sa
+    place teste le stub. Un double avait justement masqué l'absence de ce
+    signal — la suite était verte sur un code où il manquait.
+
+    La borne est à 20 s ; le parcours n'aboutit jamais (il attend un callback
+    qui ne viendra pas), donc une route qui attendrait sa fin dépasserait
+    largement le seuil mesuré ici."""
+    import time
+
+    import anyio
+
+    authorizer = mcp_proxy.UpstreamAuthorizer(
+        "jira", "https://example.test/mcp",
+        UpstreamTokenStorage(tmp_path / "t.json", "jira"),
+        "http://127.0.0.1:8765/callback",
+    )
+
+    class _Upstream:
+        async def start(self):
+            # Ce que fait le SDK : il redirige, puis attend le callback.
+            await authorizer._on_redirect("https://as.test/authorize?state=s1")
+            await anyio.sleep(30)
+
+    original = authorizer.authorize
+
+    async def _authorize(_upstream):
+        await original(_Upstream())
+
+    authorizer.authorize = _authorize
+
+    started = time.monotonic()
+    with _authorize_client(authorizer) as client:
+        response = client.get("/authorize/jira", follow_redirects=False)
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://as.test/authorize?state=s1"
+    assert elapsed < 5, f"la route a attendu {elapsed:.1f}s au lieu de répondre"

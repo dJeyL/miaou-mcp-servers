@@ -1741,9 +1741,9 @@ class UpstreamAuthorizer:
         # Une autorisation a été RÉCLAMÉE par l'AS et pas encore accordée.
         #
         # Distinct de « pas de session » : un upstream peut très bien accepter
-        # `initialize` sans jeton et n'exiger l'autorisation qu'au premier
-        # `tools/call` — c'est le cas d'un Jira derrière un portail
-        # d'entreprise, observé en production. `_session` est alors POSÉE et
+        # `initialize` ET `tools/list` sans jeton, et n'exiger l'autorisation
+        # qu'au premier `tools/call` — c'est le cas d'un Jira derrière un
+        # portail d'entreprise, observé en production. `_session` est alors POSÉE et
         # `upstream_is_live` rend True, alors que l'upstream refusera tout
         # appel. Sans ce drapeau, les trois surfaces (listing `_meta`, refus
         # d'appel, rapport `status`) concluent toutes « il va bien ».
@@ -1757,6 +1757,12 @@ class UpstreamAuthorizer:
         # l'exploitant reclique indéfiniment sur un lien qui ne peut pas
         # réparer sa configuration.
         self.last_error: str | None = None
+        # Signalé dès qu'un parcours interactif a produit son URL de
+        # redirection, OU qu'il s'est terminé sans en produire. C'est ce que
+        # /authorize/{name} attend pour répondre : une attente sur ÉVÉNEMENT,
+        # jamais un délai fixe (cf. la route). None hors parcours — la route
+        # l'arme elle-même avant de lancer sa tâche.
+        self.redirect_ready: Any = None
         # Le parcours interactif est INHIBÉ par défaut, et c'est le point
         # important : le start() d'un upstream tourne dans le lifespan, AVANT
         # qu'uvicorn n'ouvre le port. Y attendre un clic sur /callback serait un
@@ -1777,12 +1783,20 @@ class UpstreamAuthorizer:
             # jeton manque. Le noter durablement est ce qui permet aux surfaces
             # de le dire sans avoir à re-provoquer l'échec.
             self.authorization_pending = True
+            if self.redirect_ready is not None:
+                self.redirect_ready.set()
             raise AuthorizationRequired(self.name)
 
         pending = PendingAuthorization(self.name, self.wait_timeout)
         pending.authorization_url = url
         pending.state = (parse_qs(urlparse(url).query).get("state") or [None])[0]
         self.pending = pending
+        # Signalé ICI, pas au retour d'`authorize()` : celle-ci bloque juste
+        # après, en attente du retour du navigateur sur /callback. Attendre sa
+        # fin ferait tenir la route jusqu'à sa borne alors que l'URL vers
+        # laquelle rediriger est déjà connue.
+        if self.redirect_ready is not None:
+            self.redirect_ready.set()
         for line in format_authorization_notice(self.name, url):
             print(line, file=sys.stderr, flush=True)
         if self.open_browser:
@@ -2022,30 +2036,56 @@ def build_authorize_route(
             await authorizer.redirect_ready.wait()
 
         url = authorizer.pending.authorization_url if authorizer.pending else None
-        if not url:
-            # `last_error` dit POURQUOI quand le parcours a déjà échoué (scope
-            # refusé, enregistrement rejeté). Sans elle, une erreur de
-            # configuration se présentait comme une panne réseau, et
-            # l'exploitant recliquait sur un lien qui ne pouvait pas la
-            # réparer.
-            detail = authorizer.last_error
-            message = (
-                f"Le parcours d'autorisation a échoué : <code>{escape(str(detail))}</code>"
-                if detail
-                else "Le serveur d'autorisation n'a pas répondu à temps. "
-                "Voir la sortie du proxy."
-            )
+        if url:
+            from starlette.responses import RedirectResponse
+
+            return RedirectResponse(url, status_code=302)
+
+        # TROISIÈME issue, et il faut la traiter AVANT de conclure à l'échec :
+        # le parcours peut ABOUTIR SANS jamais rediriger. Un `refresh_token`
+        # encore valide en stockage, ou un AS qui accorde sans interaction, et
+        # le SDK obtient son jeton sans passer par `_on_redirect` — donc sans
+        # `pending`. Tester la seule URL de redirection faisait alors répondre
+        # « le serveur d'autorisation n'a pas répondu à temps » une seconde
+        # après un « Upstream autorisé » dans le log : le contraire de ce qui
+        # venait de se passer. Payé en production le 2026-09-07.
+        #
+        # Le témoin est l'état de l'upstream, pas le chemin qu'il a emprunté
+        # pour y arriver : `authorize()` réussi pose `authorization_pending` à
+        # faux. Noter que `pending` est de toute façon remis à None par le
+        # `finally` d'`authorize()`, donc il ne pouvait rien dire d'un parcours
+        # terminé — même abouti par redirection.
+        if not authorizer.authorization_pending and authorizer.last_error is None:
             return HTMLResponse(
                 _CALLBACK_PAGE.format(
-                    cls="ko",
-                    title="Autorisation impossible",
-                    message=message,
-                ),
-                status_code=502,
+                    cls="ok",
+                    title="Autorisation accordée",
+                    message=(
+                        f"L'upstream <code>{escape(name)}</code> est autorisé. "
+                        f"Retourner à MIAOU et relancer la demande."
+                    ),
+                )
             )
-        from starlette.responses import RedirectResponse
 
-        return RedirectResponse(url, status_code=302)
+        # `last_error` dit POURQUOI quand le parcours a échoué (scope refusé,
+        # enregistrement rejeté). Sans elle, une erreur de configuration se
+        # présentait comme une panne réseau, et l'exploitant recliquait sur un
+        # lien qui ne pouvait pas la réparer.
+        detail = authorizer.last_error
+        message = (
+            f"Le parcours d'autorisation a échoué : <code>{escape(str(detail))}</code>"
+            if detail
+            else "Le serveur d'autorisation n'a pas répondu à temps. "
+            "Voir la sortie du proxy."
+        )
+        return HTMLResponse(
+            _CALLBACK_PAGE.format(
+                cls="ko",
+                title="Autorisation impossible",
+                message=message,
+            ),
+            status_code=502,
+        )
 
     return Route("/authorize/{name}", handle_authorize, methods=["GET"])
 

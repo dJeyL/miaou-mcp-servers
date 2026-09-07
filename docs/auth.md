@@ -209,8 +209,29 @@ autorisation manquante se répare par un clic — et retirer l'upstream rendrait
 La route lance le parcours en tâche détachée (la réponse doit partir avant que
 celui-ci n'attende le retour du navigateur sur `/callback`), puis attend
 `UpstreamAuthorizer.redirect_ready` — armé **avant** le `start_soon`, sans quoi
-un parcours rapide produirait son URL avant que l'attente n'existe, et signalé
-aussi bien par un redirect obtenu que par un parcours qui échoue.
+un parcours rapide produirait son URL avant que l'attente n'existe.
+
+**Trois signaleurs, et il faut les trois** — c'est la partie qui s'est révélée
+fragile. `_on_redirect` signale dans ses DEUX branches : en mode interactif dès
+que l'URL est connue (`authorize()` bloque juste après, sur le retour du
+navigateur — attendre sa fin ferait tenir la route jusqu'à sa borne pour une
+redirection déjà décidée), et en mode inhibé où il n'y aura jamais d'URL. Le
+`finally` de la tâche couvre le reste : échec, ou parcours terminé sans
+redirection.
+
+**La route distingue TROIS issues, pas deux.** Rediriger, avoir abouti, avoir
+échoué. Le troisième cas manquait et il n'est pas théorique : un `refresh_token`
+encore valide, ou un AS qui accorde sans interaction, et le SDK obtient son
+jeton sans jamais passer par `_on_redirect`, donc sans `pending`. Tester la
+seule URL de redirection faisait alors répondre « le serveur d'autorisation n'a
+pas répondu à temps » **une ligne de log après « Upstream autorisé »** — le
+contraire de ce qui venait de se passer (payé en production le 2026-09-07).
+
+Le témoin d'une autorisation acquise est l'état de l'upstream
+(`authorization_pending` faux, `last_error` nulle), **jamais le chemin emprunté
+pour y arriver** : `pending` est de toute façon remis à `None` par le `finally`
+d'`authorize()`, donc il ne peut rien dire d'un parcours terminé, fût-il abouti
+par redirection.
 
 Elle attendait auparavant un `sleep(0.1)` fixe, et c'est un bug payé en
 production : le parcours doit d'abord découvrir l'AS (`/.well-known/…`) et
