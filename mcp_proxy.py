@@ -2012,6 +2012,22 @@ class UpstreamAuthorizer:
     async def _on_redirect(self, url: str) -> None:
         from urllib.parse import parse_qs, urlparse
 
+        if _auth_debug_enabled():
+            # CE QUE L'AS REÇOIT, et non ce qu'on croit lui envoyer. Un refus de
+            # `redirect_uri` se règle en comparant CETTE valeur, caractère par
+            # caractère, à celle enregistrée dans le client OAuth — schéma,
+            # hôte, port et chemin compris. La lire ailleurs (config, log de
+            # démarrage) ne prouve rien : seule celle-ci part réellement.
+            query = parse_qs(urlparse(url).query)
+            _log(f"  [auth] {self.name} redirection vers l'AS :")
+            _log(f"  [auth]   endpoint     : {urlparse(url)._replace(query='').geturl()}")
+            for key in ("redirect_uri", "client_id", "scope", "response_type"):
+                value = (query.get(key) or [None])[0]
+                if value is not None:
+                    _log(f"  [auth]   {key:<12} : {value}")
+            _log(f"  [auth]   Comparer redirect_uri à celle enregistrée dans "
+                 f"le client OAuth de l'AS — l'égalité doit être EXACTE.")
+
         if not self.interactive:
             # Mémorisé pour que `status` puisse le rendre, mais on ne bloque
             # pas : le parcours s'arrête ici et l'upstream reste « connu mais

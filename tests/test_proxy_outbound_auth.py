@@ -1958,3 +1958,24 @@ async def test_the_announced_and_declared_redirect_uris_agree(tmp_path):
 
     assert announced == declared
     assert [str(u) for u in client_info.redirect_uris] == [declared]
+
+
+@pytest.mark.anyio
+async def test_debug_mode_shows_the_redirect_uri_actually_sent(tmp_path, monkeypatch, capsys):
+    """Ce que l'AS REÇOIT, pas ce qu'on croit lui envoyer.
+
+    Un refus de `redirect_uri` se règle en comparant cette valeur à celle
+    enregistrée dans le client OAuth ; la lire dans la config ne prouve rien,
+    seule celle-ci part réellement."""
+    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    authorizer = _authorizer(tmp_path, interactive=False)
+
+    with pytest.raises(mcp_proxy.AuthorizationRequired):
+        await authorizer._on_redirect(
+            "https://as.test/authorize?response_type=code&client_id=ABC"
+            "&redirect_uri=http%3A%2F%2Flocalhost%3A8765%2Fcallback&state=s1"
+        )
+
+    err = capsys.readouterr().err
+    assert "redirect_uri : http://localhost:8765/callback" in err
+    assert "client_id    : ABC" in err
