@@ -226,10 +226,28 @@ rejoué ensuite, faute de quoi il est rejeté hors de toute question
 d'autorisation. La séquence complète est donc déroulée — `initialize`,
 `notifications/initialized`, `tools/call`.
 
-L'outil nommé est **inexistant à dessein** (`_AUTH_PROBE_TOOL`) : le refus
-d'autorisation précède la résolution du nom, et appeler un outil réel pour
-obtenir un jeton exécuterait une action que personne n'a demandée, sans garantie
-qu'elle soit sans effet de bord.
+**L'outil nommé doit EXISTER**, et c'est contre-intuitif. Un premier jet
+appelait un nom inventé, sur la foi d'une mesure mal lue : un 401 obtenu sur
+`tools/call` semblait prouver que le refus d'autorisation précédait la
+résolution du nom. Il ne le prouvait pas — cette mesure portait sur un outil
+réel. Reprise avec un nom inventé, elle rend `403 No matching resource found in
+the API` : la passerelle (WSO2) route par ressource et rejette un nom inconnu
+**avant** toute question d'autorisation. Un nom inventé n'y amorce donc jamais
+rien.
+
+La séquence lit donc `tools/list` et choisit un outil **réel** — mais en
+**lecture seule** (`_pick_probe_tool` / `_looks_mutating`) : obtenir un jeton ne
+doit pas créer un ticket ni envoyer un message. Les verbes d'écriture sont
+comparés par segments après découpage sur séparateurs et casse, si bien que
+`create_issue`, `createIssue` et `add-comment` sont écartés quand `list_updates`
+reste. Aucun candidat sûr → on garde le nom de repli (`_AUTH_PROBE_TOOL`) :
+une sonde qui échoue vaut mieux qu'une sonde qui écrit, et sur un serveur qui
+refuse avant de résoudre, elle fonctionne.
+
+La liste de verbes est **dupliquée** dans `tests/live_auth_probe.py`, script
+autonome (PEP 723) que l'import du proxy alourdirait — même arbitrage que le
+helper TLS de `live_call.py`, avec le même prix : toute évolution est à
+répercuter.
 
 `tests/live_auth_probe.py` (banc manuel, non collecté par pytest) pose la même
 question hors du proxy : ce qu'un upstream répond sans jeton, requête par

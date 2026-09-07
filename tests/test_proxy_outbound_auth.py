@@ -662,8 +662,9 @@ async def test_authorize_lifts_the_flag_only_for_the_attempt(tmp_path, monkeypat
     # `interactive` doit être vrai pour TOUTE la séquence : c'est le dernier
     # appel (tools/call) qui est refusé sur un serveur d'entreprise, donc celui
     # qui amorce le parcours. Sans session renvoyée par le serveur, la
-    # notification est sautée — d'où deux requêtes ici.
-    assert seen == [True, True]
+    # notification est sautée — d'où trois requêtes ici (initialize,
+    # tools/list, tools/call).
+    assert seen == [True, True, True]
     assert authorizer.interactive is False
 
 
@@ -694,32 +695,96 @@ async def test_the_probe_replays_the_session_and_ends_on_a_tool_call(tmp_path, m
     await authorizer.authorize(_NoopUpstream())
 
     assert [m for m, _ in seen] == [
-        "initialize", "notifications/initialized", "tools/call",
+        "initialize", "notifications/initialized", "tools/list", "tools/call",
     ]
     # La session obtenue à l'initialize est rejouée sur les suivantes.
-    assert [sid for _, sid in seen] == [None, "sess-42", "sess-42"]
+    assert [sid for _, sid in seen] == [None, "sess-42", "sess-42", "sess-42"]
 
 
-@pytest.mark.anyio
-async def test_the_probe_calls_a_tool_that_cannot_exist(tmp_path, monkeypatch):
-    """Le refus précède la résolution du nom, donc on n'appelle JAMAIS un outil
-    réel : obtenir un jeton ne doit pas exécuter une action non demandée."""
-    called = []
+def _tools_list_response(names):
+    """Réponse `tools/list` au format SSE de ce transport."""
+    import httpx
 
+    tools = ", ".join(
+        f'{{"name":"{n}","description":"","inputSchema":{{}}}}' for n in names
+    )
+    return httpx.Response(
+        200,
+        text=f'event: message\ndata: {{"jsonrpc":"2.0","id":2,'
+             f'"result":{{"tools":[{tools}]}}}}\n\n',
+    )
+
+
+def _probe_handler(names, called, session="S1"):
+    """Serveur qui liste `names` et note l'outil appelé."""
     def _handler(request):
         import httpx
 
         body = json.loads(request.content.decode())
-        if body.get("method") == "tools/call":
+        method = body.get("method")
+        if method == "tools/list":
+            return _tools_list_response(names)
+        if method == "tools/call":
             called.append(body["params"]["name"])
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 3, "result": {}})
+        return httpx.Response(
+            200, headers={"Mcp-Session-Id": session},
+            json={"jsonrpc": "2.0", "id": 1, "result": {}},
+        )
 
+    return _handler
+
+
+@pytest.mark.anyio
+async def test_the_probe_calls_a_real_read_only_tool(tmp_path, monkeypatch):
+    """Une passerelle qui route par ressource (WSO2, mesuré le 2026-09-07)
+    rejette un nom d'outil INCONNU avant d'évaluer l'autorisation : elle rend
+    `403 No matching resource found in the API` là où un outil réel obtient le
+    401 recherché. La sonde doit donc nommer un outil qui existe."""
+    called = []
     authorizer = _authorizer(tmp_path, interactive=False)
-    _patch_authorize_transport(monkeypatch, _handler)
+    _patch_authorize_transport(
+        monkeypatch, _probe_handler(["jira_list_projects"], called)
+    )
+    await authorizer.authorize(_NoopUpstream())
+
+    assert called == ["jira_list_projects"]
+
+
+@pytest.mark.anyio
+async def test_the_probe_never_calls_a_tool_that_writes(tmp_path, monkeypatch):
+    """Obtenir un jeton ne doit pas créer un ticket. Les outils d'écriture sont
+    écartés même s'ils viennent en premier dans la liste."""
+    called = []
+    authorizer = _authorizer(tmp_path, interactive=False)
+    _patch_authorize_transport(monkeypatch, _probe_handler(
+        ["jira_create_issue", "jira_add_comment", "jira_search"], called
+    ))
+    await authorizer.authorize(_NoopUpstream())
+
+    assert called == ["jira_search"]
+
+
+@pytest.mark.anyio
+async def test_the_probe_falls_back_when_every_tool_writes(tmp_path, monkeypatch):
+    """Aucun candidat sûr : on garde le nom de repli plutôt que d'appeler un
+    outil qui écrit. Une sonde qui échoue vaut mieux qu'une sonde qui agit."""
+    called = []
+    authorizer = _authorizer(tmp_path, interactive=False)
+    _patch_authorize_transport(
+        monkeypatch, _probe_handler(["jira_create_issue", "jira_delete"], called)
+    )
     await authorizer.authorize(_NoopUpstream())
 
     assert called == [mcp_proxy._AUTH_PROBE_TOOL]
-    assert "probe" in mcp_proxy._AUTH_PROBE_TOOL
+
+
+def test_pick_probe_tool_reads_names_and_skips_writers():
+    body = ('data: {"result":{"tools":[{"name":"add_item"},'
+            '{"name":"list_updates"},{"name":"get_page"}]}}')
+    assert mcp_proxy._pick_probe_tool(body) == "list_updates"
+    assert mcp_proxy._pick_probe_tool("") is None
+    assert mcp_proxy._pick_probe_tool('{"name":"createIssue"}') is None
 
 
 async def test_authorize_lowers_the_flag_even_on_failure(tmp_path, monkeypatch):
@@ -1761,5 +1826,83 @@ async def test_debug_mode_names_the_absence_of_a_refusal(tmp_path, monkeypatch, 
         await authorizer._provoke_refusal(client)
 
     err = capsys.readouterr().err
-    assert "AUCUN 401" in err
+    assert "VERDICT" in err
     assert "tools/call -> HTTP 200" in err
+
+
+def _probe_verdict(monkeypatch, tmp_path, capsys, handler):
+    """Déroule la sonde en mode debug et rend ce qui a été journalisé."""
+    import anyio
+    import httpx
+
+    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    authorizer = _authorizer(tmp_path, interactive=True)
+    _patch_authorize_transport(monkeypatch, handler)
+
+    async def _run():
+        async with httpx.AsyncClient() as client:
+            await authorizer._provoke_refusal(client)
+
+    anyio.run(_run)
+    return capsys.readouterr().err
+
+
+def test_debug_mode_separates_a_bare_401_from_a_usable_one(monkeypatch, tmp_path, capsys):
+    """Un 401 sans `www-authenticate` ne donne au client AUCUN serveur
+    d'autorisation à découvrir : les deux cas ne se corrigent pas au même
+    endroit, donc ils ne doivent pas se lire pareil."""
+    def _bare(request):
+        import httpx
+
+        if b"tools/call" in (request.content or b""):
+            return httpx.Response(401)
+        return httpx.Response(200, headers={"Mcp-Session-Id": "S1"},
+                              json={"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    err = _probe_verdict(monkeypatch, tmp_path, capsys, _bare)
+    assert "SANS www-authenticate" in err
+
+
+def test_debug_mode_flags_a_403_that_carried_a_token(monkeypatch, tmp_path, capsys):
+    """403 AVEC jeton envoyé et 403 sans ne mènent pas au même diagnostic : le
+    premier accuse le jeton, le second la requête elle-même."""
+    def _forbidden(request):
+        import httpx
+
+        if b"tools/call" in (request.content or b""):
+            return httpx.Response(403, text="Forbidden")
+        return httpx.Response(200, headers={"Mcp-Session-Id": "S1"},
+                              json={"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    err = _probe_verdict(monkeypatch, tmp_path, capsys, _forbidden)
+    assert "403 sans jeton envoyé" in err
+    assert "passerelle" in err
+
+
+def test_debug_mode_never_logs_a_token_value(monkeypatch, tmp_path, capsys):
+    """Le mode debug nomme les en-têtes, jamais leurs valeurs."""
+    secret = "SUPERSECRETTOKENVALUE"
+
+    def _with_token(request):
+        import httpx
+
+        return httpx.Response(200, headers={"Mcp-Session-Id": "S1"},
+                              json={"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    authorizer = _authorizer(tmp_path, interactive=True)
+    _patch_authorize_transport(monkeypatch, _with_token)
+
+    import anyio
+    import httpx
+
+    async def _run():
+        async with httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {secret}"}
+        ) as client:
+            await authorizer._provoke_refusal(client)
+
+    anyio.run(_run)
+    err = capsys.readouterr().err
+    assert secret not in err
+    assert "authorization" in err  # le NOM de l'en-tête, lui, est utile

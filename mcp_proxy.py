@@ -1801,7 +1801,13 @@ def enable_auth_debug() -> None:
     handler.setFormatter(logging.Formatter("DEBUG:    %(name)s %(message)s"))
     handler.addFilter(_RedactingFilter())
 
-    for name in ("mcp.client.auth", "httpx", "httpcore.http11"):
+    # `httpcore` est volontairement ABSENT : ses lignes ne portent ni URL ni
+    # en-tête (`send_request_headers.started request=<Request [b'POST']>`), donc
+    # elles noient le journal sans rien apprendre — mesuré, pas supposé. Seul
+    # `mcp.client.auth` dit quelque chose d'exploitable ; le reste du diagnostic
+    # vient des traces explicites du proxy, qui, elles, nomment ce qu'elles
+    # observent.
+    for name in ("mcp.client.auth", "httpx"):
         logger = logging.getLogger(name)
         logger.setLevel(logging.DEBUG)
         logger.addHandler(handler)
@@ -1824,13 +1830,72 @@ celle-ci répondrait une erreur de protocole — laquelle n'empêche pas le 401 
 """
 
 _AUTH_PROBE_TOOL = "__miaou_authorization_probe__"
-"""Nom d'outil de la requête d'amorçage — INEXISTANT à dessein.
+"""Nom d'outil de repli, quand `tools/list` n'apprend rien.
 
-Le refus d'autorisation précède la résolution du nom (mesuré sur un déploiement
-d'entreprise le 2026-09-07 : 401 sur `tools/call`, avant tout verdict sur
-l'outil demandé). Appeler un outil RÉEL pour obtenir un jeton exécuterait une
-action que personne n'a demandée, sans garantie qu'elle soit sans effet de bord.
+**Ce n'est PAS le choix par défaut, et l'histoire vaut d'être connue.** Il l'a
+été, sur la foi d'une mesure mal lue : un 401 obtenu sur `tools/call` semblait
+prouver que le refus d'autorisation précédait la résolution du nom. Il ne le
+prouvait pas — cette mesure portait sur un outil qui EXISTE. Reprise avec ce
+nom-ci, elle rend `403 No matching resource found in the API` : la passerelle
+(WSO2) route par ressource et rejette un nom inconnu **avant** toute question
+d'autorisation. Un nom inventé ne peut donc jamais amorcer le parcours là-bas.
+
+On préfère un outil réel, choisi en lecture seule (cf. `_pick_probe_tool`). Ce
+repli ne sert que si aucun n'est trouvable, où il vaut mieux qu'une requête non
+émise : sur un serveur qui, lui, refuse avant de résoudre, il fonctionne.
 """
+
+# Verbes trahissant un outil à EFFET DE BORD. La sonde d'autorisation en appelle
+# un pour se faire refuser : ce doit être une LECTURE. Un faux positif ne coûte
+# qu'un candidat écarté ; un faux négatif crée un ticket ou envoie un message.
+#
+# Liste dupliquée dans `tests/live_auth_probe.py`, qui est un script autonome
+# (bloc PEP 723) : l'importer d'ici y tirerait tout le proxy. Même arbitrage que
+# le helper TLS de `live_call.py` — toute évolution est à répercuter.
+_MUTATING_HINTS = (
+    "add", "append", "archive", "assign", "cancel", "clear", "close", "comment",
+    "create", "delete", "destroy", "edit", "insert", "move", "patch", "post",
+    "publish", "purge", "push", "put", "remove", "rename", "replace", "reset",
+    "restore", "run", "send", "set", "start", "stop", "submit", "transition",
+    "trigger", "update", "upload", "write",
+)
+
+
+def _looks_mutating(name: str) -> bool:
+    """Le nom d'outil évoque-t-il une écriture ?
+
+    Découpage sur les séparateurs usuels (`__`, `_`, `-`, `.`) plus les
+    frontières de casse, pour attraper `createIssue` comme `create_issue` ou
+    `jira__add-comment`. On compare des SEGMENTS, jamais des sous-chaînes :
+    `update` doit écarter `update_issue` sans écarter `list_updates`.
+    """
+    import re
+
+    segments = re.split(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])", name)
+    return any(seg.lower() in _MUTATING_HINTS for seg in segments if seg)
+
+
+def _pick_probe_tool(listed_body: str) -> str | None:
+    """Un outil RÉEL et en lecture seule dans une réponse `tools/list`.
+
+    Réel parce qu'une passerelle qui route par ressource rejette un nom inconnu
+    avant d'évaluer l'autorisation ; en lecture seule parce qu'obtenir un jeton
+    ne doit pas exécuter une action que personne n'a demandée. Aucun candidat
+    sûr → `None`, et l'appelant garde son repli : mieux vaut une sonde qui
+    échoue qu'une sonde qui écrit.
+
+    Le corps est lu en texte plutôt que parsé : `tools/list` arrive en SSE
+    (`event: message\ndata: {...}`) sur ce transport, et on ne cherche qu'une
+    liste de noms.
+    """
+    import re
+
+    if not listed_body:
+        return None
+    for name in re.findall(r'"name"\s*:\s*"([^"]+)"', listed_body):
+        if not _looks_mutating(name):
+            return name
+    return None
 
 _AUTHORIZATION_WAIT_S = 300.0
 
@@ -2017,17 +2082,41 @@ class UpstreamAuthorizer:
         }
 
         def _trace(step: str, response: Any) -> None:
-            """Ce que l'étape a VRAIMENT obtenu.
+            """Ce que l'étape a VRAIMENT envoyé et obtenu.
 
-            Le seul endroit d'où l'on peut voir qu'un upstream ne refuse
-            jamais rien — le cas où aucun parcours ne démarre, et qui ne
-            laissait aucune trace.
+            Les en-têtes de la REQUÊTE en font partie, et c'est le point : les
+            loggers de `httpcore` ne les montrent pas (`send_request_headers.
+            started request=<Request [b'POST']>`, mesuré), donc ils sont
+            invisibles sans ça. Or la seule différence possible entre une
+            requête du proxy et celle d'un banc externe qui obtient, lui, un
+            résultat différent, se trouve là — au premier rang, l'en-tête
+            `Authorization` que le provider OAuth ajoute quand il croit détenir
+            un jeton, et qui fait répondre 403 là où l'absence de jeton donne
+            401.
+
+            Les valeurs ne sont JAMAIS journalisées : seuls les noms d'en-tête,
+            plus la forme du jeton (son schéma et sa longueur) quand il y en a
+            un. C'est assez pour conclure, et ça ne fuite rien.
             """
             if not _auth_debug_enabled():
                 return
+            sent = response.request.headers
+            names = ", ".join(sorted(k.lower() for k in sent.keys()))
+            _log(f"  [auth] {self.name} {step} -> HTTP {response.status_code}")
+            _log(f"  [auth]   URL demandée : {_redact_url(response.request.url)}")
+            _log(f"  [auth]   en-têtes envoyés : {names}")
+            authorization = sent.get("authorization")
+            if authorization:
+                scheme, _, value = authorization.partition(" ")
+                _log(f"  [auth]   ATTENTION : Authorization envoyé "
+                     f"({scheme}, {len(value)} caractères) — un jeton refusé "
+                     f"donne 403 là où l'absence de jeton donne 401.")
             challenge = response.headers.get("www-authenticate")
-            detail = f" www-authenticate: {challenge}" if challenge else ""
-            _log(f"  [auth] {self.name} {step} -> HTTP {response.status_code}{detail}")
+            if challenge:
+                _log(f"  [auth]   www-authenticate : {challenge}")
+            body = (response.text or "").strip()
+            if response.status_code >= 400 and body:
+                _log(f"  [auth]   corps : {body[:200]}")
 
         response = await client.post(
             self.server_url,
@@ -2058,20 +2147,73 @@ class UpstreamAuthorizer:
             _log(f"  [auth] {self.name} initialize n'a renvoyé aucun "
                  f"Mcp-Session-Id — tools/call partira sans session.")
 
+        # `tools/list` d'abord : il faut le NOM d'un outil réel. Une passerelle
+        # qui route par ressource (WSO2, mesuré) rejette un nom inconnu avant
+        # d'évaluer l'autorisation, donc un nom inventé n'obtient jamais le 401
+        # qu'on cherche — il obtient un 403 de routage.
+        listed = await client.post(
+            self.server_url,
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+        _trace("tools/list", listed)
+
+        probe_tool = _pick_probe_tool(listed.text or "") or _AUTH_PROBE_TOOL
+        if _auth_debug_enabled():
+            origin = ("lu dans tools/list" if probe_tool != _AUTH_PROBE_TOOL
+                      else "REPLI — aucun outil de lecture trouvé")
+            _log(f"  [auth]   outil de sonde : {probe_tool} ({origin})")
+
         response = await client.post(
             self.server_url,
             headers=headers,
             json={
                 "jsonrpc": "2.0",
-                "id": 2,
+                "id": 3,
                 "method": "tools/call",
-                "params": {"name": _AUTH_PROBE_TOOL, "arguments": {}},
+                "params": {"name": probe_tool, "arguments": {}},
             },
         )
         _trace("tools/call", response)
-        if _auth_debug_enabled() and response.status_code != 401:
-            _log(f"  [auth] {self.name} : AUCUN 401 sur tools/call — aucun "
-                 f"parcours OAuth ne peut s'amorcer par ce chemin.")
+        if _auth_debug_enabled():
+            self._explain_probe_outcome(response)
+
+    def _explain_probe_outcome(self, response: Any) -> None:
+        """Conclut, plutôt que de laisser conclure.
+
+        Ce mode s'utilise sur un poste distant, souvent sans copier-coller
+        possible : un journal qu'il faut recopier à la main pour être interprété
+        ailleurs n'est pas un outil de diagnostic. On nomme donc le cas observé
+        ET l'action qui en découle.
+        """
+        status = response.status_code
+        if status == 401:
+            if response.headers.get("www-authenticate"):
+                _log(f"  [auth] {self.name} : VERDICT — refus exploitable, le "
+                     f"parcours OAuth peut s'amorcer.")
+            else:
+                _log(f"  [auth] {self.name} : VERDICT — 401 SANS "
+                     f"www-authenticate. Le client n'a aucun serveur "
+                     f"d'autorisation à découvrir ; à corriger côté serveur.")
+            return
+
+        if status == 403 and response.request.headers.get("authorization"):
+            _log(f"  [auth] {self.name} : VERDICT — 403 alors qu'un jeton a été "
+                 f"envoyé. Ce jeton est refusé (expiré, scopes insuffisants, "
+                 f"mauvais public). Le supprimer du fichier de jetons force un "
+                 f"parcours neuf ; s'il revient, le refus est côté droits.")
+            return
+
+        if status == 403:
+            _log(f"  [auth] {self.name} : VERDICT — 403 sans jeton envoyé. Ce "
+                 f"n'est pas une autorisation manquante au sens OAuth : une "
+                 f"passerelle ou le serveur refuse la requête elle-même. "
+                 f"Comparer avec `tests/live_auth_probe.py`, qui pose la même "
+                 f"question depuis un autre poste.")
+            return
+
+        _log(f"  [auth] {self.name} : VERDICT — ni 401 ni 403 (HTTP {status}). "
+             f"Rien à quoi accrocher un parcours OAuth par ce chemin.")
 
     async def authorize(self, upstream: Upstream) -> None:
         """Déroule le parcours interactif, puis (re)démarre l'upstream.
