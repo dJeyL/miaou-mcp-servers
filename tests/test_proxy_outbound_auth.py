@@ -1710,3 +1710,56 @@ async def test_calling_without_a_session_raises_the_stored_cause():
 
     with pytest.raises(mcp_proxy.AuthorizationRequired):
         await upstream.call_tool("search", {})
+
+
+# ---------------------------------------------------------------------------
+# Mode debug du parcours (--debug-auth)
+# ---------------------------------------------------------------------------
+
+def test_redaction_hides_secrets_and_keeps_what_diagnoses():
+    """Un log d'OAuth qui fuite un jeton serait pire que pas de log. Mais
+    masquer `state` rendrait le log inutile : c'est lui qui corrèle un
+    callback à son parcours."""
+    redacted = mcp_proxy._redact_url(
+        "https://as.test/cb?code=AUTHCODE&state=s1&access_token=LEAK"
+        "&code_challenge=xyz"
+    )
+    assert "AUTHCODE" not in redacted
+    assert "LEAK" not in redacted
+    assert "state=s1" in redacted
+    assert "code_challenge=xyz" in redacted
+
+
+def test_redaction_leaves_a_url_without_query_alone():
+    url = "https://jira.test/mcp"
+    assert mcp_proxy._redact_url(url) == url
+
+
+def test_redaction_is_readable():
+    """`***` et non `%2A%2A%2A` : un log illisible ne se lit pas."""
+    assert "***" in mcp_proxy._redact_url("https://as.test/t?code=x")
+
+
+@pytest.mark.anyio
+async def test_debug_mode_names_the_absence_of_a_refusal(tmp_path, monkeypatch, capsys):
+    """LE cas que le mode debug existe pour rendre visible : un upstream qui ne
+    refuse rien, donc aucun parcours possible — trois causes distinctes se
+    présentaient jusque-là sous le même symptôme muet."""
+    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+
+    def _never_refuses(request):
+        import httpx
+
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    authorizer = _authorizer(tmp_path, interactive=True)
+    _patch_authorize_transport(monkeypatch, _never_refuses)
+
+    import httpx
+
+    async with httpx.AsyncClient() as client:
+        await authorizer._provoke_refusal(client)
+
+    err = capsys.readouterr().err
+    assert "AUCUN 401" in err
+    assert "tools/call -> HTTP 200" in err

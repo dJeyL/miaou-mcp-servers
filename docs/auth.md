@@ -236,6 +236,29 @@ question hors du proxy : ce qu'un upstream répond sans jeton, requête par
 requête. C'est lui qui a établi le 401 ci-dessus, après trois correctifs posés
 sur des suppositions — un banc d'abord, des correctifs ensuite.
 
+## `--debug-auth` : rendre le parcours observable
+
+Un parcours qui n'aboutit pas est **silencieux par construction** : le SDK avale
+ses propres erreurs de découverte, et le proxy ne constate qu'une absence de
+jeton. « L'upstream n'a rien demandé », « l'AS a refusé l'enregistrement » et
+« la découverte a échoué » produisent alors le même symptôme muet — trois causes,
+un seul signal, et le diagnostic se fait au jugé. C'est très exactement ce qui a
+coûté plusieurs correctifs posés à l'aveugle.
+
+`enable_auth_debug()` branche les loggers du SDK (`mcp.client.auth`) et du
+transport (`httpx`, `httpcore.http11`) plutôt qu'un traçage maison : ce sont eux
+qui voient les requêtes que le proxy **n'émet pas lui-même** — découverte,
+enregistrement, échange du code. S'y ajoute une trace explicite par étape de
+`_provoke_refusal`, dont la ligne qui manquait le plus : « AUCUN 401 sur
+tools/call », qui nomme le cas où aucun parcours ne peut s'amorcer.
+
+**Les valeurs sensibles sont masquées** (`_redact_url`, filtre de logging) :
+`code`, `access_token`, `refresh_token`, `client_secret`, `code_verifier`…
+masqués par NOM, une valeur opaque ne se reconnaissant pas à sa forme. `state` et
+`code_challenge` sont **conservés** — ils ne donnent aucun accès, et ce sont eux
+qu'on lit pour corréler un callback à son parcours. Le masque est écrit `***` et
+non `%2A%2A%2A` : un log illisible ne se lit pas.
+
 **Le témoin d'un succès est le JETON**, jamais l'absence d'exception :
 `has_usable_token()` tranche après le parcours. Un upstream qui répond sans rien
 exiger n'a rien accordé — la route le dit (« Rien à autoriser »), au lieu de

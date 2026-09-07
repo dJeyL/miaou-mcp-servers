@@ -1720,6 +1720,100 @@ class PendingAuthorization:
 # Bornes du parcours interactif. L'attente d'un humain qui clique n'est pas du
 # réseau : cinq minutes est un ordre de grandeur d'attention, pas un timeout
 # technique.
+# Paramètres de requête qui ne doivent JAMAIS atteindre un log : le mode debug
+# sert à diagnostiquer un parcours, pas à exposer ce qu'il transporte. Masqué
+# par NOM plutôt que par forme — une valeur opaque ne se reconnaît pas.
+_SENSITIVE_QUERY_KEYS = (
+    "code", "access_token", "refresh_token", "id_token", "client_secret",
+    "code_verifier", "assertion", "password",
+)
+
+
+def _redact_url(url: Any) -> str:
+    """URL lisible, valeurs sensibles remplacées.
+
+    `state` et `code_challenge` sont CONSERVÉS : ils ne donnent aucun accès et
+    ce sont eux qu'on lit pour comprendre un parcours (corrélation d'un
+    callback, présence de PKCE).
+    """
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(str(url))
+    except Exception:  # pragma: no cover - une URL illisible se log telle quelle
+        return str(url)
+    if not parts.query:
+        return str(url)
+    pairs = [
+        (k, "***" if k.lower() in _SENSITIVE_QUERY_KEYS else v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+    ]
+    # `safe="*"` : sans lui le masque ressort en %2A%2A%2A, illisible pour qui
+    # lit un log en diagonale — et un log qu'on ne lit pas ne sert à rien.
+    return urlunsplit(parts._replace(query=urlencode(pairs, safe="*")))
+
+
+_AUTH_DEBUG = False
+
+
+def _auth_debug_enabled() -> bool:
+    return _AUTH_DEBUG
+
+
+def enable_auth_debug() -> None:
+    """Rend le parcours OAuth sortant observable (option `--debug-auth`).
+
+    Un parcours qui n'aboutit pas est SILENCIEUX par construction : le SDK
+    avale ses propres erreurs de découverte, et le proxy ne voit qu'une absence
+    de jeton. Impossible alors de distinguer « l'upstream n'a rien demandé » de
+    « l'AS a refusé l'enregistrement » ou de « la découverte a échoué » — trois
+    causes, un seul symptôme, et le diagnostic se fait au jugé. Ce mode expose
+    les requêtes réellement émises, seule information qui les sépare.
+
+    Branché sur les loggers du SDK MCP et de httpx plutôt que sur un traçage
+    maison : ce sont eux qui voient les requêtes, y compris celles que le proxy
+    n'émet pas lui-même (découverte, enregistrement, échange de jeton).
+    """
+    import logging
+
+    class _RedactingFilter(logging.Filter):
+        """Masque les valeurs sensibles des URL présentes dans un message."""
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                message = record.getMessage()
+            except Exception:  # pragma: no cover
+                return True
+            if "?" in message and any(
+                k in message for k in _SENSITIVE_QUERY_KEYS
+            ):
+                import re
+
+                record.msg = re.sub(
+                    r"(https?://\S+)",
+                    lambda m: _redact_url(m.group(1)),
+                    message,
+                )
+                record.args = ()
+            return True
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("DEBUG:    %(name)s %(message)s"))
+    handler.addFilter(_RedactingFilter())
+
+    for name in ("mcp.client.auth", "httpx", "httpcore.http11"):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+        logger.propagate = False
+
+    global _AUTH_DEBUG
+    _AUTH_DEBUG = True
+
+    _log("Mode debug du parcours OAuth actif (--debug-auth).")
+    _log("  Les jetons et codes d'autorisation sont masqués dans ces traces.")
+
+
 _MCP_PROTOCOL_VERSION = "2025-06-18"
 """Version annoncée par la requête d'amorçage d'`UpstreamAuthorizer`.
 
@@ -1922,6 +2016,19 @@ class UpstreamAuthorizer:
             "Content-Type": "application/json",
         }
 
+        def _trace(step: str, response: Any) -> None:
+            """Ce que l'étape a VRAIMENT obtenu.
+
+            Le seul endroit d'où l'on peut voir qu'un upstream ne refuse
+            jamais rien — le cas où aucun parcours ne démarre, et qui ne
+            laissait aucune trace.
+            """
+            if not _auth_debug_enabled():
+                return
+            challenge = response.headers.get("www-authenticate")
+            detail = f" www-authenticate: {challenge}" if challenge else ""
+            _log(f"  [auth] {self.name} {step} -> HTTP {response.status_code}{detail}")
+
         response = await client.post(
             self.server_url,
             headers=headers,
@@ -1936,6 +2043,7 @@ class UpstreamAuthorizer:
                 },
             },
         )
+        _trace("initialize", response)
 
         session_id = response.headers.get("mcp-session-id")
         if session_id:
@@ -1946,8 +2054,11 @@ class UpstreamAuthorizer:
                 headers=headers,
                 json={"jsonrpc": "2.0", "method": "notifications/initialized"},
             )
+        elif _auth_debug_enabled():
+            _log(f"  [auth] {self.name} initialize n'a renvoyé aucun "
+                 f"Mcp-Session-Id — tools/call partira sans session.")
 
-        await client.post(
+        response = await client.post(
             self.server_url,
             headers=headers,
             json={
@@ -1957,6 +2068,10 @@ class UpstreamAuthorizer:
                 "params": {"name": _AUTH_PROBE_TOOL, "arguments": {}},
             },
         )
+        _trace("tools/call", response)
+        if _auth_debug_enabled() and response.status_code != 401:
+            _log(f"  [auth] {self.name} : AUCUN 401 sur tools/call — aucun "
+                 f"parcours OAuth ne peut s'amorcer par ce chemin.")
 
     async def authorize(self, upstream: Upstream) -> None:
         """Déroule le parcours interactif, puis (re)démarre l'upstream.
@@ -2754,7 +2869,22 @@ def main() -> None:
             "référence (l'OS ne garantit ni le bon navigateur ni le bon profil)."
         ),
     )
+    parser.add_argument(
+        "--debug-auth",
+        action="store_true",
+        help=(
+            "Trace le parcours OAuth sortant : chaque requête HTTP émise vers "
+            "un upstream ou son serveur d'autorisation, avec son code de "
+            "réponse et l'en-tête WWW-Authenticate. Sans elle, un parcours qui "
+            "n'aboutit pas ne laisse AUCUNE trace — c'est ce qui a coûté "
+            "plusieurs correctifs posés à l'aveugle. Les valeurs sensibles "
+            "(jetons, codes, secrets) sont masquées."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.debug_auth:
+        enable_auth_debug()
 
     # Avant TOUT : avant build_upstreams (qui importe les modules de serveurs, et
     # donc peut construire un contexte SSL), et avant le premier handshake TLS

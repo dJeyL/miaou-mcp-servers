@@ -283,7 +283,9 @@ lots — piège déjà payé côté MIAOU.
   `upstream_is_live` — « transport ouvert » ne vaut pas « autorisé » —,
   `has_usable_token` qui l'amorce au boot sans requête, contrat
   `AUTHORIZATION_REQUIRED`, `authorize_path` et le `_meta` de `tools/list`,
-  l'attente sur événement de `/authorize/{name}`, `HttpUpstream` et la contrainte
+  l'attente sur événement de `/authorize/{name}`, `_provoke_refusal` qui déroule
+  la séquence jusqu'à `tools/call` (seul refusé sur un déploiement
+  d'entreprise), `--debug-auth` et son masquage, `HttpUpstream` et la contrainte
   anyio des cancel scopes).
 - **`docs/miaou-contract.md`** — surface de contact avec MIAOU : transport
   streamable-http et table de configuration des cartes serveur, séquence attendue
