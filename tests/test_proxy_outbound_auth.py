@@ -1462,3 +1462,110 @@ def test_the_redirect_is_served_without_waiting_for_the_callback(tmp_path):
     assert response.status_code == 302
     assert response.headers["location"] == "https://as.test/authorize?state=s1"
     assert elapsed < 5, f"la route a attendu {elapsed:.1f}s au lieu de répondre"
+
+
+# ---------------------------------------------------------------------------
+# La session meurt PENDANT l'appel (2026-09-07, troisième passe)
+#
+# La session vit dans `_serve()`, une autre tâche. Une exception levée par le
+# transport de cette tâche y est capturée et rangée dans `_failure`, puis
+# `_serve` sort de ses contextes : le stream se ferme sous les pieds de
+# l'appelant, sans réponse ni erreur POUR LUI. `session.call_tool` attendait
+# donc son propre timeout — client suspendu, refus jamais rendu.
+# ---------------------------------------------------------------------------
+
+class _BlockingSession:
+    """Un appel dont la réponse n'arrivera jamais."""
+
+    def __init__(self):
+        import anyio
+
+        self._never = anyio.Event()
+
+    async def call_tool(self, name, arguments):
+        await self._never.wait()  # pragma: no cover - jamais réveillé
+
+
+def _upstream_with_blocking_session():
+    import anyio
+
+    upstream = mcp_proxy.HttpUpstream("https://jira.test/mcp")
+    upstream._session = _BlockingSession()
+    upstream._stopped = anyio.Event()
+    upstream._serving = True
+    return upstream
+
+
+@pytest.mark.anyio
+async def test_a_service_task_dying_mid_call_wakes_the_caller():
+    """Sans ça, l'appelant attend son timeout pour un échec déjà connu."""
+    import anyio
+
+    upstream = _upstream_with_blocking_session()
+
+    async def _kill():
+        await anyio.sleep(0.05)
+        # L'ordre de `_serve` : le `except` pose la cause, le `finally` signale.
+        upstream._failure = mcp_proxy.AuthorizationRequired("jira")
+        upstream._session = None
+        upstream._stopped.set()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_kill)
+        with anyio.move_on_after(5) as scope:
+            with pytest.raises(mcp_proxy.AuthorizationRequired):
+                await upstream.call_tool("search", {})
+
+    assert not scope.cancelled_caught, "l'appelant est resté bloqué"
+
+
+@pytest.mark.anyio
+async def test_a_dying_service_without_a_cause_still_wakes_the_caller():
+    """Rien à relever, mais surtout pas une attente indéfinie."""
+    import anyio
+
+    upstream = _upstream_with_blocking_session()
+
+    async def _kill():
+        await anyio.sleep(0.05)
+        upstream._session = None
+        upstream._stopped.set()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_kill)
+        with anyio.move_on_after(5) as scope:
+            with pytest.raises(RuntimeError):
+                await upstream.call_tool("search", {})
+
+    assert not scope.cancelled_caught, "l'appelant est resté bloqué"
+
+
+@pytest.mark.anyio
+async def test_a_normal_call_is_unaffected():
+    """La surveillance ne doit rien coûter au chemin nominal."""
+    import anyio
+
+    class _OkSession:
+        async def call_tool(self, name, arguments):
+            class _Result:
+                content = ["ok"]
+
+            return _Result()
+
+    upstream = mcp_proxy.HttpUpstream("https://jira.test/mcp")
+    upstream._session = _OkSession()
+    upstream._stopped = anyio.Event()
+    upstream._serving = True
+
+    with anyio.move_on_after(5) as scope:
+        assert await upstream.call_tool("search", {}) == ["ok"]
+    assert not scope.cancelled_caught
+
+
+@pytest.mark.anyio
+async def test_calling_without_a_session_raises_the_stored_cause():
+    upstream = mcp_proxy.HttpUpstream("https://jira.test/mcp")
+    upstream._failure = mcp_proxy.AuthorizationRequired("jira")
+
+    with pytest.raises(mcp_proxy.AuthorizationRequired):
+        await upstream.call_tool("search", {})

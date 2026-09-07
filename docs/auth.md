@@ -320,6 +320,20 @@ rafraîchit seul, et envoyer l'utilisateur cliquer lui ferait régler un problè
 qui n'existe pas. Sonder l'upstream aurait coûté un aller-retour réseau par
 upstream à chaque démarrage, pour une information déjà sur le disque.
 
+**Un appel en vol survit à la mort de sa session — mais il faut le vouloir.**
+La session vit dans `_serve()`, une tâche à elle (patron des cancel scopes
+anyio). Une exception levée par le transport de CETTE tâche y est capturée,
+rangée dans `_failure`, et `_serve` sort de ses contextes : le stream se ferme
+sous les pieds de l'appelant **sans réponse ni erreur pour lui**. Un
+`session.call_tool()` nu attend donc une réponse qui n'arrivera jamais, jusqu'à
+son propre timeout — client suspendu, refus jamais rendu (payé en production le
+2026-09-07 sur un upstream dont l'AS ne réclame son jeton qu'au premier appel
+réel). `HttpUpstream.call_tool` fait donc courir l'appel CONTRE `_stopped`,
+signalé par le `finally` de `_serve` dans tous les cas de fin de service ; la
+première des deux qui vient l'emporte, et si c'est la mort du service on relève
+`_failure`, lisible parce que le `except` la pose avant que le `finally` ne
+signale.
+
 **Le premier appel refuse comme les suivants.** Quand l'AS ne réclame
 l'autorisation qu'à `tools/call`, le parcours OAuth du SDK démarre au milieu de
 cet appel et `_on_redirect`, non interactif, lève `AuthorizationRequired`. Elle

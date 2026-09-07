@@ -392,8 +392,69 @@ class HttpUpstream(Upstream):
         return result.tools
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> list[Any]:
-        result = await self._session.call_tool(name, arguments)
-        return result.content
+        """Appelle l'outil, en surveillant la MORT DE LA TÂCHE DE SERVICE.
+
+        La session vit dans `_serve()`, une autre tâche (patron des cancel
+        scopes anyio). Une exception levée par le transport de CETTE tâche —
+        typiquement `AuthorizationRequired`, quand l'AS ne réclame son jeton
+        qu'au premier appel réel — y est capturée, rangée dans `_failure`, et
+        `_serve` sort de ses contextes. Le stream se ferme alors sous les pieds
+        de l'appelant, **sans réponse ni erreur pour lui** : `session.call_tool`
+        attend une réponse qui n'arrivera jamais, jusqu'à son propre timeout.
+        Observé en production le 2026-09-07 (client suspendu, refus jamais
+        rendu) et reproduit en banc.
+
+        On attend donc l'appel ET la fin de la tâche de service, la première des
+        deux qui vient l'emportant. Si le service meurt d'abord, on relève SA
+        cause : c'est elle qui explique l'échec, et c'est elle que le site
+        d'appel sait convertir en refus d'autorisation.
+        """
+        import anyio
+
+        session = self._session
+        if session is None:
+            failure = self._failure
+            if failure is not None:
+                raise failure
+            raise RuntimeError(
+                f"Le serveur MCP distant '{self._url}' n'a pas de session ouverte."
+            )
+
+        result: list[Any] = []
+        done = False
+
+        async def _call() -> None:
+            nonlocal result, done
+            call_result = await session.call_tool(name, arguments)
+            result = call_result.content
+            done = True
+            task_group.cancel_scope.cancel()
+
+        async def _watch_service_death() -> None:
+            # `_stopped` est signalé par le `finally` de `_serve`, donc dans
+            # TOUS les cas où la session cesse d'être servie — échec compris.
+            if self._stopped is None:  # pragma: no cover
+                return
+            await self._stopped.wait()
+            task_group.cancel_scope.cancel()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(_call)
+            task_group.start_soon(_watch_service_death)
+
+        if done:
+            return result
+
+        # La tâche de service est morte avant la réponse : sa cause est la
+        # vraie explication, et `_failure` la porte déjà (posée AVANT le
+        # `finally` qui signale `_stopped`, donc lisible ici).
+        failure = self._failure
+        if failure is not None:
+            raise failure
+        raise RuntimeError(
+            f"Le serveur MCP distant '{self._url}' a fermé sa session pendant "
+            f"l'appel de '{name}'."
+        )
 
 
 # ---------------------------------------------------------------------------
