@@ -18,7 +18,7 @@ en isolation (pas de HTTP, pas de cache) sur des fragments HTML construits à la
 
 ### `tests/live_call.py` — appel réel d'un outil
 
-Script PEP 723 (dépendance unique : `mcp`), **pas un test pytest** : son nom ne commence
+Script PEP 723 (dépendances : `mcp`, `truststore`), **pas un test pytest** : son nom ne commence
 pas par `test_`, il n'est donc jamais collecté malgré sa place dans `tests/`. Il parle le
 vrai transport streamable-http, comme MIAOU (`initialize`, `notifications/initialized`,
 `tools/call`) — c'est le chemin que le stack in-process des tests unitaires ne couvre pas
@@ -29,6 +29,7 @@ uv run tests/live_call.py brave__brave_search '{"query": "blabla"}'   # proxy, p
 uv run tests/live_call.py --port 8769 ddg_search '{"query": "chat"}'  # serveur unitaire
 uv run tests/live_call.py --list                                      # outils exposés
 uv run tests/live_call.py --url http://host:8765/mcp echo '{"text": "hi"}'
+uv run tests/live_call.py -H 'Authorization: Bearer xxx' --list   # header libre, répétable
 ```
 
 `--port` défaut 8765 (le proxy), `--host` défaut `127.0.0.1`, `--url` prime sur les deux.
@@ -39,4 +40,17 @@ inconnu → liste des disponibles, code 2). Rendu des trois familles de blocs : 
 succès, 1 `isError` ou échec de connexion, 2 erreur d'usage. Les `ExceptionGroup` d'anyio
 sont aplatis avant affichage (`_flatten`) — sans ça, un serveur injoignable ne produit que
 « unhandled errors in a TaskGroup », sans la cause.
+
+`-H/--header` (répétable, forme `'Nom: valeur'`) passe des headers HTTP libres à
+`streamablehttp_client` : `Authorization` pour viser un proxy en auth entrante sans dérouler
+le parcours OAuth, mais aussi n'importe quel header applicatif d'un reverse proxy en amont.
+La valeur n'est strippée qu'à gauche, un header sans `:` sort en code 2 avant toute connexion.
+
+Le script appelle `enable_system_trust_store()` avant `asyncio.run`, comme
+`MiaouMCPBase.main()` et `mcp_proxy.main()` — sans quoi viser une URL `https://` servie sous
+AC d'entreprise interne échoue en `CERTIFICATE_VERIFY_FAILED` côté client alors même que les
+serveurs, eux, joignent leurs upstreams : le banc d'essai diagnostiquerait un faux négatif.
+Le helper y est **recopié** plutôt qu'importé de `servers/mcp_base.py` — c'est un client
+autonome, et l'import tirerait FastMCP et starlette pour quatre lignes ; le prix est une
+duplication à répercuter (cf. `docs/tls.md`).
 

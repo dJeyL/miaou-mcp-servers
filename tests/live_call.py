@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1,<2"]
+# dependencies = ["mcp>=1.28.1,<2", "truststore"]
 # ///
 """
 Appel réel d'un outil MCP sur un serveur déjà lancé (banc d'essai manuel).
@@ -16,6 +16,8 @@ Lancement (le serveur visé doit déjà tourner) :
     uv run tests/live_call.py --port 8769 ddg_search '{"query": "chat"}'
     uv run tests/live_call.py --list                       # liste les outils
     uv run tests/live_call.py --url http://127.0.0.1:8766/mcp echo '{"text": "hi"}'
+    uv run tests/live_call.py -H 'Authorization: Bearer xxx' --list
+    uv run tests/live_call.py -H 'X-Tenant: acme' -H 'X-Trace: 1' --list
 
 Sans argument JSON, l'outil est appelé sans arguments.
 """
@@ -29,6 +31,49 @@ import sys
 
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+
+
+def enable_system_trust_store() -> bool:
+    """Vérifie les certificats TLS contre le magasin de confiance du système.
+
+    Recopie délibérée du helper de `servers/mcp_base.py` : ce script est un
+    CLIENT autonome (bloc PEP 723), l'importer depuis servers/ tirerait FastMCP
+    et starlette pour quatre lignes. Toute évolution du helper d'origine doit
+    être répercutée ici — la doc de référence reste `docs/tls.md`.
+
+    Sans cette injection, viser un serveur HTTPS dont le certificat est signé
+    par une AC d'entreprise interne échoue en CERTIFICATE_VERIFY_FAILED, alors
+    que le proxy lui-même sait joindre ses upstreams : le client de banc d'essai
+    doit se comporter comme les serveurs, sinon il diagnostique un faux négatif.
+    """
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+        return True
+    except Exception as e:  # ImportError, ou plateforme non supportée
+        print(
+            f"Avertissement : magasin de confiance système non activé ({e}). "
+            "Les certificats signés par une AC interne peuvent échouer à la "
+            "vérification ; installer `truststore` corrige ce cas.",
+            file=sys.stderr,
+        )
+        return False
+
+
+def _parse_headers(raw: list[str]) -> dict[str, str] | None:
+    """Transforme une liste "Nom: valeur" en dict, ou lève ValueError.
+
+    La valeur est strippée à gauche seulement : un header dont la valeur
+    contient des espaces significatifs en fin reste transmis tel quel.
+    """
+    headers: dict[str, str] = {}
+    for item in raw:
+        name, sep, value = item.partition(":")
+        if not sep or not name.strip():
+            raise ValueError(f"header mal formé (attendu \'Nom: valeur\') : {item!r}")
+        headers[name.strip()] = value.lstrip()
+    return headers or None
 
 
 def _render_content(block) -> str:
@@ -49,8 +94,14 @@ def _render_content(block) -> str:
     return repr(block)
 
 
-async def run(url: str, tool: str | None, arguments: dict, list_only: bool) -> int:
-    async with streamablehttp_client(url) as (read, write, _get_session_id):
+async def run(
+    url: str,
+    tool: str | None,
+    arguments: dict,
+    list_only: bool,
+    headers: dict[str, str] | None = None,
+) -> int:
+    async with streamablehttp_client(url, headers=headers) as (read, write, _get_session_id):
         async with ClientSession(read, write) as session:
             init = await session.initialize()
             print(
@@ -98,6 +149,14 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1", help="hôte du serveur (défaut 127.0.0.1)")
     parser.add_argument("--url", help="URL complète du endpoint /mcp (prime sur --host/--port)")
     parser.add_argument("--list", action="store_true", help="liste les outils exposés et sort")
+    parser.add_argument(
+        "-H",
+        "--header",
+        action="append",
+        default=[],
+        metavar="'Nom: valeur'",
+        help="header HTTP libre, répétable (ex. -H 'Authorization: Bearer xxx')",
+    )
     args = parser.parse_args()
 
     if not args.list and not args.tool:
@@ -112,10 +171,20 @@ def main() -> int:
         print("les arguments doivent être un objet JSON", file=sys.stderr)
         return 2
 
+    try:
+        headers = _parse_headers(args.header)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     url = args.url or f"http://{args.host}:{args.port}/mcp"
 
+    # Avant toute construction de contexte SSL, comme dans MiaouMCPBase.main()
+    # et mcp_proxy.main() : un contexte déjà créé garde la classe d'origine.
+    enable_system_trust_store()
+
     try:
-        return asyncio.run(run(url, args.tool, arguments, args.list))
+        return asyncio.run(run(url, args.tool, arguments, args.list, headers))
     except KeyboardInterrupt:
         return 130
     except BaseException as exc:  # ExceptionGroup inclus (serveur injoignable)

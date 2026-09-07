@@ -287,11 +287,12 @@ lots — piège déjà payé côté MIAOU.
   et son rejeu qui ne marche que derrière le proxy, formats de `ref` acceptés).
 - **`docs/tls.md`** — `enable_system_trust_store()` : pourquoi une AC d'entreprise
   interne échoue en `CERTIFICATE_VERIFY_FAILED` alors que le navigateur l'accepte,
-  l'injection `truststore` qui remplace la classe `ssl.SSLContext`, les deux points
-  d'appel (et l'ordre contractuel dans `mcp_proxy.main()`), le best-effort assumé.
+  l'injection `truststore` qui remplace la classe `ssl.SSLContext`, les trois points
+  d'appel (l'ordre contractuel dans `mcp_proxy.main()`, la copie assumée dans
+  `tests/live_call.py`), le best-effort assumé.
 - **`docs/tests.md`** — ce que chaque suite mocke (aucun appel réseau réel, aucune
   clef requise), l'isolation filesystem par `tmp_path`, et `tests/live_call.py` qui
-  parle le vrai transport streamable-http comme MIAOU.
+  parle le vrai transport streamable-http comme MIAOU (`-H/--header`, truststore).
 
 ## Règle d'or
 

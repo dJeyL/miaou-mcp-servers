@@ -19,7 +19,7 @@ réécrit, et rien n'est passé explicitement à un client** — c'est la raison
 d'injection unique, et pourquoi il n'y a pas eu de migration `requests`→`httpx` ici : ce
 dépôt n'a jamais utilisé `requests`.
 
-Deux points d'appel, un par mode de lancement, et pas un de plus :
+Trois points d'appel, un par mode de lancement, et pas un de plus :
 
 - **`MiaouMCPBase.main()`** — seul point traversé par les six lancements standalone.
 - **`mcp_proxy.main()`**, en **tête**, avant `build_upstreams` (qui importe les modules de
@@ -27,6 +27,12 @@ Deux points d'appel, un par mode de lancement, et pas un de plus :
   construit garde la classe d'origine et continue d'ignorer le magasin système.
   `test_main_enables_system_trust_store_before_building_upstreams` épingle l'ordre, pas
   seulement le fait que l'appel existe.
+- **`tests/live_call.py`**, avant `asyncio.run`. Seul appelant qui **recopie** le helper au
+  lieu de l'importer : c'est un client autonome à bloc PEP 723, et importer `mcp_base`
+  y tirerait FastMCP et starlette pour quatre lignes. La contrepartie est explicite —
+  toute évolution du helper d'origine est à répercuter dans cette copie. Sans elle, viser
+  une URL `https://` sous AC interne échoue côté client seul, ce qui se lit à tort comme
+  une panne du serveur.
 
 Le mode inprocess ne passe pas par `main()` des serveurs — d'où l'appel propre du proxy,
 qui couvre alors tout le process, upstreams inprocess compris.
