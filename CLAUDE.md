@@ -276,8 +276,11 @@ lots — piège déjà payé côté MIAOU.
   RFC 8707 non désactivable, `dev_auth_server.py`). Sortante (AB-2 : le proxy est
   client OAuth d'un tiers, `UpstreamTokenStorage` et ses gardes d'écriture, parcours
   `/authorize/{name}` + `/callback`, scopes et le 403 qui n'est pas une panne, le
-  troisième état « connu mais pas autorisé », contrat `AUTHORIZATION_REQUIRED`,
-  `authorize_path` et le `_meta` de `tools/list`, `HttpUpstream` et la contrainte
+  troisième état « connu mais pas autorisé » et les DEUX conditions de
+  `upstream_is_live` — « transport ouvert » ne vaut pas « autorisé » —,
+  `has_usable_token` qui l'amorce au boot sans requête, contrat
+  `AUTHORIZATION_REQUIRED`, `authorize_path` et le `_meta` de `tools/list`,
+  l'attente sur événement de `/authorize/{name}`, `HttpUpstream` et la contrainte
   anyio des cancel scopes).
 - **`docs/miaou-contract.md`** — surface de contact avec MIAOU : transport
   streamable-http et table de configuration des cartes serveur, séquence attendue

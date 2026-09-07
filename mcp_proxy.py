@@ -827,7 +827,7 @@ def build_status_report(
     for name, upstream in sorted(upstreams.items()):
         kind = type(upstream).__name__.replace("Upstream", "").lower()
         authorizer = authorizers.get(name)
-        if authorizer is not None and not upstream_is_live(upstream):
+        if authorizer is not None and not upstream_is_live(upstream, authorizer):
             lines.append(
                 f"- {name} ({kind}) : NON AUTORISÉ. Ses outils sont listés mais "
                 f"refusent à l'appel avec {AUTHORIZATION_REQUIRED}."
@@ -872,14 +872,27 @@ def build_status_report(
     return "Serveurs agrégés par ce proxy :\n" + "\n".join(lines)
 
 
-def upstream_is_live(upstream: Upstream) -> bool:
-    """Un HttpUpstream sans session n'a pas de transport ouvert.
+def upstream_is_live(upstream: Upstream, authorizer: Any = None) -> bool:
+    """« Cet upstream honorerait-il un appel d'outil maintenant ? »
 
-    Prédicat UNIQUE de « cet upstream répond-il ? », partagé par la liste, le
-    refus d'appel et le rapport de status : trois endroits qui doivent répondre
-    la même chose, sous peine d'annoncer un outil qu'on refuse ensuite pour une
-    raison qu'on ne rapporte pas.
+    Prédicat UNIQUE, partagé par la liste, le refus d'appel et le rapport de
+    status : trois endroits qui doivent répondre la même chose, sous peine
+    d'annoncer un outil qu'on refuse ensuite pour une raison qu'on ne rapporte
+    pas.
+
+    DEUX conditions, et il faut les deux — la seconde a manqué jusqu'au
+    2026-09-07. « Transport ouvert » ne vaut pas « autorisé » : un upstream
+    OAuth peut accepter `initialize` ET `tools/list` sans jeton, et n'exiger
+    l'autorisation qu'au premier `tools/call` (cas d'un Jira d'entreprise,
+    observé en production). Le juger sur la seule session le déclarait vivant,
+    donc ses outils listés sans réserve, son `_meta` vide, et son premier appel
+    parti pour de bon vers un 401 — au lieu d'être refusé avant émission.
+
+    L'`authorizer` est facultatif : les appelants qui n'en ont pas (un upstream
+    sans OAuth, un test) obtiennent le comportement d'avant, à l'octet près.
     """
+    if authorizer is not None and getattr(authorizer, "authorization_pending", False):
+        return False
     if isinstance(upstream, HttpUpstream):
         return upstream._session is not None
     return True
@@ -911,7 +924,7 @@ def build_proxy_server(
         tools: list[types.Tool] = []
         unauthorized: list[dict[str, str]] = []
         for prefix, upstream in upstreams.items():
-            live = upstream_is_live(upstream)
+            live = upstream_is_live(upstream, authorizers.get(prefix))
             if not live and prefix in authorizers:
                 # Un upstream non vivant SANS authorizer est injoignable, pas
                 # non autorisé : il n'a aucun parcours à proposer, et le
@@ -994,14 +1007,33 @@ def build_proxy_server(
             upstream_name, orig_name = resolved
 
         upstream = upstreams[upstream_name]
-        if not upstream_is_live(upstream):
+        if not upstream_is_live(upstream, authorizers.get(upstream_name)):
             # Refus AVANT l'appel, et non conversion d'un résultat après coup :
             # c'est ce qui distingue ce contrat de REF_UNKNOWN, dont le sentinel
             # ne peut être reconnu qu'une fois l'outil exécuté. Levée ici, elle
             # serait avalée par le SDK en isError — d'où _wrap_authorization_
             # required, qui la relève en vraie erreur JSON-RPC.
             raise UpstreamNotAuthorized(upstream_name)
-        return await upstream.call_tool(orig_name, arguments or {})
+        try:
+            return await upstream.call_tool(orig_name, arguments or {})
+        except Exception as e:
+            # L'AS peut ne réclamer l'autorisation qu'ICI : un upstream qui
+            # accepte `initialize` et `tools/list` sans jeton n'a encore rien
+            # révélé, et le refus n'a donc pas pu être posé plus tôt. Le
+            # parcours OAuth du SDK client démarre alors au milieu de CET
+            # appel, `_on_redirect` le trouve non interactif et lève.
+            #
+            # Sans cette conversion, l'exception traverse le transport sans
+            # être reconnue et l'appel reste suspendu jusqu'à son timeout ;
+            # le refus n'arrive qu'au tour SUIVANT, une fois l'état posé.
+            # C'est ce tour perdu qu'on supprime — le premier appel doit
+            # refuser aussi nettement que les suivants.
+            #
+            # `_unwrap_exception_group` : anyio empaquette ce qui traverse un
+            # task group, la cause réelle n'est pas toujours au premier plan.
+            if isinstance(_unwrap_exception_group(e), AuthorizationRequired):
+                raise UpstreamNotAuthorized(upstream_name) from e
+            raise
 
     # Deux wrappers indépendants, chacun sur son propre sentinel : ils
     # inspectent le même résultat mais ne se marchent pas dessus (un texte
@@ -1490,6 +1522,25 @@ class UpstreamTokenStorage:
             token.expires_in = max(remaining, 0)
         return token
 
+    async def has_usable_token(self) -> bool:
+        """« Un appel partirait-il authentifié, là, maintenant ? »
+
+        PUREMENT LOCAL : lit le fichier de jetons, n'émet aucune requête. C'est
+        ce qui permet de savoir qu'une autorisation manque AVANT le premier
+        appel d'outil, sans sonder l'upstream ni retarder le démarrage.
+
+        Un jeton expiré mais porteur d'un `refresh_token` compte comme
+        utilisable : le SDK le rafraîchira tout seul au premier appel, sans
+        parcours interactif. Le dire « à autoriser » enverrait l'utilisateur
+        cliquer pour un problème qui se règle sans lui.
+        """
+        token = await self.get_tokens()
+        if token is None or not token.access_token:
+            return False
+        if token.expires_in is not None and token.expires_in <= 0:
+            return bool(token.refresh_token)
+        return True
+
     async def set_tokens(self, tokens: Any) -> None:
         payload = tokens.model_dump(exclude_none=True, mode="json")
         fields: dict[str, Any] = {"tokens": payload}
@@ -1610,6 +1661,17 @@ class PendingAuthorization:
 # technique.
 _AUTHORIZATION_WAIT_S = 300.0
 
+_AUTHORIZE_ROUTE_WAIT_S = 20.0
+"""Ce que /authorize/{name} attend avant de rendre la main au navigateur.
+
+Borne la DÉCOUVERTE de l'AS (métadonnées, éventuel enregistrement de client),
+pas le parcours entier — celui-ci se poursuit en tâche de fond et l'utilisateur
+y entre par la redirection. Généreux à dessein : derrière un portail
+d'entreprise, la découverte prend des secondes, et conclure trop tôt affiche
+une panne là où il n'y en a pas. Le coût d'une borne trop large est une page
+qui tarde ; celui d'une borne trop courte est un diagnostic faux.
+"""
+
 
 def format_authorization_notice(upstream_name: str, url: str) -> list[str]:
     """Le lien, en évidence, sur stderr.
@@ -1676,6 +1738,20 @@ class UpstreamAuthorizer:
         # Dernière URL d'autorisation connue, pour la rendre à qui la demande
         # sans relancer un parcours.
         self.last_authorization_url: str | None = None
+        # Une autorisation a été RÉCLAMÉE par l'AS et pas encore accordée.
+        #
+        # Distinct de « pas de session » : un upstream peut très bien accepter
+        # `initialize` sans jeton et n'exiger l'autorisation qu'au premier
+        # `tools/call` — c'est le cas d'un Jira derrière un portail
+        # d'entreprise, observé en production. `_session` est alors POSÉE et
+        # `upstream_is_live` rend True, alors que l'upstream refusera tout
+        # appel. Sans ce drapeau, les trois surfaces (listing `_meta`, refus
+        # d'appel, rapport `status`) concluent toutes « il va bien ».
+        #
+        # Il est posé par `_on_redirect` quand le parcours est inhibé, c'est-à-
+        # dire au seul moment où l'on apprend de l'AS lui-même qu'un jeton
+        # manque, et levé par un parcours mené à son terme.
+        self.authorization_pending = False
         # Dernier échec de parcours, pour que `status` dise POURQUOI. Sans lui,
         # un scope insuffisant se présente comme une autorisation manquante, et
         # l'exploitant reclique indéfiniment sur un lien qui ne peut pas
@@ -1697,6 +1773,10 @@ class UpstreamAuthorizer:
             # pas : le parcours s'arrête ici et l'upstream reste « connu mais
             # non autorisé ».
             self.last_authorization_url = url
+            # C'est ICI, et nulle part ailleurs, qu'on apprend de l'AS qu'un
+            # jeton manque. Le noter durablement est ce qui permet aux surfaces
+            # de le dire sans avoir à re-provoquer l'échec.
+            self.authorization_pending = True
             raise AuthorizationRequired(self.name)
 
         pending = PendingAuthorization(self.name, self.wait_timeout)
@@ -1734,6 +1814,12 @@ class UpstreamAuthorizer:
         self.interactive = True
         try:
             await upstream.start()
+        except Exception:
+            # L'autorisation reste due : un parcours qui échoue ne doit pas
+            # faire croire aux surfaces que le problème est réglé.
+            raise
+        else:
+            self.authorization_pending = False
         finally:
             self.interactive = False
             self.pending = None
@@ -1872,6 +1958,7 @@ def build_authorize_route(
     retour sur /callback.
     """
     import anyio
+    from html import escape
     from starlette.responses import HTMLResponse
 
     async def handle_authorize(request: Any) -> Any:
@@ -1882,7 +1969,9 @@ def build_authorize_route(
                 _CALLBACK_PAGE.format(
                     cls="ko",
                     title="Upstream inconnu",
-                    message=f"Aucun upstream OAuth nommé <code>{name}</code>.",
+                    # `name` vient du chemin d'URL, donc d'un tiers : la route
+                    # est PUBLIQUE. Échappé, sans exception.
+                    message=f"Aucun upstream OAuth nommé <code>{escape(name)}</code>.",
                 ),
                 status_code=404,
             )
@@ -1893,9 +1982,17 @@ def build_authorize_route(
                 _CALLBACK_PAGE.format(
                     cls="ok",
                     title="Autorisation déjà en cours",
-                    message=f'Suivre <a href="{url}">ce lien</a> pour la terminer.',
+                    message=(
+                        f'Suivre <a href="{escape(url, quote=True)}">ce lien</a> '
+                        f"pour la terminer."
+                    ),
                 )
             )
+
+        # Armé AVANT de lancer la tâche : le parcours peut produire son URL
+        # immédiatement, et un événement créé après coup manquerait le signal.
+        authorizer.redirect_ready = anyio.Event()
+        authorizer.last_error = None
 
         async def _run() -> None:
             try:
@@ -1905,20 +2002,44 @@ def build_authorize_route(
             except Exception as e:
                 authorizer.last_error = str(e)
                 _log(f"Autorisation de '{name}' échouée : {e}")
+            finally:
+                # Toujours réveiller la route, y compris en échec : sinon elle
+                # attendrait sa borne entière pour une erreur déjà connue.
+                authorizer.redirect_ready.set()
 
         # Tâche détachée : la réponse doit partir avant que le parcours
         # n'attende le retour du navigateur sur /callback.
         request.app.state.task_group.start_soon(_run)
-        await anyio.sleep(0.1)  # laisse le temps à l'URL d'être produite
+
+        # Attente sur ÉVÉNEMENT, jamais un délai fixe. Le parcours doit d'abord
+        # découvrir l'AS (`/.well-known/...`), et éventuellement enregistrer un
+        # client : derrière un portail d'entreprise, c'est un aller-retour
+        # réseau que 100 ms ne couvrent pas. Le chronomètre concluait alors
+        # « serveur d'autorisation injoignable » alors qu'il répondait très
+        # bien, simplement plus lentement que la borne — diagnostic faux, et
+        # faux dans le sens qui décourage de réessayer.
+        with anyio.move_on_after(_AUTHORIZE_ROUTE_WAIT_S):
+            await authorizer.redirect_ready.wait()
 
         url = authorizer.pending.authorization_url if authorizer.pending else None
         if not url:
+            # `last_error` dit POURQUOI quand le parcours a déjà échoué (scope
+            # refusé, enregistrement rejeté). Sans elle, une erreur de
+            # configuration se présentait comme une panne réseau, et
+            # l'exploitant recliquait sur un lien qui ne pouvait pas la
+            # réparer.
+            detail = authorizer.last_error
+            message = (
+                f"Le parcours d'autorisation a échoué : <code>{escape(str(detail))}</code>"
+                if detail
+                else "Le serveur d'autorisation n'a pas répondu à temps. "
+                "Voir la sortie du proxy."
+            )
             return HTMLResponse(
                 _CALLBACK_PAGE.format(
                     cls="ko",
                     title="Autorisation impossible",
-                    message="Le serveur d'autorisation n'a pas pu être joint. "
-                    "Voir la sortie du proxy.",
+                    message=message,
                 ),
                 status_code=502,
             )
@@ -2036,6 +2157,32 @@ def build_app(
             # le retirer rendrait son propre parcours d'autorisation
             # inatteignable (/authorize/{name} ne le trouverait plus). Il reste
             # donc dans la table, sans session — cf. AuthorizationRequired.
+            # Ce qu'on sait AVANT d'appeler quoi que ce soit : un upstream
+            # OAuth dont le stockage ne porte pas de jeton utilisable exigera
+            # une autorisation. Purement local (lecture de fichier), donc
+            # gratuit et sans requête sortante — le boot n'est pas retardé.
+            #
+            # Sans cet amorçage, le seul événement qui révèle l'autorisation
+            # manquante est un `_on_redirect`, lequel n'a lieu qu'au premier
+            # appel réellement émis : un upstream qui accepte `initialize` ET
+            # `tools/list` sans jeton (Jira d'entreprise, observé en
+            # production) resterait donc annoncé sans réserve jusqu'à ce que
+            # l'utilisateur se prenne l'échec. C'est précisément ce que la
+            # surface `_meta` existe pour éviter.
+            for name, authorizer in (authorizers or {}).items():
+                storage = getattr(authorizer, "_storage", None)
+                probe = getattr(storage, "has_usable_token", None)
+                if probe is None:
+                    continue
+                try:
+                    if not await probe():
+                        authorizer.authorization_pending = True
+                except Exception as e:
+                    # Une surface facultative ne doit jamais empêcher un
+                    # démarrage : au pire on ne signale pas, et le refus à
+                    # l'appel reste le filet.
+                    _log(f"  {name:<12} état d'autorisation indéterminé ({e})")
+
             started: list[Upstream] = []
             failed: list[str] = []
             for name, upstream in list(upstreams.items()):

@@ -1102,3 +1102,280 @@ def test_non_403_failure_is_reported_without_the_scope_hint():
     )
     assert "connection refused" in report
     assert "scopes sont insuffisants" not in report
+
+
+# ---------------------------------------------------------------------------
+# Session ouverte MAIS autorisation manquante (correctif du 2026-09-07)
+#
+# Le lot AB-5 jugeait « cet upstream répond-il ? » sur la seule présence d'une
+# session. Un Jira d'entreprise, observé en production, accepte `initialize` ET
+# `tools/list` sans jeton et n'exige l'autorisation qu'au premier `tools/call` :
+# la session existe, le prédicat le déclarait vivant, et les trois surfaces
+# concluaient toutes « il va bien » — pas de `_meta`, pas de refus avant appel,
+# `status` muet.
+# ---------------------------------------------------------------------------
+
+class _PendingAuthorizer(_FakeAuthorizer):
+    """Autorisation réclamée par l'AS et pas encore accordée."""
+
+    def __init__(self, url="https://as.test/authorize?state=s1"):
+        super().__init__(url)
+        self.authorization_pending = True
+
+
+def _live_http_upstream():
+    """HttpUpstream AVEC session : `initialize` a réussi, le transport est
+    ouvert. C'est l'état exact d'un upstream qui n'exige son jeton qu'à
+    l'appel."""
+    up = mcp_proxy.HttpUpstream("https://example.test/mcp")
+    up._session = object()
+    return up
+
+
+def test_a_live_session_is_not_enough_to_be_live():
+    """Le prédicat répond « non » dès qu'une autorisation est due, même
+    transport ouvert. C'est la condition qui manquait."""
+    upstream = _live_http_upstream()
+    assert mcp_proxy.upstream_is_live(upstream) is True
+    assert mcp_proxy.upstream_is_live(upstream, _PendingAuthorizer()) is False
+
+
+def test_an_upstream_without_authorizer_keeps_the_previous_verdict():
+    """Pas d'authorizer (upstream sans OAuth, appelant historique) → le
+    comportement d'avant, à l'octet près."""
+    assert mcp_proxy.upstream_is_live(_live_http_upstream()) is True
+    assert mcp_proxy.upstream_is_live(_unauthorized_upstream()) is False
+
+
+def test_status_reports_a_live_but_unauthorized_upstream():
+    """`status` doit le dire : c'est une des trois surfaces qui mentaient."""
+    report = mcp_proxy.build_status_report(
+        {"jira": _live_http_upstream()}, {"jira": _PendingAuthorizer()}, None
+    )
+    assert "NON AUTORISÉ" in report
+    assert "/authorize/jira" in report
+
+
+@pytest.mark.anyio
+async def test_list_tools_meta_names_a_live_but_unauthorized_upstream():
+    """La surface `_meta` est ce qui allume la pastille de MIAOU AVANT tout
+    appel. Sans le correctif, elle reste vide pour un upstream qui liste ses
+    outils sans jeton — exactement le cas où on en a le plus besoin."""
+    upstream = _live_http_upstream()
+
+    async def _list_tools():
+        return [_tool()]
+
+    upstream.list_tools = _list_tools
+
+    server = mcp_proxy.build_proxy_server(
+        {"jira": upstream},
+        {},
+        authorizers={"jira": _PendingAuthorizer()},
+    )
+    import mcp.types as types
+
+    handler = server.request_handlers[types.ListToolsRequest]
+    result = await handler(
+        types.ListToolsRequest(method="tools/list", params=None)
+    )
+    meta = result.root.meta or {}
+    entries = meta.get(mcp_proxy.UNAUTHORIZED_UPSTREAMS_META_KEY) or []
+    assert [e["name"] for e in entries] == ["jira"]
+    assert entries[0]["authorize_path"] == "/authorize/jira"
+
+
+# ---------------------------------------------------------------------------
+# has_usable_token : savoir sans rien émettre
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_no_token_at_all_is_not_usable(tmp_path):
+    storage = UpstreamTokenStorage(tmp_path / "t.json", "jira")
+    assert await storage.has_usable_token() is False
+
+
+@pytest.mark.anyio
+async def test_a_fresh_token_is_usable(tmp_path):
+    path = tmp_path / "t.json"
+    path.write_text(json.dumps({
+        "jira": {
+            "tokens": {"access_token": "a", "token_type": "Bearer", "expires_in": 3600},
+            "expires_at": time.time() + 3600,
+        }
+    }))
+    assert await UpstreamTokenStorage(path, "jira").has_usable_token() is True
+
+
+@pytest.mark.anyio
+async def test_an_expired_token_with_a_refresh_token_stays_usable(tmp_path):
+    """Le SDK le rafraîchit seul, sans parcours interactif : envoyer
+    l'utilisateur cliquer serait lui faire régler un problème qui n'existe
+    pas."""
+    path = tmp_path / "t.json"
+    path.write_text(json.dumps({
+        "jira": {
+            "tokens": {
+                "access_token": "a", "token_type": "Bearer",
+                "expires_in": 3600, "refresh_token": "r",
+            },
+            "expires_at": time.time() - 10,
+        }
+    }))
+    assert await UpstreamTokenStorage(path, "jira").has_usable_token() is True
+
+
+@pytest.mark.anyio
+async def test_an_expired_token_without_refresh_is_not_usable(tmp_path):
+    path = tmp_path / "t.json"
+    path.write_text(json.dumps({
+        "jira": {
+            "tokens": {"access_token": "a", "token_type": "Bearer", "expires_in": 3600},
+            "expires_at": time.time() - 10,
+        }
+    }))
+    assert await UpstreamTokenStorage(path, "jira").has_usable_token() is False
+
+
+# ---------------------------------------------------------------------------
+# Le drapeau, posé et levé
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_an_inhibited_redirect_marks_the_authorization_as_due(tmp_path):
+    """`_on_redirect` non interactif est le seul moment où l'AS nous apprend
+    qu'un jeton manque. Le noter est ce qui permet aux surfaces de le dire sans
+    re-provoquer l'échec."""
+    authorizer = mcp_proxy.UpstreamAuthorizer(
+        "jira", "https://example.test/mcp",
+        UpstreamTokenStorage(tmp_path / "t.json", "jira"),
+        "http://127.0.0.1:8765/callback",
+    )
+    assert authorizer.authorization_pending is False
+
+    with pytest.raises(mcp_proxy.AuthorizationRequired):
+        await authorizer._on_redirect("https://as.test/authorize?state=s1")
+
+    assert authorizer.authorization_pending is True
+    assert authorizer.last_authorization_url == "https://as.test/authorize?state=s1"
+
+
+@pytest.mark.anyio
+async def test_a_completed_authorization_clears_the_flag(tmp_path):
+    authorizer = mcp_proxy.UpstreamAuthorizer(
+        "jira", "https://example.test/mcp",
+        UpstreamTokenStorage(tmp_path / "t.json", "jira"),
+        "http://127.0.0.1:8765/callback",
+    )
+    authorizer.authorization_pending = True
+
+    class _Ok:
+        async def start(self):
+            return None
+
+    await authorizer.authorize(_Ok())
+    assert authorizer.authorization_pending is False
+
+
+@pytest.mark.anyio
+async def test_a_failed_authorization_keeps_the_flag(tmp_path):
+    """Un parcours qui échoue ne doit pas faire croire que c'est réglé."""
+    authorizer = mcp_proxy.UpstreamAuthorizer(
+        "jira", "https://example.test/mcp",
+        UpstreamTokenStorage(tmp_path / "t.json", "jira"),
+        "http://127.0.0.1:8765/callback",
+    )
+    authorizer.authorization_pending = True
+
+    class _Boom:
+        async def start(self):
+            raise RuntimeError("scope refusé")
+
+    with pytest.raises(RuntimeError):
+        await authorizer.authorize(_Boom())
+    assert authorizer.authorization_pending is True
+
+
+# ---------------------------------------------------------------------------
+# La route /authorize attend l'URL, elle ne la chronomètre pas
+#
+# Elle rendait sa réponse après un `sleep(0.1)` fixe : derrière un portail
+# d'entreprise, la découverte de l'AS prend des secondes, et la route concluait
+# « serveur d'autorisation injoignable » alors qu'il répondait très bien.
+# Diagnostic faux, et faux dans le sens qui décourage de réessayer.
+# ---------------------------------------------------------------------------
+
+class _SlowAuthorizer:
+    """AS qui met plus longtemps que l'ancien délai fixe à produire son URL."""
+
+    def __init__(self, name="jira", delay=0.6, failure=None):
+        self.name = name
+        self._delay = delay
+        self._failure = failure
+        self.pending = None
+        self.last_error = None
+        self.last_authorization_url = None
+        self.authorization_pending = True
+        self.redirect_ready = None
+
+    async def authorize(self, upstream):
+        import anyio
+
+        await anyio.sleep(self._delay)
+        if self._failure:
+            raise RuntimeError(self._failure)
+        pending = mcp_proxy.PendingAuthorization(self.name, 300.0)
+        pending.authorization_url = "https://as.test/authorize?state=s1"
+        self.pending = pending
+        if self.redirect_ready is not None:
+            self.redirect_ready.set()
+        await anyio.sleep(30)  # attend le retour sur /callback
+
+
+def _authorize_client(authorizer):
+    from contextlib import asynccontextmanager
+
+    import anyio
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+
+    route = mcp_proxy.build_authorize_route({"jira": authorizer}, {"jira": object()})
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with anyio.create_task_group() as tg:
+            app.state.task_group = tg
+            yield
+            tg.cancel_scope.cancel()
+
+    return TestClient(Starlette(routes=[route], lifespan=lifespan))
+
+
+def test_a_slow_authorization_server_still_redirects():
+    """Le cas payé en production : l'AS répond, mais pas en 100 ms."""
+    with _authorize_client(_SlowAuthorizer()) as client:
+        response = client.get("/authorize/jira", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://as.test/authorize?state=s1"
+
+
+def test_a_failed_flow_says_why_instead_of_blaming_the_network():
+    """Un enregistrement refusé n'est pas une panne réseau. Le dire évite de
+    renvoyer l'exploitant vers un lien qui ne peut rien réparer."""
+    failure = "Registration failed: 403 insufficient_scope"
+    with _authorize_client(_SlowAuthorizer(delay=0.05, failure=failure)) as client:
+        response = client.get("/authorize/jira", follow_redirects=False)
+
+    assert response.status_code == 502
+    assert "insufficient_scope" in response.text
+    assert "n'a pas pu être joint" not in response.text
+
+
+def test_an_unknown_upstream_name_is_escaped():
+    """La route est PUBLIQUE et son `name` vient du chemin d'URL."""
+    with _authorize_client(_SlowAuthorizer()) as client:
+        response = client.get("/authorize/%3Cimg%20src=x%3E", follow_redirects=False)
+
+    assert response.status_code == 404
+    assert "<img src=x>" not in response.text

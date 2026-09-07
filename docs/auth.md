@@ -205,6 +205,29 @@ lifespan, et elle a sa raison : une panne ne se répare pas toute seule, une
 autorisation manquante se répare par un clic — et retirer l'upstream rendrait
 `/authorize/{name}` incapable de le retrouver.
 
+**`/authorize/{name}` attend son URL sur un ÉVÉNEMENT, jamais sur un délai.**
+La route lance le parcours en tâche détachée (la réponse doit partir avant que
+celui-ci n'attende le retour du navigateur sur `/callback`), puis attend
+`UpstreamAuthorizer.redirect_ready` — armé **avant** le `start_soon`, sans quoi
+un parcours rapide produirait son URL avant que l'attente n'existe, et signalé
+aussi bien par un redirect obtenu que par un parcours qui échoue.
+
+Elle attendait auparavant un `sleep(0.1)` fixe, et c'est un bug payé en
+production : le parcours doit d'abord découvrir l'AS (`/.well-known/…`) et
+parfois enregistrer un client, ce qui derrière un portail d'entreprise prend des
+secondes. Passé le dixième de seconde, la route concluait « Le serveur
+d'autorisation n'a pas pu être joint » alors qu'il répondait très bien —
+diagnostic faux, et faux dans le sens qui décourage de réessayer. La borne
+(`_AUTHORIZE_ROUTE_WAIT_S`) est volontairement généreuse : une borne trop large
+coûte une page qui tarde, une borne trop courte coûte un mensonge.
+
+Quand le parcours a **déjà** échoué, la page rend `last_error` plutôt qu'un
+diagnostic réseau générique : un enregistrement refusé (`403
+insufficient_scope`) ou un scope manquant est une erreur de configuration, et la
+présenter comme une panne fait recliquer sur un lien qui ne peut rien réparer.
+Les deux routes échappent tout ce qu'elles interpolent (`html.escape`) — elles
+sont publiques, et `name` vient du chemin d'URL.
+
 Le lien d'autorisation est **imprimé sur stderr**, copiable. C'est le mécanisme
 de référence, pas un repli : `mcp_proxy` est une CLI, et confier l'ouverture à
 l'OS ne garantit ni le bon navigateur ni le bon **profil** (celui où la session
@@ -245,12 +268,45 @@ Un upstream OAuth sans jeton n'est ni disponible ni en panne. Ses outils
 silencieusement de `tools/list` — un outil absent ne donne au modèle aucune
 piste, un outil qui refuse en donne une actionnable.
 
-Le prédicat est unique : `upstream_is_live()`, partagé par le listing, le refus
-d'appel, le rapport de `status` et le `_meta` de `tools/list` — des endroits qui
-doivent répondre la même chose, sous peine d'annoncer un outil qu'on refuse
-ensuite pour une raison qu'on ne rapporte pas. Un prédicat n'est unique que si
-tous ses consommateurs y passent : ajouter une surface, c'est y brancher un
-consommateur de plus, jamais réécrire le filtre sur place.
+Le prédicat est unique : `upstream_is_live(upstream, authorizer)`, partagé par
+le listing, le refus d'appel, le rapport de `status` et le `_meta` de
+`tools/list` — des endroits qui doivent répondre la même chose, sous peine
+d'annoncer un outil qu'on refuse ensuite pour une raison qu'on ne rapporte pas.
+Un prédicat n'est unique que si tous ses consommateurs y passent : ajouter une
+surface, c'est y brancher un consommateur de plus, jamais réécrire le filtre sur
+place.
+
+**Il répond sur DEUX conditions, et la seconde a manqué jusqu'au 2026-09-07.**
+« Transport ouvert » ne vaut pas « autorisé ». Un upstream OAuth peut accepter
+`initialize` ET `tools/list` sans jeton, et n'exiger l'autorisation qu'au
+premier `tools/call` — c'est le cas d'un Jira d'entreprise, payé en production.
+Jugé sur la seule session, il était déclaré vivant : ses outils listés sans
+réserve, son `_meta` vide (donc aucune pastille côté MIAOU), `status` muet, et
+son premier appel parti pour de bon vers un 401 au lieu d'être refusé avant
+émission. Le drapeau `UpstreamAuthorizer.authorization_pending` porte la seconde
+condition. L'`authorizer` est facultatif : un appelant qui n'en a pas retrouve
+le comportement d'avant, à l'octet près.
+
+**Ce qui arme le drapeau, et pourquoi ça ne peut pas être seulement `_on_redirect`.**
+Celui-ci n'est atteint qu'au moment où une requête part réellement : sur un
+upstream qui liste ses outils sans jeton, le premier événement révélateur est
+donc l'échec que l'utilisateur subit — précisément ce que la surface `_meta`
+existe pour éviter. Le lifespan amorce donc l'état au démarrage en interrogeant
+le **stockage** : `UpstreamTokenStorage.has_usable_token()`, purement local
+(lecture de fichier, aucune requête sortante, aucun retard au boot). Un jeton
+expiré mais porteur d'un `refresh_token` compte comme utilisable — le SDK le
+rafraîchit seul, et envoyer l'utilisateur cliquer lui ferait régler un problème
+qui n'existe pas. Sonder l'upstream aurait coûté un aller-retour réseau par
+upstream à chaque démarrage, pour une information déjà sur le disque.
+
+**Le premier appel refuse comme les suivants.** Quand l'AS ne réclame
+l'autorisation qu'à `tools/call`, le parcours OAuth du SDK démarre au milieu de
+cet appel et `_on_redirect`, non interactif, lève `AuthorizationRequired`. Elle
+traverse le transport sans être reconnue : l'appel restait suspendu jusqu'à son
+timeout, et le refus n'arrivait qu'au tour SUIVANT, une fois l'état posé — un
+tour entier perdu, pendant lequel MIAOU n'affiche rien. Le site d'appel la
+convertit donc en `UpstreamNotAuthorized` (via `_unwrap_exception_group`, anyio
+empaquetant ce qui traverse un task group).
 
 **Cache d'outils** (`ToolCatalogCache`, `<config>-tools.json`) : sans lui, un
 upstream non autorisé serait muet, `tools/list` répondant 401 avant de rien
