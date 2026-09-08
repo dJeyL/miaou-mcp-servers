@@ -1,6 +1,25 @@
-# Dépendances runtime — suffisantes pour lancer tous les serveurs.
-# Avec uv : uv run <script> installe automatiquement depuis le bloc PEP 723.
-# Avec pip : pip install -r requirements.txt
+# Dépendances runtime — suffisantes pour lancer tous les serveurs ET le proxy,
+# sans installer le projet. C'est le chemin pip :
+#
+#   pip install -r requirements.txt
+#   python -m mcp_proxy [options]        # depuis la racine
+#   python servers/mcp_bench.py          # ou n'importe quel serveur
+#
+# Avec uv, rien de tout ceci n'est nécessaire : les serveurs plats de servers/
+# (et dev_auth_server.py) portent un bloc PEP 723 dont `uv run <script>` installe
+# les dépendances tout seul, et le proxy passe par pyproject.toml
+# (`uv run mcp_proxy`, cf. [project.scripts]).
+#
+# Il garde deux usages que pyproject.toml ne couvre pas : installer les
+# dépendances SANS installer le projet (pas de build, pas de wheel — utile pour
+# qui clone et lance depuis la racine), et fournir pytest/pytest-asyncio, absents
+# de [project.dependencies] où ils vivent dans le groupe dev.
+#
+# À noter, parce que ce n'est pas ce qu'on attend : `pip install -e .` suffit
+# aussi à lancer les serveurs de servers/, alors que [tool.hatch] n'emballe que
+# mcp_proxy/. [project.dependencies] couvre en effet l'UNION des dépendances
+# runtime (DD7) — les paquets sont donc là, même pour du code non emballé,
+# qu'on lance par son chemin depuis la racine.
 
 mcp>=1.28.1,<2
 uvicorn

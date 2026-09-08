@@ -14,7 +14,7 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 | `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API |
 | `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) |
 | `servers/mcp_docs/` | 8771 | Extraction PDF/Office/Zip, paginée, sessions par conversation — **obsolète, désactivé par défaut** ([pourquoi](#mcp_docs--obsolète-mais-conservé-pour-le-hors-connexion)) |
-| `mcp_proxy.py` | configurable | Proxy qui agrège les serveurs ci-dessus |
+| `mcp_proxy/` | configurable | Proxy qui agrège les serveurs ci-dessus |
 
 ### `mcp_docs` : obsolète, mais conservé pour le hors-connexion
 
@@ -76,7 +76,7 @@ uv run servers/mcp_bench.py --transport stdio # mode stdio
 ```bash
 cp config.sample.json config.json
 # Éditer config.json : BRAVE_API_KEY, activer/désactiver des serveurs
-uv run mcp_proxy.py
+uv run mcp_proxy
 ```
 
 `config.sample.json` active bench, weather, web et duckduckgo par défaut en
@@ -268,8 +268,8 @@ Pour éviter deux terminaux, le proxy sait le lancer lui-même — il tourne alo
 le même process, sur son propre port, et la clé `auth` devient inutile :
 
 ```bash
-uv run mcp_proxy.py --with-dev-auth                  # AS sur 8787
-uv run mcp_proxy.py --with-dev-auth 9001 --dev-auth-auto-approve
+uv run mcp_proxy --with-dev-auth             # AS sur 8787
+uv run mcp_proxy --with-dev-auth 9001 --dev-auth-auto-approve
 ```
 
 > **Serveur de développement — jamais en production.** Il n'authentifie personne :
@@ -401,7 +401,14 @@ dans `tests/` parce que c'est un outil de vérification, pas un module du produi
 
 ```
 miaou-mcp-servers/
-├── mcp_proxy.py          # proxy (point d'entrée principal)
+├── mcp_proxy/            # proxy (package, point d'entrée principal)
+│   ├── upstream.py       # InProcess / Stdio / Http
+│   ├── config.py         # load_config, build_upstreams
+│   ├── server.py         # build_proxy_server, catalogue d'outils
+│   ├── auth_in.py        # Resource Server OAuth (entrante)
+│   ├── auth_out/         # client OAuth d'upstreams tiers (sortante), package
+│   ├── app.py            # application Starlette
+│   └── entry.py          # CLI, main()
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
 │   ├── mcp_base.py       # classe de base + make_opener() proxy-aware

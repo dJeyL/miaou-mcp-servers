@@ -1,4 +1,4 @@
-"""Tests pour mcp_proxy.py : config, upstreams, routing."""
+"""Tests pour le paquet mcp_proxy : config, upstreams, routing."""
 import os
 import sys
 from pathlib import Path
@@ -132,7 +132,7 @@ async def test_stdio_upstream_start_times_out_on_hanging_handshake(monkeypatch):
     bloquer le démarrage du proxy indéfiniment — timeout avec message clair."""
     import asyncio
 
-    monkeypatch.setattr(mcp_proxy, "_STDIO_HANDSHAKE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(mcp_proxy.upstream, "_STDIO_HANDSHAKE_TIMEOUT_S", 0.05)
 
     from contextlib import asynccontextmanager
 
@@ -572,7 +572,7 @@ async def test_build_app_mcp_without_trailing_slash_no_redirect():
         await send({"type": "http.response.body", "body": b""})
 
     with patch.object(
-        mcp_proxy.StreamableHTTPSessionManager,
+        mcp_proxy.app.StreamableHTTPSessionManager,
         "handle_request",
         new=fake_session_manager_handle_request,
     ):
@@ -941,15 +941,15 @@ def test_main_enables_system_trust_store_before_building_upstreams(tmp_path, mon
 
     order = []
     monkeypatch.setattr(
-        mcp_proxy, "enable_system_trust_store", lambda: order.append("trust")
+        mcp_proxy.entry, "enable_system_trust_store", lambda: order.append("trust")
     )
-    real_build = mcp_proxy.build_upstreams
+    real_build = mcp_proxy.entry.build_upstreams
     monkeypatch.setattr(
-        mcp_proxy,
+        mcp_proxy.entry,
         "build_upstreams",
         lambda *a, **kw: (order.append("upstreams"), real_build(*a, **kw))[1],
     )
-    monkeypatch.setattr(sys, "argv", ["mcp_proxy.py", "--config", str(cfg)])
+    monkeypatch.setattr(sys, "argv", ["mcp_proxy", "--config", str(cfg)])
 
     import uvicorn
 

@@ -1810,7 +1810,7 @@ async def test_debug_mode_names_the_absence_of_a_refusal(tmp_path, monkeypatch, 
     """LE cas que le mode debug existe pour rendre visible : un upstream qui ne
     refuse rien, donc aucun parcours possible — trois causes distinctes se
     présentaient jusque-là sous le même symptôme muet."""
-    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    monkeypatch.setattr(mcp_proxy.auth_out.debug, "_AUTH_DEBUG", True)
 
     def _never_refuses(request):
         import httpx
@@ -1835,7 +1835,7 @@ def _probe_verdict(monkeypatch, tmp_path, capsys, handler):
     import anyio
     import httpx
 
-    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    monkeypatch.setattr(mcp_proxy.auth_out.debug, "_AUTH_DEBUG", True)
     authorizer = _authorizer(tmp_path, interactive=True)
     _patch_authorize_transport(monkeypatch, handler)
 
@@ -1889,7 +1889,7 @@ def test_debug_mode_never_logs_a_token_value(monkeypatch, tmp_path, capsys):
         return httpx.Response(200, headers={"Mcp-Session-Id": "S1"},
                               json={"jsonrpc": "2.0", "id": 1, "result": {}})
 
-    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    monkeypatch.setattr(mcp_proxy.auth_out.debug, "_AUTH_DEBUG", True)
     authorizer = _authorizer(tmp_path, interactive=True)
     _patch_authorize_transport(monkeypatch, _with_token)
 
@@ -1967,7 +1967,7 @@ async def test_debug_mode_shows_the_redirect_uri_actually_sent(tmp_path, monkeyp
     Un refus de `redirect_uri` se règle en comparant cette valeur à celle
     enregistrée dans le client OAuth ; la lire dans la config ne prouve rien,
     seule celle-ci part réellement."""
-    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    monkeypatch.setattr(mcp_proxy.auth_out.debug, "_AUTH_DEBUG", True)
     authorizer = _authorizer(tmp_path, interactive=False)
 
     with pytest.raises(mcp_proxy.AuthorizationRequired):
@@ -2284,7 +2284,7 @@ async def test_storing_a_token_without_refresh_is_said_out_loud(
     """Le savoir à l'obtention plutôt qu'à l'expiration : c'est la différence
     entre un réglage à corriger côté AS et une panne subie des heures plus
     tard."""
-    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    monkeypatch.setattr(mcp_proxy.auth_out.debug, "_AUTH_DEBUG", True)
     storage = UpstreamTokenStorage(tmp_path / "t.json", "jira")
 
     await storage.set_tokens(_token(expires_in=3600))
@@ -2296,7 +2296,7 @@ async def test_storing_a_token_without_refresh_is_said_out_loud(
 
 @pytest.mark.anyio
 async def test_storing_a_refreshable_token_says_so(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    monkeypatch.setattr(mcp_proxy.auth_out.debug, "_AUTH_DEBUG", True)
     storage = UpstreamTokenStorage(tmp_path / "t.json", "jira")
 
     await storage.set_tokens(_token(expires_in=3600, refresh_token="r"))
@@ -2746,14 +2746,14 @@ def _restore_logging():
         )
         for n in names
     }
-    saved_flag = mcp_proxy._AUTH_DEBUG
+    saved_flag = mcp_proxy.auth_out.debug._AUTH_DEBUG
     yield
     for n, (level, handlers, propagate) in saved.items():
         logger = logging.getLogger(n)
         logger.setLevel(level)
         logger.handlers = handlers
         logger.propagate = propagate
-    mcp_proxy._AUTH_DEBUG = saved_flag
+    mcp_proxy.auth_out.debug._AUTH_DEBUG = saved_flag
 
 
 def test_debug_auth_instruments_the_post_boot_transport(_restore_logging):

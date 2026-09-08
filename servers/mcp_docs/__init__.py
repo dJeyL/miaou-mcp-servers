@@ -22,7 +22,7 @@ normal (`content_b64`), injectés par le dispatcher MIAOU seulement au premier
 appel pour un `ref` donné (matérialisation idempotente) ; les appels suivants
 ne portent que `ref`. Un `ref` inconnu sans `content_b64` déclenche l'erreur
 machine REF_UNKNOWN (voir `REF_UNKNOWN_SENTINEL` ci-dessous), convertie par le
-proxy (mcp_proxy.py) en erreur JSON-RPC ; le client MIAOU rejoue alors une fois
+proxy (paquet mcp_proxy) en erreur JSON-RPC ; le client MIAOU rejoue alors une fois
 avec le contenu inliné. Ce rejeu ne fonctionne que derrière le proxy — en
 standalone (FastMCP pur) l'appel échoue simplement en isError.
 

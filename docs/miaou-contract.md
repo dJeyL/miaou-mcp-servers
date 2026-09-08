@@ -76,7 +76,7 @@ mirror de `docs/mcp.md` §12 côté MIAOU, à tenir synchronisé si l'un des deu
   `mcp_docs.REF_UNKNOWN_SENTINEL`) ; le proxy (`mcp_proxy._wrap_ref_unknown_sentinel`)
   détecte ce sentinel dans le résultat `isError` (le SDK MCP avale toute exception de
   l'outil en `CallToolResult(isError=True)`, y compris `McpError` — voir le commentaire
-  du post-wrapper dans `mcp_proxy.py`) et lève `McpError(data={'code': 'REF_UNKNOWN'})`,
+  du post-wrapper dans `mcp_proxy/server.py`) et lève `McpError(data={'code': 'REF_UNKNOWN'})`,
   que `_handle_request` du SDK convertit en erreur JSON-RPC. **Ce rejeu ne fonctionne que
   derrière le proxy** : en standalone (FastMCP pur, port 8771 direct), l'appel échoue en
   isError textuel sans déclencher le rejeu — documenté ici, pas une régression à corriger.

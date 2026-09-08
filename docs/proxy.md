@@ -1,4 +1,4 @@
-# `mcp_proxy.py` — proxy MCP
+# `mcp_proxy/` — proxy MCP
 
 Agrégation des upstreams, configuration, override du proxy réseau. L'auth OAuth
 (entrante et sortante) est dans `docs/auth.md`.
@@ -66,24 +66,35 @@ Trois chemins d'application distincts selon le type d'upstream :
   aussi le `env` transmis aux subprocess stdio existants, ce qui n'est pas gratuit.
 
 
-## Architecture de `mcp_proxy.py`
+## Architecture de `mcp_proxy/`
 
 ```
-mcp_proxy.py (racine)
-├── ajoute servers/ à sys.path au démarrage
-├── lit config.json → build_upstreams()
+mcp_proxy/ (paquet, à la racine du projet)
+├── __init__.py    ajoute servers/ à sys.path, PUIS ré-exporte la surface publique
+│                  (l'ordre compte : les sous-modules importent mcp_base)
+├── logging.py     _log — sans dépendance interne, pour rester importable de partout
+├── contract.py    AUTHORIZATION_REQUIRED, authorize_path(), AuthorizationRequired
+│                  — ce que server et auth_out nomment tous deux ; posé ici, leur
+│                    dépendance reste à sens unique (pas de cycle entre eux)
+├── upstream.py    les trois types, même surface `Upstream` :
 │   ├── InProcessUpstream  : importlib.import_module(module) → module.mcp._tool_manager
 │   ├── StdioUpstream      : stdio_client + ClientSession (subprocess MCP)
 │   └── HttpUpstream       : streamablehttp_client + ClientSession (serveur distant)
-├── build_proxy_server()   : mcp.server.Server avec list_tools / call_tool dynamiques
+├── netproxy.py    override --proxy / --noproxy (calcul pur, n'applique rien)
+├── config.py      lit config.json → build_upstreams()
+├── server.py      build_proxy_server() : mcp.server.Server, list_tools / call_tool
 │   ├── list_tools → agrège tous les upstreams, préfixe les noms avec "{name}__"
-│   └── call_tool  → dépréfixe, route vers l'upstream concerné
-├── aggregate_instructions() : compose le champ `instructions` de l'InitializeResult
-├── build_app()            : Starlette + StreamableHTTPSessionManager + CORSMiddleware
+│   ├── call_tool  → dépréfixe, route vers l'upstream concerné
+│   └── aggregate_instructions() : compose `instructions` de l'InitializeResult
+├── auth_in.py     auth entrante — Resource Server (docs/auth.md)
+├── auth_out/      auth sortante — client OAuth de tiers (docs/auth.md), lui-même
+│                  découpé : debug (traces) → probe (sonde) → storage (jetons)
+│                  → authorizer (parcours, renouvellement, routes)
+├── app.py         build_app() : Starlette + StreamableHTTPSessionManager + CORS
 │   ├── lifespan : start/stop de chaque upstream, puis écriture des instructions
 │   └── auth (facultative) : routes RFC 9728 + RequireAuthMiddleware sur /mcp
-└── run_with_dev_auth()    : --with-dev-auth — proxy ET AS de développement dans
-                             ce process, sur DEUX ports (deux origines)
+└── entry.py       main() — CLI ; et run_with_dev_auth() : --with-dev-auth, proxy
+                   ET AS de développement dans ce process, sur DEUX ports
 ```
 
 `build_app()` ne retourne pas directement le `Starlette` mais une fonction ASGI qui l'enveloppe :
@@ -206,7 +217,7 @@ serveur) en plus de `"env"` :
 
 Un module qui veut supporter ça expose une factory `build(config: dict | None)
 -> FastMCP` en plus du singleton `mcp` — `InProcessUpstream.start()` (dans
-`mcp_proxy.py`) appelle `module.build(config)` si elle existe, sinon retombe
+`mcp_proxy/upstream.py`) appelle `module.build(config)` si elle existe, sinon retombe
 sur `module.mcp` (comportement actuel, inchangé pour tous les serveurs qui
 n'ont pas de `build()`) :
 

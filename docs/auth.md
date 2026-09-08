@@ -66,9 +66,11 @@ Trois propriétés à ne pas défaire :
   OIDC ne sert souvent que le second). La récupération est bloquante (urllib), donc passée
   par `asyncio.to_thread` — pattern du dépôt pour toute I/O en contexte async.
 
-`pyjwt[crypto]` est désormais importé directement, donc déclaré explicitement aux **trois**
-endroits qui gouvernent un environnement : le bloc PEP 723 de `mcp_proxy.py` (celui qui
-compte en mode inprocess), `requirements.txt` et `pyproject.toml`.
+`pyjwt[crypto]` est désormais importé directement, donc déclaré explicitement aux **deux**
+endroits qui gouvernent un environnement : `requirements.txt` et `pyproject.toml`. Il y en
+avait un troisième, le bloc PEP 723 en tête de `mcp_proxy.py` ; la mise en paquet du proxy
+l'a supprimé avec le fichier plat, et c'est `[project.dependencies]` qui couvre désormais
+le lancement `uv run mcp_proxy`.
 
 ## `dev_auth_server.py` — Authorization Server de développement (lot AB-1.3)
 

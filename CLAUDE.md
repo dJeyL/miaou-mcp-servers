@@ -16,7 +16,23 @@ tourner localement pendant le développement de MIAOU.
 
 ```
 miaou-mcp-servers/
-├── mcp_proxy.py          # serveur proxy (racine, point d'entrée principal)
+├── mcp_proxy/            # serveur proxy (package, point d'entrée principal)
+│   ├── __init__.py       # ré-exporte la surface publique historique
+│   ├── __main__.py       # `python -m mcp_proxy`
+│   ├── contract.py       # constantes/exceptions partagées (casse le cycle server↔auth_out)
+│   ├── logging.py        # `_log` format uvicorn
+│   ├── upstream.py       # InProcess / Stdio / Http
+│   ├── netproxy.py       # override --proxy / --noproxy
+│   ├── config.py         # load_config, build_upstreams
+│   ├── server.py         # build_proxy_server, catalogue, instructions
+│   ├── auth_in.py        # Resource Server OAuth (AB-1)
+│   ├── auth_out/         # client OAuth d'upstreams tiers (AB-2/AB-3), package
+│   │   ├── debug.py      # --debug-auth, masquage (porte _AUTH_DEBUG)
+│   │   ├── probe.py      # choix de l'outil de sonde, lecture du refus
+│   │   ├── storage.py    # UpstreamTokenStorage, gardes d'écriture
+│   │   └── authorizer.py # parcours, renouvellement, routes Starlette
+│   ├── app.py            # build_app (Starlette)
+│   └── entry.py          # CLI, main()
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
 │   ├── mcp_base.py       # classe de base partagée (MiaouMCPBase + make_opener)
@@ -46,6 +62,8 @@ miaou-mcp-servers/
 ├── config.json           # (gitignored) config active du proxy
 ├── requirements.txt      # pour les utilisateurs sans uv
 ├── pyproject.toml        # métadonnées projet + config pytest (asyncio_mode=auto) + groupe dev
+│                         # + [project.scripts] mcp_proxy et le build-system qui le rend
+│                         #   installable — c'est ce qui garde `uv run mcp_proxy` court
 ├── uv.lock               # lock uv, versionné
 └── .gitignore
 ```
@@ -64,7 +82,7 @@ Six serveurs de banc d'essai plus un proxy qui les agrège. Le détail de chacun
 | `mcp_ddg.py` | 8769 | Recherche DuckDuckGo (HTML scrapé) | `ddg_search` |
 | `mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) | `brave_search`, `brave_image_search` |
 | `mcp_docs/` | 8771 | Extraction PDF/Office/Zip — **obsolète, désactivé par défaut** | `list`, `read`, `search`, `extract`, `drop_session` |
-| `mcp_proxy.py` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) | (+ `status` si auth sortante) |
+| `mcp_proxy/` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) | (+ `status` si auth sortante) |
 
 Deux points qu'on ne devine pas depuis le tableau :
 
@@ -99,11 +117,11 @@ uv run --directory servers python -m mcp_docs        # HTTP 127.0.0.1:8771
 
 # Proxy (agrège tout sur un seul port)
 cp config.sample.json config.json     # puis éditer config.json (BRAVE_API_KEY, etc.)
-uv run mcp_proxy.py                   # port défini dans config.json
-uv run mcp_proxy.py --port 8765       # override port
-uv run mcp_proxy.py --config autre.json
-uv run mcp_proxy.py --proxy 10.0.0.1:3128   # force le proxy réseau vu par les upstreams
-uv run mcp_proxy.py --noproxy               # force l'absence de proxy vu par les upstreams
+uv run mcp_proxy                        # port défini dans config.json
+uv run mcp_proxy --port 8765            # override port
+uv run mcp_proxy --config autre.json
+uv run mcp_proxy --proxy 10.0.0.1:3128  # force le proxy réseau vu par les upstreams
+uv run mcp_proxy --noproxy              # force l'absence de proxy vu par les upstreams
 ```
 
 ### Avec pip
@@ -116,7 +134,7 @@ python servers/mcp_ddg.py [options]
 BRAVE_API_KEY=<key> python servers/mcp_brave.py [options]
 python -m mcp_web [options]     # depuis servers/ (package, pas un script plat)
 python -m mcp_docs [options]    # depuis servers/ (package, pas un script plat)
-python mcp_proxy.py [options]
+python -m mcp_proxy [options]     # depuis la racine (package, plus un script plat)
 ```
 
 
@@ -271,7 +289,7 @@ lots — piège déjà payé côté MIAOU.
   `mcp_brave` (`resolve_api_key`, refus d'init sans clef), `mcp_docs` (obsolète mais
   conservé pour le hors-connexion : sessions, pagination, `search`, `extract` hors
   `READ_CAP`, sécurité archives, locales des headings docx).
-- **`docs/proxy.md`** — `mcp_proxy.py` hors auth : les trois types d'upstream
+- **`docs/proxy.md`** — `mcp_proxy/` hors auth : les trois types d'upstream
   (inprocess/stdio/http), `build_upstreams`/`build_proxy_server`/`build_app` et le
   wrapper ASGI qui évite le 307 sur `/mcp`, l'override `--proxy`/`--noproxy` et ses
   trois chemins d'application, le format de `config.json`, le pattern

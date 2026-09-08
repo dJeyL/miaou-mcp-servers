@@ -107,7 +107,7 @@ class MiaouMCPBase:
     `config` transporte un dict libre propre à l'instance (base URL, credentials,
     etc.) — support du multi-instance inprocess : plusieurs entrées `mcpServers`
     du même module dans config.json, chacune avec sa propre clé `"config"` (voir
-    `InProcessUpstream` dans mcp_proxy.py). Un serveur qui n'a pas besoin de
+    `InProcessUpstream` dans mcp_proxy/upstream.py). Un serveur qui n'a pas besoin de
     multi-instance peut l'ignorer et continuer à lire `os.environ` comme avant.
 
     `instructions` porte une consigne valant pour le SERVEUR ENTIER, remontée

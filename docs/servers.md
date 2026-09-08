@@ -374,7 +374,7 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
 **Procédure manuelle (banc d'essai MIAOU, brief A)** — vérification réelle via l'UI MIAOU,
 à exécuter uniquement sur demande explicite, pas automatisée ici :
 
-1. Lancer le proxy (`uv run mcp_proxy.py`) avec `docs` activé dans `config.json`.
+1. Lancer le proxy (`uv run mcp_proxy`) avec `docs` activé dans `config.json`.
 2. Dans MIAOU, joindre un PDF/docx/xlsx/pptx/zip à un message, demander au modèle de lister
    sa structure (`docs__list`) puis de lire un extrait (`docs__read`).
 3. Vérifier le rejeu REF_UNKNOWN : recharger la page MIAOU en cours de conversation, puis

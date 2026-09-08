@@ -25,7 +25,7 @@ from pathlib import Path
 # Contrat REF_UNKNOWN partagé (proxy + tests)
 # ---------------------------------------------------------------------------
 
-# Marqueur stable en tête du message d'erreur. Le proxy (mcp_proxy.py) détecte
+# Marqueur stable en tête du message d'erreur. Le proxy (paquet mcp_proxy) détecte
 # ce préfixe dans le résultat isError du SDK MCP (qui avale toute exception
 # levée par l'outil) et le convertit en erreur JSON-RPC data.code=REF_UNKNOWN.
 REF_UNKNOWN_SENTINEL = "REF_UNKNOWN"
