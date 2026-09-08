@@ -1979,3 +1979,246 @@ async def test_debug_mode_shows_the_redirect_uri_actually_sent(tmp_path, monkeyp
     err = capsys.readouterr().err
     assert "redirect_uri : http://localhost:8765/callback" in err
     assert "client_id    : ABC" in err
+
+
+# ---------------------------------------------------------------------------
+# Endpoints de l'AS déclarés en config (lot AB-3)
+#
+# Le SDK ne connaît le token endpoint que par `context.oauth_metadata`, peuplé
+# par la seule découverte `/.well-known/...`, laquelle échoue sur un AS qui ne
+# les sert pas aux chemins essayés — et n'est de toute façon jamais persistée.
+# Son repli vise alors `<hôte-du-serveur-MCP>/token`, donc le Jira au lieu de
+# l'AS : le refresh échoue, le refresh token est jeté, l'utilisateur reclique.
+# ---------------------------------------------------------------------------
+
+def test_declared_endpoints_become_oauth_metadata():
+    meta = mcp_proxy.build_oauth_metadata_override({
+        "authorization_endpoint": "https://as.test/realms/w/protocol/openid-connect/auth",
+        "token_endpoint": "https://as.test/realms/w/protocol/openid-connect/token",
+    })
+
+    assert str(meta.token_endpoint) == (
+        "https://as.test/realms/w/protocol/openid-connect/token"
+    )
+    assert str(meta.authorization_endpoint) == (
+        "https://as.test/realms/w/protocol/openid-connect/auth"
+    )
+
+
+def test_an_issuer_is_derived_when_not_declared():
+    """`issuer` est exigé par le modèle mais n'a pas d'usage propre ici : le
+    déduire évite une clé de config de plus, sans rien décider."""
+    meta = mcp_proxy.build_oauth_metadata_override({
+        "authorization_endpoint": "https://as.test/realms/w/protocol/openid-connect/auth",
+        "token_endpoint": "https://as.test/realms/w/protocol/openid-connect/token",
+    })
+
+    assert str(meta.issuer).rstrip("/") == "https://as.test"
+
+
+def test_a_lone_token_endpoint_is_ignored():
+    """Les deux ou rien : un token endpoint seul laisserait le parcours initial
+    rediriger vers un AS découvert, et rafraîchir auprès d'un autre."""
+    assert mcp_proxy.build_oauth_metadata_override(
+        {"token_endpoint": "https://as.test/token"}
+    ) is None
+    assert mcp_proxy.build_oauth_metadata_override(
+        {"authorization_endpoint": "https://as.test/auth"}
+    ) is None
+
+
+def test_without_declaration_nothing_is_overridden():
+    """Le défaut ne bouge pas : la découverte reste le chemin nominal."""
+    assert mcp_proxy.build_oauth_metadata_override({}) is None
+    assert mcp_proxy.build_oauth_metadata_override(None) is None
+
+
+def test_the_provider_carries_the_declared_token_endpoint(tmp_path):
+    """LE test de non-régression du refresh : sans ça, `_refresh_token()` du
+    SDK se replie sur l'hôte du serveur MCP et poste vers un /token qui
+    n'existe pas."""
+    authorizers = _authorizers_for({
+        "client_id": "opencode",
+        "authorization_endpoint": "https://as.test/realms/w/protocol/openid-connect/auth",
+        "token_endpoint": "https://as.test/realms/w/protocol/openid-connect/token",
+    }, tmp_path)
+
+    context = authorizers["jira"].provider().context
+
+    assert context.oauth_metadata is not None
+    assert str(context.oauth_metadata.token_endpoint) == (
+        "https://as.test/realms/w/protocol/openid-connect/token"
+    )
+    # Et surtout : PAS l'hôte du serveur MCP.
+    assert "jira.test" not in str(context.oauth_metadata.token_endpoint)
+
+
+def test_an_undeclared_as_leaves_the_sdk_to_its_discovery(tmp_path):
+    authorizers = _authorizers_for({"client_id": "opencode"}, tmp_path)
+
+    assert authorizers["jira"].provider().context.oauth_metadata is None
+
+
+# ---------------------------------------------------------------------------
+# Rafraîchissement PROACTIF (lot AB-3)
+#
+# Le refresh du SDK est passif : il n'a lieu qu'au passage d'une requête. Un
+# upstream inutilisé assez longtemps perd son access token PUIS son refresh
+# token, et redemande une autorisation manuelle. C'est cette inactivité — et
+# elle seule — que la boucle couvre.
+# ---------------------------------------------------------------------------
+
+def _store_token(tmp_path, name="remote", *, expires_in, refresh="r"):
+    tokens = {"access_token": "a", "token_type": "Bearer", "expires_in": 3600}
+    if refresh:
+        tokens["refresh_token"] = refresh
+    (tmp_path / "t.json").write_text(json.dumps({
+        name: {"tokens": tokens, "expires_at": time.time() + expires_in}
+    }))
+
+
+@pytest.mark.anyio
+async def test_a_token_valid_for_a_long_time_is_left_alone(tmp_path):
+    """Une boucle de fond qui renouvelle sans raison ferait tourner
+    inutilement un AS à rotation, et multiplierait les écritures."""
+    _store_token(tmp_path, expires_in=mcp_proxy._REFRESH_MARGIN_S + 3600)
+    authorizer = _authorizer(tmp_path, interactive=False)
+
+    with patch("httpx.AsyncClient") as client:
+        assert await authorizer.refresh_if_due() is False
+    client.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_a_token_without_refresh_token_is_not_chased(tmp_path):
+    """Rien à renouveler : c'est une autorisation à refaire, pas un refresh à
+    tenter, et les surfaces le disent déjà."""
+    _store_token(tmp_path, expires_in=60, refresh=None)
+    authorizer = _authorizer(tmp_path, interactive=False)
+
+    with patch("httpx.AsyncClient") as client:
+        assert await authorizer.refresh_if_due() is False
+    client.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_a_token_about_to_expire_is_renewed_through_the_provider(tmp_path):
+    """Le renouvellement passe par le provider PARTAGÉ, sous le verrou du SDK :
+    un second chemin d'écriture ferait voir un rejeu à un AS à rotation, qui
+    révoquerait toute la famille de jetons."""
+    _store_token(tmp_path, expires_in=60)
+    authorizer = _authorizer(tmp_path, interactive=False)
+    seen = {}
+
+    async def _post(*a, **kw):
+        # Ce que ferait le SDK au passage de la requête : renouveler et écrire.
+        _store_token(tmp_path, expires_in=mcp_proxy._REFRESH_MARGIN_S + 3600)
+        return object()
+
+    class _Client:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        post = staticmethod(_post)
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is True
+
+    # L'auth passée au client est bien le provider partagé, pas un neuf.
+    assert seen["auth"] is authorizer.provider()
+    assert authorizer.authorization_pending is False
+
+
+@pytest.mark.anyio
+async def test_a_background_renewal_never_opens_an_interactive_flow(tmp_path):
+    """Une boucle de fond ne doit JAMAIS ouvrir un parcours que personne n'a
+    demandé : elle marque l'autorisation comme due et s'arrête là."""
+    _store_token(tmp_path, expires_in=60)
+    authorizer = _authorizer(tmp_path, interactive=False)
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            raise mcp_proxy.AuthorizationRequired("remote")
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is False
+
+    assert authorizer.interactive is False
+    assert authorizer.authorization_pending is True
+
+
+@pytest.mark.anyio
+async def test_an_unreachable_as_does_not_cost_the_authorization(tmp_path):
+    """Le jeton courant reste valable jusqu'à son terme : marquer
+    l'autorisation comme due enverrait cliquer pour une panne réseau."""
+    _store_token(tmp_path, expires_in=60)
+    authorizer = _authorizer(tmp_path, interactive=False)
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            raise OSError("réseau injoignable")
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is False
+
+    assert authorizer.authorization_pending is False
+
+
+@pytest.mark.anyio
+async def test_the_margin_is_wide_before_the_poll_interval():
+    """Plusieurs réveils doivent tomber dans la fenêtre « bientôt expiré »
+    avant l'échéance : sinon un réveil manqué (veille machine) laisse passer
+    l'expiration."""
+    assert mcp_proxy._REFRESH_MARGIN_S >= 2 * mcp_proxy._REFRESH_POLL_INTERVAL_S
+
+
+@pytest.mark.anyio
+async def test_storing_a_token_without_refresh_is_said_out_loud(
+    tmp_path, monkeypatch, capsys
+):
+    """Le savoir à l'obtention plutôt qu'à l'expiration : c'est la différence
+    entre un réglage à corriger côté AS et une panne subie des heures plus
+    tard."""
+    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    storage = UpstreamTokenStorage(tmp_path / "t.json", "jira")
+
+    await storage.set_tokens(_token(expires_in=3600))
+
+    err = capsys.readouterr().err
+    assert "SANS refresh_token" in err
+    assert "offline_access" in err
+
+
+@pytest.mark.anyio
+async def test_storing_a_refreshable_token_says_so(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(mcp_proxy, "_AUTH_DEBUG", True)
+    storage = UpstreamTokenStorage(tmp_path / "t.json", "jira")
+
+    await storage.set_tokens(_token(expires_in=3600, refresh_token="r"))
+
+    err = capsys.readouterr().err
+    assert "refresh_token présent" in err

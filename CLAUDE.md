@@ -286,7 +286,11 @@ lots — piège déjà payé côté MIAOU.
   l'attente sur événement de `/authorize/{name}`, `_provoke_refusal` qui déroule
   la séquence jusqu'à `tools/call` (seul refusé sur un déploiement
   d'entreprise), `--debug-auth` et son masquage, `HttpUpstream` et la contrainte
-  anyio des cancel scopes).
+  anyio des cancel scopes). Renouvellement (AB-3 : le refresh du SDK est passif et
+  vise `<hôte-du-serveur-MCP>/token` quand la découverte échoue — d'où
+  `build_oauth_metadata_override` et les endpoints déclarés ENSEMBLE en config —,
+  `refresh_if_due` et la boucle du lifespan qui couvre l'INACTIVITÉ, écriture par
+  le provider partagé pour rester écrivain unique).
 - **`docs/miaou-contract.md`** — surface de contact avec MIAOU : transport
   streamable-http et table de configuration des cartes serveur, séquence attendue
   (`initialize` → `tools/list` → `tools/call`) et les trois familles de blocs de

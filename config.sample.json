@@ -67,6 +67,9 @@
         "scope": "mcp:read",
         "_comment_creds": "Facultatifs : client_id, client_secret, redirect_uri, token_endpoint_auth_method.",
         "_comment_redirect": "redirect_uri : URL annoncée à l'AS. Défaut http://127.0.0.1:<port>/callback, dérivé de l'adresse d'écoute. À renseigner quand l'AS refuse le loopback en clair — le déploiement doit alors router cette URL vers /callback du proxy. Cf. docs/auth.md.",
+        "_comment_endpoints": "authorization_endpoint + token_endpoint : endpoints de l'AS, à déclarer ENSEMBLE quand la découverte /.well-known/... n'aboutit pas (WSO2/Keycloak sur un realm, p.ex.). Sans eux le SDK se replie sur <hôte-du-serveur-MCP>/token et le RENOUVELLEMENT du jeton échoue silencieusement : le refresh token est jeté et l'autorisation redemandée à la main. Cf. docs/auth.md.",
+        "authorization_endpoint": "",
+        "token_endpoint": "",
         "client_id": "",
         "client_secret": ""
       }

@@ -288,6 +288,92 @@ Trois issues, par coût croissant, et **aucune n'est du code** :
    aucun parcours n'est tenté. Sans `refresh_token`, il faudra le renouveler à
    l'expiration — c'est le prix de cette voie, et il est explicite.
 
+## Le renouvellement du jeton (lot AB-3)
+
+Le refresh est **entièrement passif, et c'est le SDK qui le fait**.
+`OAuthClientProvider` étant un `httpx.Auth`, httpx l'invoque sur chaque requête
+sortante du transport ; en tête d'`async_auth_flow`, s'il voit un jeton expiré et
+un refresh possible, il intercale lui-même un POST au token endpoint, met à jour
+le jeton, l'écrit par `set_tokens()`, et laisse partir l'appel avec le nouveau
+`Bearer`. Aucun appel explicite du proxy, aucune intervention utilisateur.
+
+Deux conditions le neutralisent, et toutes deux ont été payées en production le
+2026-09-07.
+
+### Le token endpoint doit être connu, et la découverte ne suffit pas
+
+`_refresh_token()` lit `context.oauth_metadata.token_endpoint`, et **se replie
+sinon sur `urljoin(<base du serveur MCP>, "/token")`** — l'hôte du Jira, pas
+celui de l'AS. Or `oauth_metadata` n'est peuplé que par la découverte
+`/.well-known/...`, qui a lieu dans la branche 401 d'`async_auth_flow`, et qui :
+
+- **échoue** si l'AS ne sert pas ses métadonnées aux trois chemins essayés
+  (WSO2/Keycloak sur un realm : seuls les endpoints
+  `.../protocol/openid-connect/*` existent) ;
+- **n'est jamais persistée** — au redémarrage, `_initialize()` recharge jetons et
+  client_info depuis le fichier, mais `oauth_metadata` repart à `None`.
+
+Le POST de renouvellement part alors vers une URL inexistante, échoue, et
+`_handle_refresh_response` appelle `clear_tokens()` : **le refresh token est
+jeté**, un parcours interactif s'ouvre, et l'utilisateur reclique « Autoriser »
+sans qu'un mot n'explique pourquoi (un `logger.warning` en DEBUG est la seule
+trace côté SDK).
+
+D'où `auth.authorization_endpoint` + `auth.token_endpoint` en config
+(`build_oauth_metadata_override`), posés sur `provider().context.oauth_metadata`
+à la construction. **Les deux ou rien** : un token endpoint seul laisserait le
+parcours initial rediriger vers un AS découvert et rafraîchir auprès d'un autre —
+deux AS pour une même identité est un mode de panne pire que l'absence de
+configuration. `issuer` est dérivé de l'authorization endpoint s'il n'est pas
+donné : le modèle l'exige, le SDK ne s'en sert pas ici.
+
+Une découverte qui aboutit écrase ces valeurs, et c'est voulu : des métadonnées
+fraîches valent mieux que des déclarées. Un échec, lui, ne les efface pas.
+
+### Passif ne suffit pas : l'inactivité
+
+Le refresh n'ayant lieu qu'au passage d'une requête, un upstream qu'on n'appelle
+pas pendant assez longtemps voit son access token expirer, **puis son refresh
+token**, sans qu'aucun des deux n'ait servi. Le prochain appel, des semaines plus
+tard, exige une ré-autorisation manuelle.
+
+`UpstreamAuthorizer.refresh_if_due()`, réveillé toutes les
+`_REFRESH_POLL_INTERVAL_S` par une boucle du lifespan, renouvelle quand
+l'échéance lue **en stockage** passe sous `_REFRESH_MARGIN_S`. La marge est large
+devant l'intervalle pour que plusieurs réveils tombent dans la fenêtre : un
+réveil manqué (machine en veille) ne doit pas laisser passer l'expiration. Sous
+un AS à rotation — WSO2 le fait, c'est configurable — cela repousse indéfiniment
+l'échéance du refresh token.
+
+Trois points de conception qui ne se devinent pas :
+
+- **L'écriture passe par le provider partagé**, via une requête anodine sur
+  l'upstream, jamais par un POST émis à la main. C'est le passage par
+  `async_auth_flow`, sous le `anyio.Lock` d'OAuthContext, qui garde **un seul
+  écrivain** sur le fichier de jetons. Un second chemin ferait voir un rejeu du
+  refresh token à un AS à rotation, qui révoquerait toute la famille — exactement
+  ce que la boucle existe pour éviter.
+- **`interactive` reste faux.** Si le renouvellement échoue, le SDK enchaîne sur
+  un parcours complet, que `_on_redirect` inhibe en levant
+  `AuthorizationRequired` : la boucle marque l'autorisation comme due et s'arrête
+  là. Une tâche de fond n'ouvre jamais un parcours que personne n'a demandé.
+- **Un AS injoignable ne coûte pas l'autorisation.** Le jeton courant reste
+  valable jusqu'à son terme et le prochain réveil réessaiera ; marquer
+  l'autorisation comme due enverrait cliquer pour une panne réseau passagère.
+
+Le déclencheur est l'échéance **en stockage**, pas `context.is_token_valid()` :
+le contexte peut n'avoir jamais été sollicité depuis le démarrage, auquel cas son
+verdict serait « valide » sur un jeton périmé.
+
+### L'absence de `refresh_token` est dite à voix haute
+
+Sous `--debug-auth`, `set_tokens()` — passage obligé de tout jeton obtenu, échange
+initial comme renouvellement — annonce si un `refresh_token` accompagne le jeton.
+Sans lui, rien ne pourra le renouveler et l'autorisation sera à refaire à la main.
+Le savoir à l'obtention plutôt qu'à l'expiration, c'est la différence entre un
+réglage à corriger côté AS (grant `refresh_token`, scope `offline_access`) et une
+panne subie des heures plus tard.
+
 ## `--debug-auth` : rendre le parcours observable
 
 Un parcours qui n'aboutit pas est **silencieux par construction** : le SDK avale

@@ -1611,6 +1611,30 @@ class UpstreamTokenStorage:
             fields["expires_at"] = None
         self._update_entry(**fields)
 
+        # PASSAGE OBLIGÉ de tout jeton obtenu — échange initial comme
+        # rafraîchissement. Le tracer ici, et pas dans le parcours, est ce qui
+        # rend le cycle de vie observable sans rejouer une autorisation.
+        #
+        # L'absence de `refresh_token` est dite à voix haute : sans lui, le
+        # jeton expirera sans que rien ne puisse le renouveler, et l'utilisateur
+        # se reverra proposer « Autoriser » sans explication. Le savoir à
+        # l'obtention plutôt qu'à l'expiration, c'est la différence entre un
+        # réglage à corriger côté AS (grant `refresh_token`, scope
+        # `offline_access`) et une panne subie des heures plus tard.
+        if not _auth_debug_enabled():
+            return
+        if tokens.refresh_token:
+            horizon = (f"expire dans {tokens.expires_in}s"
+                       if tokens.expires_in is not None
+                       else "sans expiration annoncée")
+            _log(f"  [auth] {self._name} jeton enregistré ({horizon}), "
+                 f"refresh_token présent — renouvellement automatique possible.")
+        else:
+            _log(f"  [auth] {self._name} jeton enregistré SANS refresh_token : "
+                 f"il ne pourra pas être renouvelé, et l'autorisation devra "
+                 f"être refaite à la main à son expiration. Vérifier le grant "
+                 f"'refresh_token' du client et le scope 'offline_access'.")
+
     async def get_client_info(self) -> Any:
         from mcp.shared.auth import OAuthClientInformationFull
 
@@ -1657,6 +1681,62 @@ def build_client_info_override(auth: dict[str, Any] | None) -> Any:
             "token_endpoint_auth_method",
             "client_secret_post" if auth.get("client_secret") else "none",
         ),
+    )
+
+
+def build_oauth_metadata_override(auth: dict[str, Any] | None) -> Any:
+    """Endpoints de l'AS déclarés en config → OAuthMetadata, ou None.
+
+    POURQUOI CE N'EST PAS UN CONFORT. Le SDK ne connaît le token endpoint que
+    par `context.oauth_metadata`, peuplé UNIQUEMENT par la découverte
+    `/.well-known/...` qui a lieu dans la branche 401 d'`async_auth_flow`. Deux
+    conséquences, toutes deux mesurées le 2026-09-07 sur un WSO2 :
+
+    - cette découverte ÉCHOUE quand l'AS ne sert pas ses métadonnées aux trois
+      chemins que le SDK essaie (ici : realms/wso2, où seuls les endpoints
+      `protocol/openid-connect/*` existent) ;
+    - même réussie, elle n'est JAMAIS persistée : au redémarrage du proxy,
+      `_initialize()` recharge les jetons et le client_info depuis le fichier,
+      mais `oauth_metadata` repart à None.
+
+    Or `_refresh_token()` du SDK se replie alors sur
+    `urljoin(base_url_du_SERVEUR_MCP, "/token")` — l'hôte du Jira, pas celui de
+    l'AS. Le POST de rafraîchissement part vers une URL inexistante, échoue, et
+    `_handle_refresh_response` appelle `clear_tokens()` : le refresh token est
+    jeté, un parcours interactif s'ouvre, et l'utilisateur reclique. Le tout
+    sans un mot, un `logger.warning` en DEBUG étant la seule trace.
+
+    Déclarer les endpoints rend donc le rafraîchissement possible là où la
+    découverte ne peut pas aboutir. `issuer` n'a pas d'usage propre ici — le
+    SDK ne le vérifie pas — mais le modèle l'exige : on le dérive de
+    l'authorization endpoint quand il n'est pas donné.
+    """
+    if not auth:
+        return None
+    token_endpoint = auth.get("token_endpoint")
+    authorization_endpoint = auth.get("authorization_endpoint")
+    if not token_endpoint or not authorization_endpoint:
+        # Les deux ou rien : un token endpoint seul laisserait le parcours
+        # initial rediriger vers une URL découverte, donc potentiellement vers
+        # un autre AS que celui qui rafraîchit. Deux AS pour une même identité
+        # est un mode de panne bien pire que l'absence de configuration.
+        return None
+
+    from mcp.shared.auth import OAuthMetadata
+
+    issuer = auth.get("issuer")
+    if not issuer:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(authorization_endpoint)
+        issuer = f"{parsed.scheme}://{parsed.netloc}"
+
+    return OAuthMetadata(
+        issuer=issuer,
+        authorization_endpoint=authorization_endpoint,
+        token_endpoint=token_endpoint,
+        registration_endpoint=auth.get("registration_endpoint"),
+        scopes_supported=auth["scope"].split() if auth.get("scope") else None,
     )
 
 
@@ -1900,6 +1980,22 @@ def _pick_probe_tool(listed_body: str) -> str | None:
 _AUTHORIZATION_WAIT_S = 300.0
 
 _AUTHORIZE_ROUTE_WAIT_S = 20.0
+
+# Rafraîchissement PROACTIF : intervalle de réveil, et marge avant expiration
+# en deçà de laquelle on renouvelle sans attendre un appel d'outil.
+#
+# Le refresh du SDK est PASSIF — il n'a lieu qu'au passage d'une requête. Sur un
+# upstream peu sollicité, l'access token peut donc expirer, puis le refresh
+# token lui-même, sans qu'aucune requête ne les ait jamais renouvelés : au
+# prochain appel, des semaines plus tard, l'utilisateur se retrouve devant un
+# parcours d'autorisation complet. Ce que la boucle achète est exactement ça —
+# elle ne remplace pas le refresh passif, elle couvre l'INACTIVITÉ.
+#
+# La marge est large devant l'intervalle : il faut que plusieurs réveils
+# tombent dans la fenêtre « bientôt expiré » avant l'échéance, sinon un réveil
+# manqué (proxy suspendu, machine en veille) laisse passer l'expiration.
+_REFRESH_POLL_INTERVAL_S = 300.0
+_REFRESH_MARGIN_S = 900.0
 """Ce que /authorize/{name} attend avant de rendre la main au navigateur.
 
 Borne la DÉCOUVERTE de l'AS (métadonnées, éventuel enregistrement de client),
@@ -1963,11 +2059,18 @@ class UpstreamAuthorizer:
         scope: str | None = None,
         open_browser: bool = False,
         wait_timeout: float = _AUTHORIZATION_WAIT_S,
+        oauth_metadata: Any = None,
     ) -> None:
         self.name = name
         self.server_url = server_url
         self.callback_url = callback_url
         self.scope = scope
+        # Endpoints déclarés en config, s'il y en a. Posés sur le contexte du
+        # provider à sa construction : le SDK ne les découvre qu'en branche
+        # 401 et ne les persiste jamais, donc sans ça le refresh d'un proxy
+        # redémarré vise `<hôte-du-serveur-MCP>/token`. Cf.
+        # build_oauth_metadata_override.
+        self.oauth_metadata = oauth_metadata
         self.open_browser = open_browser
         self.wait_timeout = wait_timeout
         self._storage = storage
@@ -2290,6 +2393,105 @@ class UpstreamAuthorizer:
             await upstream.stop()
             await upstream.start()
 
+    async def refresh_if_due(self) -> bool:
+        """Renouvelle le jeton s'il expire bientôt. Rend True s'il l'a fait.
+
+        POURQUOI CETTE MÉTHODE EXISTE. Le refresh du SDK est passif : il se
+        déclenche dans `async_auth_flow`, donc uniquement quand une requête
+        traverse le provider. Un upstream qu'on n'appelle pas pendant une
+        semaine voit son access token expirer, puis son refresh token, sans
+        qu'aucun des deux n'ait servi — et le prochain appel exige une
+        ré-autorisation manuelle. Rafraîchir d'avance transforme l'inactivité
+        en non-événement, et sous un AS à rotation (WSO2 le fait, c'est
+        configurable) cela repousse indéfiniment l'échéance du refresh token.
+
+        ÉCRITURE PAR LE PROVIDER PARTAGÉ, jamais en direct. Le renouvellement
+        passe par `async_auth_flow`, sous le `anyio.Lock` d'OAuthContext, comme
+        le ferait un appel d'outil : c'est ce qui garde UN SEUL écrivain sur le
+        fichier de jetons. Émettre le POST nous-mêmes doublerait le chemin de
+        refresh, et un AS à rotation verrait deux usages du même refresh token
+        — il révoquerait alors toute la famille, ce que cette boucle est
+        justement censée éviter.
+
+        Le déclencheur est l'échéance lue en STOCKAGE, pas
+        `context.is_token_valid()` : le contexte peut très bien ne rien savoir
+        (provider jamais sollicité depuis le démarrage), auquel cas son verdict
+        serait « valide » sur un jeton périmé.
+        """
+        token = await self._storage.get_tokens()
+        if token is None or not token.refresh_token:
+            # Rien à renouveler : soit aucun jeton, soit un jeton sans moyen de
+            # l'être. Dans les deux cas c'est à l'utilisateur d'autoriser, et
+            # les surfaces le disent déjà.
+            return False
+        if token.expires_in is None:
+            # Sans échéance annoncée, rien ne permet de dire « bientôt » : on
+            # laisse le refresh passif faire son travail au premier 401.
+            return False
+        if token.expires_in > _REFRESH_MARGIN_S:
+            return False
+
+        import httpx
+
+        # Une requête quelconque suffit : c'est son PASSAGE par le provider qui
+        # déclenche le refresh, pas ce qu'elle demande. On vise donc l'upstream
+        # avec la plus inoffensive qui soit — et son résultat ne nous intéresse
+        # pas, seulement l'effet de bord sur le stockage.
+        #
+        # `interactive` reste FAUX : si le renouvellement échoue (refresh token
+        # révoqué ou expiré), le SDK enchaîne sur un parcours complet, que
+        # `_on_redirect` inhibe en levant AuthorizationRequired. C'est le
+        # comportement voulu — une boucle de fond ne doit jamais ouvrir un
+        # parcours interactif que personne n'a demandé ; elle marque
+        # l'autorisation comme due et s'arrête là.
+        try:
+            async with httpx.AsyncClient(
+                auth=self.provider(), timeout=self.wait_timeout,
+                follow_redirects=False,
+            ) as client:
+                await client.post(
+                    self.server_url,
+                    headers={
+                        "Accept": "application/json, text/event-stream",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": _MCP_PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "clientInfo": {"name": "miaou-proxy", "version": "1"},
+                        },
+                    },
+                )
+        except AuthorizationRequired:
+            _log(f"Renouvellement du jeton de '{self.name}' impossible — "
+                 f"autorisation à refaire : {authorize_path(self.name)}")
+            self.authorization_pending = True
+            return False
+        except Exception as e:
+            # Un AS injoignable n'est pas une autorisation perdue : le jeton
+            # courant reste valable jusqu'à son terme, et le prochain réveil
+            # réessaiera. Ne PAS marquer l'autorisation comme due ici, ce
+            # serait envoyer cliquer pour une panne réseau passagère.
+            _log(f"Renouvellement du jeton de '{self.name}' échoué ({e}) — "
+                 f"nouvelle tentative au prochain réveil.")
+            return False
+
+        # Le témoin est le STOCKAGE, pas l'absence d'exception : la requête
+        # peut très bien avoir abouti sans qu'aucun refresh n'ait eu lieu.
+        renewed = await self._storage.get_tokens()
+        if renewed is not None and renewed.expires_in is not None and (
+            renewed.expires_in > _REFRESH_MARGIN_S
+        ):
+            _log(f"Jeton de '{self.name}' renouvelé "
+                 f"(valide {int(renewed.expires_in)}s).")
+            self.authorization_pending = False
+            return True
+        return False
+
     def provider(self) -> Any:
         """Construit le provider AU PREMIER APPEL, puis le rend tel quel."""
         if self._provider is not None:
@@ -2312,6 +2514,18 @@ class UpstreamAuthorizer:
             redirect_handler=self._on_redirect,
             callback_handler=self._on_callback,
         )
+        if self.oauth_metadata is not None:
+            # Posé sur le CONTEXTE, pas passé au constructeur : le SDK n'a pas
+            # de paramètre pour ça, il n'attend ces métadonnées que de sa
+            # découverte. Les y installer d'avance fait exactement ce que la
+            # découverte aurait fait si elle avait abouti — `_refresh_token()`
+            # et `_perform_authorization()` lisent tous deux
+            # `context.oauth_metadata` sans se soucier de son origine.
+            #
+            # Ne PAS mettre `auth_server_url` à jour au passage : il ne sert
+            # qu'à construire les URLs de découverte, laquelle n'aura plus
+            # lieu d'être pour les endpoints qu'on vient de fournir.
+            self._provider.context.oauth_metadata = self.oauth_metadata
         return self._provider
 
 
@@ -2600,6 +2814,7 @@ def build_upstream_authorizers(
         # d'avance — cas rencontré en production (WSO2) le 2026-09-07. C'est
         # alors au déploiement de router cette URL vers `/callback` du proxy.
         upstream_callback = auth.get("redirect_uri") or callback_url
+        oauth_metadata = build_oauth_metadata_override(auth)
         authorizer = UpstreamAuthorizer(
             name=name,
             server_url=srv["url"],
@@ -2607,7 +2822,11 @@ def build_upstream_authorizers(
             callback_url=upstream_callback,
             scope=auth.get("scope"),
             open_browser=open_browser,
+            oauth_metadata=oauth_metadata,
         )
+        if oauth_metadata is not None:
+            _log(f"  {name:<12} endpoints OAuth déclarés : "
+                 f"token={oauth_metadata.token_endpoint}")
         if auth.get("redirect_uri"):
             _log(f"  {name:<12} redirection OAuth : {upstream_callback} "
                  f"(depuis la config)")
@@ -2744,6 +2963,28 @@ def build_app(
         # /authorize/{name} (qui doivent survivre à la requête qui les lance,
         # sans quoi le navigateur resterait suspendu pendant qu'on attend son
         # propre retour sur /callback).
+        async def _refresh_loop() -> None:
+            """Renouvelle d'avance les jetons qui vont expirer.
+
+            Le refresh du SDK étant passif (il n'a lieu qu'au passage d'une
+            requête), un upstream inutilisé assez longtemps perd son access
+            token PUIS son refresh token, et redemande une autorisation
+            manuelle. Cette boucle couvre cette inactivité, et elle seule : le
+            chemin normal reste le refresh passif, au fil des appels.
+
+            Jamais bruyante quand tout va bien — `refresh_if_due` ne fait rien
+            tant que l'échéance est loin, et ne log que lorsqu'il se passe
+            quelque chose. Une exception ici ne doit pas emporter le task
+            group, donc le proxy : on la signale et on continue.
+            """
+            while True:
+                await anyio.sleep(_REFRESH_POLL_INTERVAL_S)
+                for name, authorizer in (authorizers or {}).items():
+                    try:
+                        await authorizer.refresh_if_due()
+                    except Exception as e:  # pragma: no cover - filet
+                        _log(f"Renouvellement de '{name}' interrompu ({e}).")
+
         async with anyio.create_task_group() as tg:
             app.state.task_group = tg
             for upstream in upstreams.values():
@@ -2753,6 +2994,12 @@ def build_app(
             started: list[Upstream] = []
             try:
                 started = await _start_upstreams()
+                # Lancée APRÈS le démarrage : elle n'a rien à faire tant qu'un
+                # upstream n'a pas de jeton, et le premier réveil est de toute
+                # façon différé d'un intervalle. Annulée avec le task group à
+                # l'extinction (cancel_scope.cancel() du finally).
+                if authorizers:
+                    tg.start_soon(_refresh_loop)
                 # session_manager.run() initialise le task group interne requis pour
                 # traiter les requêtes MCP (sans ça : RuntimeError "Task group is not initialized").
                 async with session_manager.run():
