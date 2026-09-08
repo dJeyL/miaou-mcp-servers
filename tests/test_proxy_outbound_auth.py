@@ -2068,12 +2068,22 @@ def test_an_undeclared_as_leaves_the_sdk_to_its_discovery(tmp_path):
 # elle seule — que la boucle couvre.
 # ---------------------------------------------------------------------------
 
-def _store_token(tmp_path, name="remote", *, expires_in, refresh="r"):
-    tokens = {"access_token": "a", "token_type": "Bearer", "expires_in": 3600}
+def _store_token(tmp_path, name="remote", *, expires_in, refresh="r",
+                 lifetime=3600):
+    """`expires_in` = ce qu'il RESTE ; `lifetime` = ce que l'AS a émis.
+
+    Les deux sont distincts et tous deux nécessaires : la marge de
+    renouvellement se calibre sur la durée de vie émise, pas sur le reliquat.
+    """
+    tokens = {"access_token": "a", "token_type": "Bearer", "expires_in": lifetime}
     if refresh:
         tokens["refresh_token"] = refresh
     (tmp_path / "t.json").write_text(json.dumps({
-        name: {"tokens": tokens, "expires_at": time.time() + expires_in}
+        name: {
+            "tokens": tokens,
+            "expires_at": time.time() + expires_in,
+            "lifetime": lifetime,
+        }
     }))
 
 
@@ -2188,12 +2198,83 @@ async def test_an_unreachable_as_does_not_cost_the_authorization(tmp_path):
     assert authorizer.authorization_pending is False
 
 
+def test_the_poll_interval_stays_under_the_shortest_margin():
+    """L'INVARIANT : plusieurs réveils doivent tomber dans la fenêtre « bientôt
+    expiré » de chaque upstream. Des constantes fixes ne peuvent pas le tenir —
+    sur des jetons de 5 min la marge vaut 150 s, sous l'intervalle par défaut de
+    300 s, et la fenêtre serait sautée en entier."""
+    class _S:
+        def __init__(self, lifetime):
+            self._lifetime = lifetime
+
+        def observed_lifetime(self):
+            return self._lifetime
+
+    class _A:
+        def __init__(self, lifetime):
+            self._storage = _S(lifetime)
+
+    short = mcp_proxy._refresh_poll_interval({"jira": _A(300)})
+    assert short <= 300 / 2 / 2
+
+    # Un AS généreux n'est pas sondé plus souvent que le plafond.
+    assert mcp_proxy._refresh_poll_interval({"jira": _A(3600)}) == (
+        mcp_proxy._REFRESH_POLL_INTERVAL_S
+    )
+    # Rien d'observé encore : le plafond, pas une boucle serrée.
+    assert mcp_proxy._refresh_poll_interval({}) == mcp_proxy._REFRESH_POLL_INTERVAL_S
+
+
 @pytest.mark.anyio
-async def test_the_margin_is_wide_before_the_poll_interval():
-    """Plusieurs réveils doivent tomber dans la fenêtre « bientôt expiré »
-    avant l'échéance : sinon un réveil manqué (veille machine) laisse passer
-    l'expiration."""
-    assert mcp_proxy._REFRESH_MARGIN_S >= 2 * mcp_proxy._REFRESH_POLL_INTERVAL_S
+async def test_a_short_lived_token_is_not_renewed_on_every_wake(tmp_path):
+    """Une marge fixe de 15 min rendrait « bientôt expiré » tout jeton d'un AS
+    qui en émet de 5 min, dès son émission : la boucle renouvellerait à chaque
+    réveil, ce qui est le rejeu qu'on veut éviter devant un AS à rotation."""
+    _store_token(tmp_path, expires_in=280, lifetime=300)
+    authorizer = _authorizer(tmp_path, interactive=False)
+
+    with patch("httpx.AsyncClient") as client:
+        assert await authorizer.refresh_if_due() is False
+    client.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_a_renewal_is_judged_on_the_deadline_moving(tmp_path):
+    """Le témoin est que l'échéance ait AVANCÉ, jamais qu'elle dépasse une
+    marge : exiger d'un jeton frais qu'il vive plus de 15 min classait en échec
+    un renouvellement réussi sur un AS qui en émet de 5 — rien n'était
+    journalisé, et la boucle recommençait au réveil suivant."""
+    _store_token(tmp_path, expires_in=30, lifetime=300)
+    authorizer = _authorizer(tmp_path, interactive=False)
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            # Renouvellement réussi : 300 s, bien en deçà de _REFRESH_MARGIN_S.
+            _store_token(tmp_path, expires_in=300, lifetime=300)
+            return object()
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is True
+
+
+@pytest.mark.anyio
+async def test_the_issued_lifetime_is_remembered(tmp_path):
+    """`expires_in` relu plus tard est ce qu'il RESTE : la durée de vie ne se
+    lit qu'à l'émission, et c'est elle qui calibre la marge."""
+    storage = UpstreamTokenStorage(tmp_path / "t.json", "jira")
+
+    await storage.set_tokens(_token(expires_in=300, refresh_token="r"))
+
+    assert storage.observed_lifetime() == 300
 
 
 @pytest.mark.anyio

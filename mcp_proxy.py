@@ -1602,11 +1602,27 @@ class UpstreamTokenStorage:
             return bool(token.refresh_token)
         return True
 
+    def observed_lifetime(self) -> float | None:
+        """Durée de vie à l'émission du dernier jeton écrit, ou None.
+
+        Sert à calibrer la marge de renouvellement sur ce que l'AS émet
+        réellement, plutôt que sur une constante qui suppose des jetons d'une
+        heure. Lecture de fichier, aucun réseau.
+        """
+        value = self._read_entry().get("lifetime")
+        return float(value) if isinstance(value, (int, float)) else None
+
     async def set_tokens(self, tokens: Any) -> None:
         payload = tokens.model_dump(exclude_none=True, mode="json")
         fields: dict[str, Any] = {"tokens": payload}
         if tokens.expires_in is not None:
             fields["expires_at"] = time.time() + tokens.expires_in
+            # DURÉE DE VIE À L'ÉMISSION, mémorisée ici parce que c'est le seul
+            # endroit où on la voit : relu plus tard, `expires_in` est ce qu'il
+            # RESTE. C'est elle qui calibre la marge de renouvellement, laquelle
+            # ne peut pas être une constante — un AS qui émet des jetons de 5
+            # minutes rendrait « bientôt expiré » tout jeton dès son émission.
+            fields["lifetime"] = tokens.expires_in
         else:
             fields["expires_at"] = None
         self._update_entry(**fields)
@@ -1991,11 +2007,41 @@ _AUTHORIZE_ROUTE_WAIT_S = 20.0
 # parcours d'autorisation complet. Ce que la boucle achète est exactement ça —
 # elle ne remplace pas le refresh passif, elle couvre l'INACTIVITÉ.
 #
-# La marge est large devant l'intervalle : il faut que plusieurs réveils
-# tombent dans la fenêtre « bientôt expiré » avant l'échéance, sinon un réveil
-# manqué (proxy suspendu, machine en veille) laisse passer l'expiration.
+# INVARIANT : la marge doit rester large devant l'intervalle, pour que
+# plusieurs réveils tombent dans la fenêtre « bientôt expiré » avant
+# l'échéance — sinon un réveil manqué (proxy suspendu, machine en veille)
+# laisse passer l'expiration.
+#
+# Deux constantes fixes ne peuvent pas tenir cet invariant face à un AS
+# quelconque. La marge est plafonnée à la moitié de la durée de vie réellement
+# émise (`_refresh_margin`), donc sur des jetons de 5 minutes — WSO2, mesuré le
+# 2026-09-08 — elle tombe à 150 s, sous un intervalle de 300 s : la fenêtre
+# serait sautée en entier. L'intervalle se dérive donc de la marge la plus
+# courte en vigueur (`_refresh_poll_interval`), et ces valeurs ne sont que des
+# plafonds, pour un AS qui émet des jetons de longue durée.
 _REFRESH_POLL_INTERVAL_S = 300.0
 _REFRESH_MARGIN_S = 900.0
+
+
+def _refresh_poll_interval(authorizers: dict[str, Any] | None) -> float:
+    """Période de réveil : assez courte pour qu'aucune fenêtre ne soit sautée.
+
+    Un tiers de la marge la plus courte parmi les upstreams, pour que trois
+    réveils au moins tombent dans la fenêtre de chacun. Plafonné à
+    `_REFRESH_POLL_INTERVAL_S` — un AS généreux n'a pas à être sondé plus
+    souvent — et borné en bas pour ne pas tourner en boucle serrée sur un AS
+    aux jetons très courts.
+    """
+    margins = []
+    for authorizer in (authorizers or {}).values():
+        storage = getattr(authorizer, "_storage", None)
+        observed = getattr(storage, "observed_lifetime", None)
+        lifetime = observed() if callable(observed) else None
+        if lifetime:
+            margins.append(min(_REFRESH_MARGIN_S, lifetime / 2))
+    if not margins:
+        return _REFRESH_POLL_INTERVAL_S
+    return max(30.0, min(_REFRESH_POLL_INTERVAL_S, min(margins) / 3))
 """Ce que /authorize/{name} attend avant de rendre la main au navigateur.
 
 Borne la DÉCOUVERTE de l'AS (métadonnées, éventuel enregistrement de client),
@@ -2428,8 +2474,12 @@ class UpstreamAuthorizer:
             # Sans échéance annoncée, rien ne permet de dire « bientôt » : on
             # laisse le refresh passif faire son travail au premier 401.
             return False
-        if token.expires_in > _REFRESH_MARGIN_S:
+        if token.expires_in > self._refresh_margin(token):
             return False
+
+        # L'instant d'expiration AVANT la tentative : c'est son avancement qui
+        # dira si un renouvellement a réellement eu lieu (cf. plus bas).
+        deadline_before = time.time() + token.expires_in
 
         import httpx
 
@@ -2482,15 +2532,48 @@ class UpstreamAuthorizer:
 
         # Le témoin est le STOCKAGE, pas l'absence d'exception : la requête
         # peut très bien avoir abouti sans qu'aucun refresh n'ait eu lieu.
+        #
+        # Et le critère est que l'ÉCHÉANCE AIT AVANCÉ, jamais qu'elle dépasse
+        # une marge. Comparer à `_REFRESH_MARGIN_S` (première version) exigeait
+        # d'un jeton frais qu'il vive plus de 15 minutes : sur un AS qui en
+        # émet de 5 minutes — WSO2, mesuré le 2026-09-08 — un renouvellement
+        # parfaitement réussi était classé en échec. Rien n'était journalisé,
+        # et la boucle recommençait à chaque réveil sur un jeton qu'elle venait
+        # de renouveler, ce qui est exactement le rejeu qu'on veut éviter
+        # devant un AS à rotation.
         renewed = await self._storage.get_tokens()
-        if renewed is not None and renewed.expires_in is not None and (
-            renewed.expires_in > _REFRESH_MARGIN_S
-        ):
-            _log(f"Jeton de '{self.name}' renouvelé "
-                 f"(valide {int(renewed.expires_in)}s).")
-            self.authorization_pending = False
-            return True
-        return False
+        if renewed is None or renewed.expires_in is None:
+            return False
+        deadline_after = time.time() + renewed.expires_in
+        if deadline_after <= deadline_before:
+            return False
+        _log(f"Jeton de '{self.name}' renouvelé "
+             f"(valide {int(renewed.expires_in)}s).")
+        self.authorization_pending = False
+        return True
+
+    def _refresh_margin(self, token: Any) -> float:
+        """Combien de temps AVANT l'échéance on renouvelle.
+
+        Plafonnée à une FRACTION de la durée de vie du jeton, sans quoi une
+        marge fixe plus large que cette durée rend tout jeton « bientôt
+        expiré » dès son émission : la boucle renouvellerait à chaque réveil,
+        indéfiniment. Un AS d'entreprise émet couramment des jetons de 5
+        minutes (WSO2, mesuré le 2026-09-08) là où la marge vaut 15 minutes.
+
+        La durée de vie n'est pas lisible sur un jeton déjà entamé —
+        `expires_in` est ce qu'il en RESTE. On retient donc la plus longue
+        échéance vue pour cet upstream, mémorisée à l'écriture par le stockage,
+        et on retombe sur `expires_in` tant qu'on n'a rien vu de mieux.
+        """
+        lifetime = getattr(self._storage, "observed_lifetime", None)
+        if callable(lifetime):
+            lifetime = lifetime()
+        if not lifetime:
+            lifetime = token.expires_in or 0
+        # La moitié de la durée de vie laisse un réveil entier pour réessayer
+        # après un échec, sans renouveler dès l'émission.
+        return min(_REFRESH_MARGIN_S, lifetime / 2)
 
     def provider(self) -> Any:
         """Construit le provider AU PREMIER APPEL, puis le rend tel quel."""
@@ -2995,7 +3078,10 @@ def build_app(
             group, donc le proxy : on la signale et on continue.
             """
             while True:
-                await anyio.sleep(_REFRESH_POLL_INTERVAL_S)
+                # Recalculé à CHAQUE tour : au premier réveil aucun jeton n'a
+                # encore été observé, et la période se resserre d'elle-même dès
+                # qu'on connaît la durée de vie réellement émise par l'AS.
+                await anyio.sleep(_refresh_poll_interval(authorizers))
                 for name, authorizer in (authorizers or {}).items():
                     try:
                         await authorizer.refresh_if_due()

@@ -337,13 +337,32 @@ pas pendant assez longtemps voit son access token expirer, **puis son refresh
 token**, sans qu'aucun des deux n'ait servi. Le prochain appel, des semaines plus
 tard, exige une ré-autorisation manuelle.
 
-`UpstreamAuthorizer.refresh_if_due()`, réveillé toutes les
-`_REFRESH_POLL_INTERVAL_S` par une boucle du lifespan, renouvelle quand
-l'échéance lue **en stockage** passe sous `_REFRESH_MARGIN_S`. La marge est large
-devant l'intervalle pour que plusieurs réveils tombent dans la fenêtre : un
-réveil manqué (machine en veille) ne doit pas laisser passer l'expiration. Sous
-un AS à rotation — WSO2 le fait, c'est configurable — cela repousse indéfiniment
+`UpstreamAuthorizer.refresh_if_due()`, réveillé par une boucle du lifespan,
+renouvelle quand l'échéance lue **en stockage** passe sous la marge. Sous un AS à
+rotation — WSO2 le fait, c'est configurable — cela repousse indéfiniment
 l'échéance du refresh token.
+
+**Les deux constantes ne sont que des plafonds**, et c'est la correction du
+2026-09-08. L'invariant à tenir est que plusieurs réveils tombent dans la fenêtre
+« bientôt expiré » avant l'échéance, sinon un réveil manqué (machine en veille)
+laisse passer l'expiration. Deux valeurs fixes ne peuvent pas le tenir face à un
+AS quelconque : sur des jetons de **5 minutes** — mesuré sur WSO2 — une marge de
+15 minutes rend tout jeton « bientôt expiré » dès son émission, et la boucle
+renouvelle à chaque réveil, ce qui est exactement le rejeu qu'on veut éviter
+devant un AS à rotation.
+
+La marge est donc plafonnée à la **moitié de la durée de vie réellement émise**
+(`_refresh_margin`), et la période de réveil dérivée du tiers de la plus courte
+marge en vigueur (`_refresh_poll_interval`), recalculée à chaque tour. Cette
+durée de vie ne se lit qu'**à l'émission** — relu plus tard, `expires_in` est ce
+qu'il en RESTE — d'où sa mémorisation par `set_tokens()` sous la clé `lifetime`,
+rendue par `observed_lifetime()`.
+
+Le succès se juge sur l'**avancement de l'échéance**, jamais sur le franchissement
+d'une marge. Exiger d'un jeton frais qu'il dépasse `_REFRESH_MARGIN_S` classait en
+échec un renouvellement parfaitement réussi de 5 minutes : rien n'était
+journalisé — d'où un « je ne vois aucune trace du refresh » parfaitement fondé —
+et la boucle recommençait au réveil suivant.
 
 Trois points de conception qui ne se devinent pas :
 

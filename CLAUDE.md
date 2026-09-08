@@ -291,7 +291,9 @@ lots — piège déjà payé côté MIAOU.
   `build_oauth_metadata_override` et les endpoints déclarés ENSEMBLE en config —,
   `refresh_if_due` et la boucle du lifespan qui couvre l'INACTIVITÉ, tentative au
   boot parce que « utilisable » inclut un jeton expiré à rafraîchir, écriture par
-  le provider partagé pour rester écrivain unique).
+  le provider partagé pour rester écrivain unique, marge et période CALIBRÉES sur
+  la durée de vie émise — `observed_lifetime`, les constantes ne sont que des
+  plafonds — et succès jugé sur l'avancement de l'échéance).
 - **`docs/miaou-contract.md`** — surface de contact avec MIAOU : transport
   streamable-http et table de configuration des cartes serveur, séquence attendue
   (`initialize` → `tools/list` → `tools/call`) et les trois familles de blocs de
