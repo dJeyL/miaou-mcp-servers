@@ -2921,6 +2921,23 @@ def build_app(
                 try:
                     if not await probe():
                         authorizer.authorization_pending = True
+                        continue
+                    # Le stockage dit « utilisable », ce qui inclut UN JETON
+                    # EXPIRÉ porteur d'un refresh token : utilisable au sens
+                    # où il se renouvelle sans l'utilisateur, pas au sens où
+                    # il partirait tel quel. Tenter le renouvellement ICI
+                    # plutôt que d'attendre le premier appel ou le premier
+                    # réveil de la boucle (plusieurs minutes), sans quoi le
+                    # proxy démarre en annonçant un upstream disponible dont
+                    # le tout premier appel d'outil échouera — mesuré sur le
+                    # terrain le 2026-09-08.
+                    #
+                    # Ne renouvelle QUE si l'échéance est proche
+                    # (`refresh_if_due` sort sans requête sinon) : un
+                    # démarrage avec des jetons frais ne coûte rien.
+                    refresher = getattr(authorizer, "refresh_if_due", None)
+                    if refresher is not None:
+                        await refresher()
                 except Exception as e:
                     # Une surface facultative ne doit jamais empêcher un
                     # démarrage : au pire on ne signale pas, et le refus à

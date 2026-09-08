@@ -289,7 +289,8 @@ lots — piège déjà payé côté MIAOU.
   anyio des cancel scopes). Renouvellement (AB-3 : le refresh du SDK est passif et
   vise `<hôte-du-serveur-MCP>/token` quand la découverte échoue — d'où
   `build_oauth_metadata_override` et les endpoints déclarés ENSEMBLE en config —,
-  `refresh_if_due` et la boucle du lifespan qui couvre l'INACTIVITÉ, écriture par
+  `refresh_if_due` et la boucle du lifespan qui couvre l'INACTIVITÉ, tentative au
+  boot parce que « utilisable » inclut un jeton expiré à rafraîchir, écriture par
   le provider partagé pour rester écrivain unique).
 - **`docs/miaou-contract.md`** — surface de contact avec MIAOU : transport
   streamable-http et table de configuration des cartes serveur, séquence attendue

@@ -365,6 +365,16 @@ Le déclencheur est l'échéance **en stockage**, pas `context.is_token_valid()`
 le contexte peut n'avoir jamais été sollicité depuis le démarrage, auquel cas son
 verdict serait « valide » sur un jeton périmé.
 
+Le boot tente aussi ce renouvellement, une fois, juste après l'amorçage du
+drapeau — et pas seulement parce que c'est plus tôt. `has_usable_token()` répond
+« utilisable » à un jeton **expiré porteur d'un refresh token** : utilisable au
+sens où il se renouvelle sans l'utilisateur, pas au sens où il partirait tel
+quel. Sans cette tentative, le proxy démarre donc en annonçant un upstream sans
+réserve — aucune pastille côté MIAOU — dont le tout premier appel d'outil
+échoue, en attendant le premier réveil de la boucle. Mesuré le 2026-09-08.
+`refresh_if_due()` sortant sans requête quand l'échéance est loin, un démarrage
+avec des jetons frais ne coûte rien.
+
 ### L'absence de `refresh_token` est dite à voix haute
 
 Sous `--debug-auth`, `set_tokens()` — passage obligé de tout jeton obtenu, échange

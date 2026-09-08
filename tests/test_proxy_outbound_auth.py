@@ -2222,3 +2222,82 @@ async def test_storing_a_refreshable_token_says_so(tmp_path, monkeypatch, capsys
 
     err = capsys.readouterr().err
     assert "refresh_token présent" in err
+
+
+# ---------------------------------------------------------------------------
+# Le boot ne se contente pas de constater (lot AB-3)
+# ---------------------------------------------------------------------------
+
+class _BootAuthorizer:
+    """Authorizer minimal : `has_usable_token` et `refresh_if_due` observés."""
+
+    def __init__(self, usable=True):
+        self.name = "jira"
+        self.authorization_pending = False
+        self.refreshed = False
+        self._storage = self
+
+        async def _probe():
+            return usable
+
+        self.has_usable_token = _probe
+
+    async def refresh_if_due(self):
+        self.refreshed = True
+        return True
+
+
+async def _boot(authorizer):
+    """Déroule le lifespan jusqu'au yield, puis le referme.
+
+    Par le protocole ASGI : `build_app` rend le wrapper qui évite le 307 sur
+    /mcp, pas l'app Starlette — c'est ce wrapper que sert uvicorn, donc c'est
+    lui qu'on démarre ici."""
+    import anyio
+
+    app = mcp_proxy.build_app(
+        mcp_proxy.build_proxy_server({}, {}), {},
+        authorizers={"jira": authorizer},
+    )
+    send_stream, receive_stream = anyio.create_memory_object_stream(8)
+    events = []
+
+    async def receive():
+        return await receive_stream.receive()
+
+    async def send(message):
+        events.append(message)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(app, {"type": "lifespan"}, receive, send)
+        await send_stream.send({"type": "lifespan.startup"})
+        while not any(e["type"].startswith("lifespan.startup.") for e in events):
+            await anyio.sleep(0)
+        await send_stream.send({"type": "lifespan.shutdown"})
+
+
+@pytest.mark.anyio
+async def test_an_expiring_token_is_renewed_at_boot():
+    """« Utilisable » inclut un jeton EXPIRÉ porteur d'un refresh token :
+    utilisable au sens où il se renouvelle sans l'utilisateur, pas au sens où
+    il partirait tel quel. Sans renouvellement au boot, le proxy annonce un
+    upstream disponible dont le premier appel d'outil échoue — mesuré sur le
+    terrain le 2026-09-08."""
+    authorizer = _BootAuthorizer(usable=True)
+
+    await _boot(authorizer)
+
+    assert authorizer.refreshed is True
+    assert authorizer.authorization_pending is False
+
+
+@pytest.mark.anyio
+async def test_nothing_is_renewed_when_there_is_no_token():
+    """Rien à renouveler : c'est une autorisation à demander, et la tenter
+    ferait une requête sortante inutile au démarrage."""
+    authorizer = _BootAuthorizer(usable=False)
+
+    await _boot(authorizer)
+
+    assert authorizer.refreshed is False
+    assert authorizer.authorization_pending is True
