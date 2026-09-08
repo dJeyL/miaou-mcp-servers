@@ -2436,3 +2436,77 @@ async def test_a_genuinely_new_token_carries_its_own_deadline(tmp_path):
 
     renewed = await storage.get_tokens()
     assert 290 <= renewed.expires_in <= 300
+
+
+# ---------------------------------------------------------------------------
+# Un refresh qui échoue est MUET : ni exception, ni fichier modifié
+#
+# Le SDK appelle `clear_tokens()` (contexte seulement), repose `_initialized`
+# et laisse partir la requête SANS en-tête Authorization. Sur un upstream qui
+# accepte `initialize` sans jeton, la sonde répond 200 : l'échec ne se voit
+# nulle part, sauf dans le contexte du provider.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_a_silently_refused_refresh_is_not_a_success(tmp_path):
+    """Se fier au fichier faisait annoncer « renouvelé » et lever le drapeau
+    alors que rien n'était autorisé — l'échec ressortait au premier
+    tools/call."""
+    _store_token(tmp_path, expires_in=-10, lifetime=300)
+    authorizer = _authorizer(tmp_path, interactive=False)
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            # Ce que fait le SDK quand le refresh est refusé : il a chargé les
+            # jetons (_initialized), puis vide le CONTEXTE sans toucher au
+            # fichier, et n'élève rien.
+            provider = authorizer.provider()
+            provider._initialized = True
+            provider.context.current_tokens = None
+            return object()
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is False
+
+    assert authorizer.authorization_pending is True
+
+
+@pytest.mark.anyio
+async def test_a_token_still_expired_afterwards_is_not_a_renewal(tmp_path):
+    """Partant d'un jeton expiré, une échéance qui « avance » jusqu'à
+    maintenant n'est pas un renouvellement : `valide 0s` était annoncé sur un
+    jeton mort."""
+    _store_token(tmp_path, expires_in=-10, lifetime=300)
+    authorizer = _authorizer(tmp_path, interactive=False)
+    # Contexte intact et chargé : seul le stockage décide ici.
+    provider = authorizer.provider()
+    provider._initialized = True
+    provider.context.current_tokens = _token(refresh_token="r")
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            _store_token(tmp_path, expires_in=0, lifetime=300)
+            return object()
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is False
+
+    assert authorizer.authorization_pending is True

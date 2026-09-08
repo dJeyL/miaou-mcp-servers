@@ -369,8 +369,22 @@ l'objet : une durée de vie ne rétrécit jamais (on retient la plus longue vue)
 l'échéance d'un access token **inchangé** ne recule pas — un jeton réellement
 différent repart, lui, de celle qu'il annonce.
 
-Le succès se juge sur l'**avancement de l'échéance**, jamais sur le franchissement
-d'une marge. Exiger d'un jeton frais qu'il dépasse `_REFRESH_MARGIN_S` classait en
+**Un refresh qui échoue est MUET**, et c'est le piège principal de cette boucle.
+Le SDK ne lève rien : il appelle `clear_tokens()` — qui vide le contexte **sans
+toucher au fichier** —, repose `_initialized`, et laisse partir la requête **sans
+en-tête `Authorization`**. Sur un upstream qui accepte `initialize` sans jeton
+(ce Jira), la sonde répond donc 200, et le fichier garde un jeton d'apparence
+intacte. Se fier à l'un ou à l'autre faisait annoncer « renouvelé » et lever
+`authorization_pending` alors que rien n'était autorisé — l'échec ne ressortait
+qu'au premier `tools/call`, avec sa stacktrace. Le témoin est donc
+`provider.context.current_tokens`, seul endroit où le refus s'inscrit, et
+seulement une fois `_initialized` posé : un contexte encore vierge est vide lui
+aussi.
+
+Le succès se juge sur l'**avancement de l'échéance DANS LE FUTUR**, jamais sur le
+franchissement d'une marge ni sur le seul fait d'avancer. Partant d'un jeton déjà
+expiré, l'échéance de départ est dans le passé et un `expires_in` de 0 la
+dépasse : on journalisait « renouvelé (valide 0s) » sur un jeton mort. Exiger d'un jeton frais qu'il dépasse `_REFRESH_MARGIN_S` classait en
 échec un renouvellement parfaitement réussi de 5 minutes : rien n'était
 journalisé — d'où un « je ne vois aucune trace du refresh » parfaitement fondé —
 et la boucle recommençait au réveil suivant.

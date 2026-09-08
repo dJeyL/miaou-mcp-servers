@@ -2571,8 +2571,50 @@ class UpstreamAuthorizer:
         # et la boucle recommençait à chaque réveil sur un jeton qu'elle venait
         # de renouveler, ce qui est exactement le rejeu qu'on veut éviter
         # devant un AS à rotation.
+        # Et l'échéance doit avoir avancé DANS LE FUTUR. « Avoir avancé » seul
+        # ne suffit pas : partant d'un jeton déjà expiré, `deadline_before` est
+        # dans le passé, et un `expires_in` de 0 le dépasse — on journalisait
+        # alors « renouvelé (valide 0s) » et on levait `authorization_pending`
+        # sur un jeton mort. Le proxy annonçait l'upstream comme autorisé, et
+        # le premier appel d'outil échouait. Mesuré le 2026-09-08.
+        # LE CONTEXTE DU PROVIDER D'ABORD, et pas seulement le fichier. Quand
+        # un refresh échoue, le SDK ne lève RIEN : il appelle `clear_tokens()`
+        # — qui vide le contexte sans toucher au fichier —, repose
+        # `_initialized` et laisse partir la requête SANS en-tête
+        # `Authorization`. Sur un upstream qui accepte `initialize` sans jeton
+        # (ce Jira, mesuré), la sonde répond donc 200 et l'échec est
+        # totalement muet ; le fichier, lui, garde un jeton d'apparence
+        # intacte. Se fier à lui faisait annoncer « renouvelé » et lever
+        # `authorization_pending` alors que rien n'était autorisé — l'échec
+        # ressortait au premier `tools/call`. Mesuré le 2026-09-08.
+        #
+        # La garde ne vaut QUE si le provider a effectivement chargé les
+        # jetons (`_initialized`) : un contexte encore vierge est vide lui
+        # aussi, et le confondre avec un refus ferait annoncer une
+        # autorisation due à chaque premier passage.
+        context = getattr(self._provider, "context", None)
+        initialized = getattr(self._provider, "_initialized", False)
+        if (
+            initialized
+            and context is not None
+            and getattr(context, "current_tokens", None) is None
+        ):
+            _log(f"Renouvellement du jeton de '{self.name}' refusé par l'AS — "
+                 f"autorisation à refaire : {authorize_path(self.name)}")
+            self.authorization_pending = True
+            return False
+
         renewed = await self._storage.get_tokens()
         if renewed is None or renewed.expires_in is None:
+            return False
+        if renewed.expires_in <= 0:
+            # « Avoir avancé » ne suffit pas : partant d'un jeton déjà expiré,
+            # `deadline_before` est dans le passé et un `expires_in` de 0 le
+            # dépasse. On journalisait « renouvelé (valide 0s) » sur un jeton
+            # mort, et le premier appel d'outil échouait.
+            _log(f"Renouvellement du jeton de '{self.name}' sans effet — le "
+                 f"jeton reste expiré. Autoriser : {authorize_path(self.name)}")
+            self.authorization_pending = True
             return False
         deadline_after = time.time() + renewed.expires_in
         if deadline_after <= deadline_before:
