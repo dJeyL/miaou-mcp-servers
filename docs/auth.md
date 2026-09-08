@@ -375,6 +375,18 @@ au restant — d'où `+Ns, reste Ns, émis pour Ns`, et un avertissement explici
 quand le gain tombe sous la moitié de la durée émise : l'AS a bougé le jeton sans
 en délivrer un neuf, et la boucle perdra la course.
 
+**Trois cas, pas deux.** Entre « renouvelé » et « refusé » il y a l'échéance
+**inchangée** : l'AS répond sans rien réémettre — il ne l'a pas jugé nécessaire —
+et le seul écart restant est la dérive d'horloge entre les deux lectures. En deçà
+de `_RENEWAL_NOOP_FRACTION` de la durée émise, ce n'est donc **pas** un
+renouvellement (l'annoncer donnait « renouvelé (+0s) » aussitôt démenti par un
+ATTENTION, sur un upstream où tout allait bien) et **pas** une anomalie : le
+jeton court jusqu'à son terme, `authorization_pending` reste bas, et
+`refresh_if_due` rend `False`. La trace est calme, et posée **une seule fois par
+épisode** (`_renewal_noop_reported`, réarmé par le premier vrai renouvellement) :
+tant que le jeton reste dans la fenêtre, la boucle repasse à chaque réveil — trois
+fois par durée de vie — et répéter le non-événement noierait le reste.
+
 **Un jeton relu n'est pas un jeton frais**, et `set_tokens()` doit s'en garder.
 `get_tokens()` écrase `expires_in` par le RESTANT — nécessaire, le SDK ne
 repassant pas par `update_token_expiry()` au chargement — mais le SDK garde cet
@@ -454,12 +466,36 @@ jeton. « L'upstream n'a rien demandé », « l'AS a refusé l'enregistrement »
 un seul signal, et le diagnostic se fait au jugé. C'est très exactement ce qui a
 coûté plusieurs correctifs posés à l'aveugle.
 
-`enable_auth_debug()` branche les loggers du SDK (`mcp.client.auth`) et du
-transport (`httpx`, `httpcore.http11`) plutôt qu'un traçage maison : ce sont eux
-qui voient les requêtes que le proxy **n'émet pas lui-même** — découverte,
-enregistrement, échange du code. S'y ajoute une trace explicite par étape de
-`_provoke_refusal`, dont la ligne qui manquait le plus : « AUCUN 401 sur
-tools/call », qui nomme le cas où aucun parcours ne peut s'amorcer.
+`enable_auth_debug()` branche les loggers du SDK et du transport plutôt qu'un
+traçage maison : ce sont eux qui voient les requêtes que le proxy **n'émet pas
+lui-même** — découverte, enregistrement, échange du code. S'y ajoute une trace
+explicite par étape de `_provoke_refusal`, dont la ligne qui manquait le plus :
+« AUCUN 401 sur tools/call », qui nomme le cas où aucun parcours ne peut
+s'amorcer.
+
+**La liste couvre tout le cycle de vie, pas seulement le boot.** Première
+version : `("mcp.client.auth", "httpx")` — on voyait les URL d'AS essayées au
+démarrage puis plus rien, alors que le mode reste actif (relevé le 2026-09-08).
+Deux causes, mesurées :
+
+- **`mcp.client.auth` n'émet rien** dans le SDK installé : ni `getLogger`, ni
+  appel `logger.*` dans le module. Tout ce qu'on voyait venait de `httpx`.
+  Nommer un logger inexistant est **silencieux**, d'où une liste qui paraissait
+  correcte.
+- Le trafic d'**après** le boot passe par `mcp.client.streamable_http` — le
+  transport des upstreams HTTP : connexion, session, envoi de messages,
+  reconnexions SSE — qui journalise sous **son** nom et n'était pas couvert.
+
+Deux pièges de nommage, vérifiés à la source plutôt que devinés :
+`mcp.client.session` journalise sous `"client"` (pas sous son nom de module), et
+`mcp.shared.session` appelle `logging.*` au niveau module — donc le **root
+logger**, hors de portée d'une liste nommée. `httpx`, enfin, journalise ses
+requêtes en **INFO**, pas en DEBUG : d'où un niveau posé sur chaque logger plutôt
+qu'un filtrage par sévérité. `httpcore` reste volontairement **absent** — ses
+lignes ne portent ni URL ni en-tête, elles noient le journal sans rien apprendre.
+
+Les tests vérifient les noms **contre la source des modules du SDK**, jamais
+contre une liste recopiée : recopier reproduirait exactement l'erreur à attraper.
 
 **Les valeurs sensibles sont masquées** (`_redact_url`, filtre de logging) :
 `code`, `access_token`, `refresh_token`, `client_secret`, `code_verifier`…

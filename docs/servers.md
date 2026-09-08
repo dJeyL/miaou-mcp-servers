@@ -22,6 +22,25 @@ Les outils ont un `asyncio.sleep(2)` intentionnel pour simuler la latence résea
 vérifier que le patienteur animé et les acks MCP (`mcp_call`) s'affichent correctement
 pendant le round-trip.
 
+**Seul serveur du dépôt à publier des `instructions`** (consigne de portée serveur,
+champ de l'`InitializeResult` — cf. `docs/proxy.md`) : il demande au modèle de
+signaler chaque usage d'un outil `bench` par la ligne « *Banc d'essai bench —
+résultat **non contractuel**.* ». Durable, et non un canari à retirer : la consigne est
+vraie (résultat sans utilité en production) et sert en même temps de témoin de bout
+en bout — le marqueur porte le mot `bench`, donc sa présence dans une réponse
+atteste que le champ a été lu ET rattaché au bon serveur.
+
+Le texte se NOMME (« les outils `bench` ») au lieu de se désigner (« ce serveur ») :
+agrégé par le proxy, il vit sous un titre de section parmi N, où un déictique n'a
+plus d'antécédent stable. `bench` reste un segment littéral du nom d'outil en accès
+direct comme derrière le double préfixe côté MIAOU (`miaou-proxy__bench__echo`). La
+mention de l'effet réel (résolution DNS) évite par ailleurs qu'un modèle prudent
+refuse `dns_lookup` en le croyant simulé.
+
+Conséquence pour les tests : `mcp_bench` ne peut plus servir d'upstream muet. Les
+tests qui vérifient « rien à agréger → rien à publier » montent sur un double
+explicite, la garantie portant sur le proxy et non sur le silence d'un serveur.
+
 ## `servers/mcp_weather.py` — météo réelle (port 8767)
 
 Un seul outil `get_weather(city, state?, country?, astronomy?, hourly?, extract?)` qui

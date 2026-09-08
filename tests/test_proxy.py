@@ -700,7 +700,6 @@ async def _run_lifespan(asgi_app):
     """Déclenche le lifespan Starlette d'une app construite par build_app()."""
     import anyio
 
-    receive_send = anyio.create_memory_object_stream(10)
     startup_done = anyio.Event()
     shutdown = anyio.Event()
     errors: list[BaseException] = []
@@ -988,3 +987,171 @@ def test_sdk_http_client_uses_injected_ssl_context():
     assert module == "truststore._api", (
         "le client httpx du SDK ne passe plus par la classe ssl.SSLContext injectée"
     )
+
+
+# ---------------------------------------------------------------------------
+# instructions — consigne de portée serveur (InitializeResult.instructions)
+# ---------------------------------------------------------------------------
+
+class _InstructedUpstream(InProcessUpstream):
+    """Upstream inprocess qui publie des instructions.
+
+    Aucun serveur du dépôt n'en déclare aujourd'hui : le lot livre le tuyau,
+    pas le contenu. Ce double fournit donc la seule source d'instructions des
+    tests, sans figer un texte dans un serveur réel."""
+
+    def __init__(self, text: str | None, module: str = "mcp_bench") -> None:
+        super().__init__(module)
+        self._text = text
+
+    async def start(self) -> None:
+        await super().start()
+        self.instructions = self._text
+
+
+def test_upstream_instructions_default_none():
+    """Avant start(), aucun upstream n'a été interrogé : la valeur est None."""
+    assert InProcessUpstream("mcp_bench").instructions is None
+    assert StdioUpstream("cmd", []).instructions is None
+
+
+@pytest.mark.asyncio
+async def test_bench_instructions_survive_aggregation():
+    """`mcp_bench` publie une consigne durable ; elle doit rester exploitable
+    une fois agrégée, c'est-à-dire lue et rattachée au bon serveur.
+
+    Le texte se NOMME (« les outils `bench` ») au lieu de se désigner (« ce
+    serveur ») : agrégé, il vit sous un titre de section parmi N, où un
+    déictique n'a plus d'antécédent stable. `bench` reste un segment littéral du
+    nom d'outil en accès direct comme derrière le double préfixe côté MIAOU
+    (`miaou-proxy__bench__echo`)."""
+    up = InProcessUpstream("mcp_bench")
+    await up.start()
+    text = mcp_proxy.aggregate_instructions({"bench": up})
+
+    assert "## bench" in text
+    assert "les outils `bench`" in text
+    # Le marqueur porte le mot `bench` : sa présence dans une réponse atteste
+    # que le champ a été lu ET rattaché au bon serveur. Assertion posée sur les
+    # deux fragments qui portent cette valeur, et non sur la ligne entière : le
+    # balisage markdown du marqueur relève de la présentation et peut bouger
+    # sans rien changer au témoin.
+    assert "Banc d'essai bench" in text
+    assert "non contractuel" in text
+    # Aucun déictique non résolu : « ce serveur » redeviendrait ambigu ici.
+    assert "ce serveur" not in text.split("## bench", 1)[1]
+
+
+@pytest.mark.asyncio
+async def test_inprocess_upstream_captures_instructions():
+    """Chemin inprocess : pas d'initialize, les instructions se lisent sur le
+    FastMCP importé."""
+    up = InProcessUpstream("mcp_bench")
+    await up.start()
+    import mcp_bench
+
+    assert up.instructions == mcp_bench.mcp.instructions
+
+
+def test_aggregate_instructions_none_when_no_upstream_declares():
+    """Aucune instruction déclarée → None, donc InitializeResult inchangé par
+    rapport à avant le lot.
+
+    Upstreams muets choisis explicitement (`_InstructedUpstream(None)`) plutôt
+    qu'un serveur réel : `mcp_bench` en publie désormais, et un serveur qui se
+    met à parler ne doit pas transformer ce test en tautologie silencieuse."""
+    ups = {"a": _InstructedUpstream(None), "b": _InstructedUpstream(None)}
+    assert mcp_proxy.aggregate_instructions(ups) is None
+
+
+def test_aggregate_instructions_ignores_blank():
+    """Une chaîne vide ou blanche ne vaut pas une consigne : pas de section
+    vide, et pas de préambule annonçant des sections inexistantes."""
+    ups = {"a": _InstructedUpstream(""), "b": _InstructedUpstream("   \n  ")}
+    for up in ups.values():
+        up.instructions = up._text
+    assert mcp_proxy.aggregate_instructions(ups) is None
+
+
+def test_aggregate_instructions_sections_titled_by_tool_prefix():
+    """Le titre de section est le préfixe d'outil : c'est ce qui rend la portée
+    d'une consigne déductible sans convention supplémentaire."""
+    ups = {
+        "bench": _InstructedUpstream("Lire la skill `bench-usage`."),
+        "quiet": _InstructedUpstream(None),
+        "docs": _InstructedUpstream("Passer par `list` avant `read`."),
+    }
+    for up in ups.values():
+        up.instructions = up._text
+    text = mcp_proxy.aggregate_instructions(ups)
+
+    assert text.startswith(mcp_proxy._INSTRUCTIONS_PREAMBLE)
+    assert "## bench" in text
+    assert "## docs" in text
+    # Un upstream sans instructions n'a pas de section : un titre nu
+    # laisserait croire à une consigne perdue.
+    assert "## quiet" not in text
+    assert "Lire la skill `bench-usage`." in text
+    assert "Passer par `list` avant `read`." in text
+    # Ordre de la table de routage, pas alphabétique.
+    assert text.index("## bench") < text.index("## docs")
+
+
+def test_aggregate_instructions_preamble_states_unprefixed_tool_form():
+    """Le préambule énonce `<serveur>__<outil>`, littéralement vraie en accès
+    direct. Un client qui re-préfixe (MIAOU : `miaou-proxy__bench__echo`) doit
+    réécrire cette phrase — le proxy ignore le slug sous lequel il est publié,
+    et le mettre en config dupliquerait une donnée qui vit chez le client."""
+    assert "`<serveur>__<outil>`" in mcp_proxy._INSTRUCTIONS_PREAMBLE
+
+
+def test_aggregate_instructions_publishes_unauthorized_upstream():
+    """Un upstream non autorisé garde sa section : c'est de la documentation,
+    pas une capability. `initialize` ne se rejoue pas après une autorisation
+    obtenue en cours de route — une section omise manquerait définitivement."""
+    up = _InstructedUpstream("Consigne d'un upstream pas encore autorisé.")
+    up.instructions = up._text
+    # Non démarré, donc non vivant : l'état d'autorisation ne doit pas peser.
+    text = mcp_proxy.aggregate_instructions({"jira": up})
+    assert "## jira" in text
+    assert "Consigne d'un upstream pas encore autorisé." in text
+
+
+@pytest.mark.asyncio
+async def test_lifespan_publishes_instructions_after_start():
+    """La construction du Server précède start() : les instructions y seraient
+    vides. Le lifespan les écrit après, et le SDK relit l'attribut à chaque
+    create_initialization_options() — donc tout initialize client les voit."""
+    upstreams = {
+        "bench": _InstructedUpstream("Lire la skill `bench-usage`."),
+        "quiet": _InstructedUpstream(None),
+    }
+    server = build_proxy_server(upstreams, {})
+    # À la construction : rien, précisément le piège que l'écriture différée évite.
+    assert server.instructions is None
+
+    app = build_app(server, upstreams)
+    async with _run_lifespan(app):
+        assert server.instructions is not None
+        assert "## bench" in server.instructions
+        assert "Lire la skill `bench-usage`." in server.instructions
+        # Ce que verra le client, via le même chemin que le SDK.
+        opts = server.create_initialization_options()
+        assert opts.instructions == server.instructions
+
+
+@pytest.mark.asyncio
+async def test_lifespan_leaves_instructions_none_without_declarations():
+    """Non-régression : sans upstream déclarant d'instructions, le champ reste
+    None et l'InitializeResult est celui d'avant le lot, à l'octet près.
+
+    Monté sur un upstream muet explicite, et non sur un serveur réel : la
+    garantie porte sur le proxy (« rien à agréger → rien à publier »), pas sur
+    le silence d'un serveur donné, qui peut cesser à tout moment — c'est
+    précisément ce qui est arrivé à `mcp_bench`."""
+    upstreams = {"quiet": _InstructedUpstream(None)}
+    server = build_proxy_server(upstreams, {})
+    app = build_app(server, upstreams)
+    async with _run_lifespan(app):
+        assert server.instructions is None
+        assert server.create_initialization_options().instructions is None

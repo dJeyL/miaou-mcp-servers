@@ -66,6 +66,12 @@ from mcp_base import enable_system_trust_store
 # ---------------------------------------------------------------------------
 
 class Upstream(ABC):
+    # Consigne de portée serveur publiée par l'upstream (champ `instructions`
+    # de l'InitializeResult MCP), ou None s'il n'en déclare pas. Renseigné par
+    # start() — avant, aucun upstream n'a été interrogé et la valeur est None
+    # pour tout le monde. Agrégée par aggregate_instructions().
+    instructions: str | None = None
+
     @abstractmethod
     async def start(self) -> None: ...
 
@@ -128,6 +134,10 @@ class InProcessUpstream(Upstream):
                 f"Le module '{self._module_name}' n'expose ni 'build(config)' ni 'mcp' (FastMCP)."
             )
         self._tool_manager = fastmcp._tool_manager
+        # Pas d'`initialize` sur ce chemin (on parle au FastMCP en direct, sans
+        # transport) : les instructions se lisent sur l'objet, là où les deux
+        # autres upstreams les reçoivent dans leur InitializeResult.
+        self.instructions = fastmcp.instructions
 
         # PRX2 : lecture opportuniste du contrat REF_UNKNOWN sur le module qui
         # vient d'être importé, au lieu d'un `from mcp_docs import ...` au niveau
@@ -193,7 +203,8 @@ class StdioUpstream(Upstream):
             read, write = await self._exit_stack.enter_async_context(stdio_client(params))
             session = ClientSession(read, write)
             self._session = await self._exit_stack.enter_async_context(session)
-            await self._session.initialize()
+            result = await self._session.initialize()
+            self.instructions = result.instructions
 
         try:
             # wait_for (pas asyncio.timeout, réservé à Python 3.11+) — le PEP 723
@@ -303,7 +314,8 @@ class HttpUpstream(Upstream):
                 # Triplet (read, write, get_session_id) ; le troisième ne sert
                 # pas ici, le proxy ne gère pas la session HTTP amont.
                 async with ClientSession(streams[0], streams[1]) as session:
-                    await session.initialize()
+                    result = await session.initialize()
+                    self.instructions = result.instructions
                     self._session = session
                     self._ready.set()
                     # Reste ouvert jusqu'à stop() : c'est ce maintien qui garde
@@ -957,6 +969,53 @@ def upstream_is_live(upstream: Upstream, authorizer: Any = None) -> bool:
     if isinstance(upstream, HttpUpstream):
         return upstream._session is not None
     return True
+
+
+_INSTRUCTIONS_PREAMBLE = (
+    "Ce serveur agrège plusieurs serveurs MCP. Les outils sont préfixés par le "
+    "nom de leur serveur d'origine (`<serveur>__<outil>`). Les sections "
+    "ci-dessous portent les consignes propres à chaque serveur d'origine, "
+    "titrées par ce même nom."
+)
+
+
+def aggregate_instructions(upstreams: dict[str, Upstream]) -> str | None:
+    """Compose le champ `instructions` du proxy à partir de celui de chaque
+    upstream (spec MCP : `InitializeResult.instructions`, destiné au system
+    prompt du modèle).
+
+    Le champ est unique en sortie et multiple en entrée, d'où le besoin de
+    préserver le lien texte ↔ outils : les outils sont préfixés
+    (`bench__echo`), et rien ne dirait au modèle qu'un paragraphe couvre
+    `docs__read` mais pas `web__fetch_url`. Chaque section est donc titrée par
+    le préfixe d'outil lui-même — la portée se déduit du titre, sans convention
+    supplémentaire à faire connaître au modèle.
+
+    Le préambule énonce la forme `<serveur>__<outil>`, littéralement vraie pour
+    un client parlant à ce proxy en direct. Un client qui agrège LUI-MÊME
+    plusieurs serveurs re-préfixe (MIAOU expose `miaou-proxy__bench__echo`) :
+    la forme est alors fausse d'un cran, et c'est à ce client de la réécrire —
+    il est seul à connaître le slug sous lequel il publie ce proxy. Le mettre
+    en config ici dupliquerait une information qui vit chez le client, avec
+    dérive garantie au premier renommage de carte serveur.
+
+    Publie la section de TOUT upstream qui déclare des instructions, y compris
+    non autorisé : c'est de la documentation, pas une capability. Une section
+    décrivant un outil temporairement absent coûte moins qu'une section
+    manquant définitivement, puisque `initialize` ne se rejoue pas après une
+    autorisation obtenue en cours de route.
+
+    Renvoie None si aucun upstream n'a d'instructions — l'InitializeResult est
+    alors identique à celui d'avant ce lot, à l'octet près.
+    """
+    sections = [
+        f"## {prefix}\n\n{upstream.instructions.strip()}"
+        for prefix, upstream in upstreams.items()
+        if upstream.instructions and upstream.instructions.strip()
+    ]
+    if not sections:
+        return None
+    return "\n\n".join([_INSTRUCTIONS_PREAMBLE, *sections])
 
 
 def build_proxy_server(
@@ -1926,14 +1985,41 @@ def enable_auth_debug() -> None:
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("DEBUG:    %(name)s %(message)s"))
     handler.addFilter(_RedactingFilter())
+    handler.setLevel(logging.DEBUG)
 
     # `httpcore` est volontairement ABSENT : ses lignes ne portent ni URL ni
     # en-tête (`send_request_headers.started request=<Request [b'POST']>`), donc
-    # elles noient le journal sans rien apprendre — mesuré, pas supposé. Seul
-    # `mcp.client.auth` dit quelque chose d'exploitable ; le reste du diagnostic
-    # vient des traces explicites du proxy, qui, elles, nomment ce qu'elles
-    # observent.
-    for name in ("mcp.client.auth", "httpx"):
+    # elles noient le journal sans rien apprendre — mesuré, pas supposé.
+    #
+    # LA LISTE COUVRE TOUT LE CYCLE DE VIE, PAS SEULEMENT LE BOOT. Première
+    # version : `("mcp.client.auth", "httpx")`. On voyait alors les URL d'AS
+    # essayées au démarrage puis plus rien, alors que le mode est censé rester
+    # actif — incohérence relevée le 2026-09-08. Deux causes, mesurées :
+    #
+    # - `mcp.client.auth` N'ÉMET RIEN dans le SDK installé (aucun `getLogger`,
+    #   aucun appel `logger.*` dans le module). Le nommer ne coûte rien mais
+    #   n'apportait rien non plus : tout ce qu'on voyait venait de `httpx`.
+    # - Le trafic d'APRÈS le boot passe par `mcp.client.streamable_http` (le
+    #   transport des upstreams HTTP : connexion, session, envoi de messages,
+    #   reconnexions SSE), qui journalise sous SON nom et n'était pas couvert.
+    #
+    # `httpx` journalise ses requêtes en INFO, pas en DEBUG — d'où un niveau
+    # posé sur chaque logger plutôt qu'un filtrage par sévérité : on veut la
+    # ligne `HTTP Request: POST … "200 OK"` de chaque requête, quel que soit
+    # son niveau d'origine.
+    #
+    # Les NOMS sont ceux que les modules posent réellement, vérifiés à la
+    # source : `mcp.client.session` journalise sous `"client"` (et non sous son
+    # nom de module), et `mcp.shared.session` appelle `logging.*` au niveau
+    # module — donc le root logger, hors de portée d'une liste nommée. Nommer
+    # un logger qui n'existe pas est silencieux : c'est ainsi que la première
+    # version a pu paraître correcte.
+    for name in (
+        "mcp.client.auth",
+        "mcp.client.streamable_http",
+        "client",
+        "httpx",
+    ):
         logger = logging.getLogger(name)
         logger.setLevel(logging.DEBUG)
         logger.addHandler(handler)
@@ -2051,6 +2137,14 @@ _AUTHORIZE_ROUTE_WAIT_S = 20.0
 # plafonds, pour un AS qui émet des jetons de longue durée.
 _REFRESH_POLL_INTERVAL_S = 300.0
 _REFRESH_MARGIN_S = 900.0
+
+# En deçà de cette fraction de la durée émise, l'échéance n'a pas bougé : l'AS
+# a répondu sans rien réémettre (il ne l'a pas jugé nécessaire), et l'écart
+# résiduel n'est que la dérive entre les deux lectures d'horloge. Ce n'est ni
+# un renouvellement — l'annoncer donnerait « renouvelé (+0s) » —, ni une
+# anomalie — le jeton courant reste valable jusqu'à son terme, et le prochain
+# réveil réessaiera. Mesuré le 2026-09-08 sur WSO2, jetons de 300s.
+_RENEWAL_NOOP_FRACTION = 0.05
 
 
 def _refresh_poll_interval(authorizers: dict[str, Any] | None) -> float:
@@ -2180,6 +2274,12 @@ class UpstreamAuthorizer:
         # dire au seul moment où l'on apprend de l'AS lui-même qu'un jeton
         # manque, et levé par un parcours mené à son terme.
         self.authorization_pending = False
+        # Un AS qui rend la même échéance le fait à CHAQUE réveil tant que le
+        # jeton reste dans la fenêtre de renouvellement — trois fois par durée
+        # de vie avec la période actuelle. Journaliser le non-événement une
+        # seule fois par épisode : la trace sert à comprendre pourquoi le jeton
+        # ne bouge pas, pas à la répéter jusqu'à noyer le reste.
+        self._renewal_noop_reported = False
         # Dernier échec de parcours, pour que `status` dise POURQUOI. Sans lui,
         # un scope insuffisant se présente comme une autorisation manquante, et
         # l'exploitant reclique indéfiniment sur un lien qui ne peut pas
@@ -2643,19 +2743,39 @@ class UpstreamAuthorizer:
         gained = int(deadline_after - deadline_before)
         issued = self._storage.observed_lifetime() if hasattr(
             self._storage, "observed_lifetime") else None
+
+        # TROIS CAS, PAS DEUX. Entre « renouvelé » et « refusé » il y a
+        # l'échéance qui n'a pas bougé : l'AS a répondu sans rien réémettre.
+        # La version précédente l'annonçait comme un renouvellement puis se
+        # contredisait par un ATTENTION — « renouvelé (+0s) » suivi de « l'AS
+        # n'a pas délivré un jeton neuf ». Or rien ne va mal : le jeton court
+        # toujours, et le prochain réveil réessaiera.
+        if issued and gained < issued * _RENEWAL_NOOP_FRACTION:
+            if not self._renewal_noop_reported:
+                _log(f"Jeton de '{self.name}' non renouvelé — l'AS a rendu la "
+                     f"même échéance (reste {int(renewed.expires_in)}s sur "
+                     f"{int(issued)}s). Nouvelle tentative au prochain réveil.")
+                self._renewal_noop_reported = True
+            # L'autorisation n'est pas due pour autant : le jeton reste bon.
+            self.authorization_pending = False
+            return False
+
         detail = f"+{gained}s, reste {int(renewed.expires_in)}s"
         if issued:
             detail += f", émis pour {int(issued)}s"
         _log(f"Jeton de '{self.name}' renouvelé ({detail}).")
 
-        # Un gain très inférieur à la durée émise n'est pas un renouvellement
-        # complet : le jeton a bougé sans repartir à neuf, et la boucle
-        # reviendra très vite. Le dire, plutôt que de laisser croire que tout
-        # va bien jusqu'à ce que l'appel échoue.
+        # Un gain réel mais très inférieur à la durée émise n'est pas un
+        # renouvellement complet : le jeton a bougé sans repartir à neuf, et la
+        # boucle reviendra très vite. Le dire, plutôt que de laisser croire que
+        # tout va bien jusqu'à ce que l'appel échoue. Le seuil bas est traité
+        # au-dessus : ici on sait déjà que l'échéance a réellement avancé.
         if issued and gained < issued / 2:
             _log(f"  ATTENTION : gain de {gained}s pour un jeton émis pour "
                  f"{int(issued)}s — l'AS n'a pas délivré un jeton neuf. "
                  f"Vérifier la rotation des refresh tokens côté serveur.")
+        # Réarmement : le prochain épisode de non-renouvellement sera dit.
+        self._renewal_noop_reported = False
         self.authorization_pending = False
         return True
 
@@ -3204,6 +3324,16 @@ def build_app(
             started: list[Upstream] = []
             try:
                 started = await _start_upstreams()
+                # Écriture différée, et non un paramètre de construction :
+                # build_proxy_server() s'exécute AVANT start(), donc avant que
+                # le moindre upstream ait été interrogé — les instructions y
+                # seraient vides pour tout le monde, en silence. Le SDK relit
+                # `Server.instructions` à chaque create_initialization_options()
+                # (lowlevel/server.py), si bien qu'une écriture postérieure à la
+                # construction est vue par tout `initialize` client, y compris
+                # le premier : aucun client ne peut avoir fait son handshake
+                # avant, session_manager.run() n'ayant pas encore démarré.
+                mcp_server.instructions = aggregate_instructions(upstreams)
                 # Lancée APRÈS le démarrage : elle n'a rien à faire tant qu'un
                 # upstream n'a pas de jeton, et le premier réveil est de toute
                 # façon différé d'un intervalle. Annulée avec le task group à

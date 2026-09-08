@@ -110,6 +110,20 @@ class MiaouMCPBase:
     `InProcessUpstream` dans mcp_proxy.py). Un serveur qui n'a pas besoin de
     multi-instance peut l'ignorer et continuer à lire `os.environ` comme avant.
 
+    `instructions` porte une consigne valant pour le SERVEUR ENTIER, remontée
+    dans l'`InitializeResult` (champ `instructions` de la spec MCP) et destinée
+    au system prompt du modèle, pas à l'humain. C'est le seul emplacement du
+    protocole pour une consigne de cette portée : les seuls champs qu'un client
+    relaie au modèle par outil sont `name`, `description` et `inputSchema`, si
+    bien qu'une consigne globale (« lire telle documentation avant d'appeler ces
+    outils ») n'a autrement d'autre issue que d'être recopiée à l'identique dans
+    chaque docstring — N copies d'un texte qui ne discrimine aucun outil. Ce
+    qui reste dans une docstring d'outil doit être ce qui distingue CET outil.
+
+    Facultatif et sans valeur par défaut : un serveur qui n'a pas de consigne de
+    portée serveur n'en déclare pas, et son `InitializeResult` est inchangé.
+    Ne vaut que si le client lit le champ — il n'atteint pas le modèle seul.
+
     Usage:
         class MyServer(MiaouMCPBase):
             def __init__(self):
@@ -127,11 +141,19 @@ class MiaouMCPBase:
             server.main()
     """
 
-    def __init__(self, name: str, default_port: int, config: dict | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        default_port: int,
+        config: dict | None = None,
+        instructions: str | None = None,
+    ) -> None:
         self.default_port = default_port
         self.config = config or {}
         _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        self.mcp = FastMCP(name, transport_security=_security)
+        self.mcp = FastMCP(
+            name, transport_security=_security, instructions=instructions
+        )
 
     def finalize_tools(self) -> None:
         """Normalise ce que tools/list expose, pour réduire le payload envoyé au

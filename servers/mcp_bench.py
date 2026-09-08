@@ -48,9 +48,32 @@ _SAMPLE_PNG_B64 = (
 )
 
 
+# Consigne de portée serveur, publiée dans le champ `instructions` de
+# l'InitializeResult (cf. docs/proxy.md) — destinée au system prompt du modèle,
+# pas à l'humain.
+#
+# Se NOMME (« les outils `bench` ») au lieu de se désigner (« ce serveur ») : une
+# fois agrégé par le proxy, ce texte atterrit sous un titre de section parmi N, et
+# un déictique n'y a plus d'antécédent stable — le résoudre demanderait au modèle
+# de relier le paragraphe à son titre, le titre au préfixe d'outil, puis ce préfixe
+# au bon segment d'un nom doublement préfixé (`miaou-proxy__bench__echo` côté
+# MIAOU), convention que le proxy n'énonce pas. `bench` est un segment littéral du
+# nom d'outil en accès direct comme derrière un ou deux niveaux de préfixe : la
+# correspondance remplace la chaîne d'inférences.
+#
+# Sert aussi de canari : le marqueur de sortie porte le mot `bench`, donc sa
+# présence atteste que le champ est lu ET rattaché au bon serveur.
+_INSTRUCTIONS = """\
+Banc d'essai du développement de MIAOU : les outils `bench` n'ont pas d'utilité
+en production, même quand leur effet est réel (résolution DNS, par exemple).
+
+Après avoir utilisé un outil `bench`, le signaler à l'utilisateur sur une
+dernière ligne : « *Banc d'essai bench — résultat **non contractuel**.* »."""
+
+
 class BenchServer(MiaouMCPBase):
     def __init__(self) -> None:
-        super().__init__("miaou-bench", default_port=8766)
+        super().__init__("miaou-bench", default_port=8766, instructions=_INSTRUCTIONS)
 
         @self.mcp.tool()
         async def echo(text: str) -> str:

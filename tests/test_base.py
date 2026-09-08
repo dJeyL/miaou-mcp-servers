@@ -203,3 +203,20 @@ def test_server_main_enables_system_trust_store(monkeypatch):
     srv.main()
 
     assert calls == [True]
+
+
+def test_instructions_absent_by_default():
+    """Un serveur qui ne déclare pas de consigne de portée serveur laisse le
+    champ `instructions` de son InitializeResult à None."""
+    assert MiaouMCPBase("t", default_port=9999).mcp.instructions is None
+
+
+def test_instructions_reach_fastmcp():
+    """`instructions` est la seule voie du protocole pour une consigne valant
+    pour le serveur entier : les seuls champs qu'un client relaie au modèle par
+    outil sont name/description/inputSchema."""
+    srv = MiaouMCPBase("t", default_port=9999, instructions="Lire la skill `t-usage`.")
+    assert srv.mcp.instructions == "Lire la skill `t-usage`."
+    # Jusque dans ce que le SDK enverra au client.
+    opts = srv.mcp._mcp_server.create_initialization_options()
+    assert opts.instructions == "Lire la skill `t-usage`."

@@ -2349,12 +2349,18 @@ async def _boot(authorizer):
     async def send(message):
         events.append(message)
 
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(app, {"type": "lifespan"}, receive, send)
-        await send_stream.send({"type": "lifespan.startup"})
-        while not any(e["type"].startswith("lifespan.startup.") for e in events):
-            await anyio.sleep(0)
-        await send_stream.send({"type": "lifespan.shutdown"})
+    # `async with` sur les DEUX extrémités : un stream mémoire laissé ouvert
+    # émet un ResourceWarning à sa collecte, qui ressort comme un bruit de
+    # test sans rapport avec ce qu'on vérifie ici.
+    async with send_stream, receive_stream:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(app, {"type": "lifespan"}, receive, send)
+            await send_stream.send({"type": "lifespan.startup"})
+            while not any(
+                e["type"].startswith("lifespan.startup.") for e in events
+            ):
+                await anyio.sleep(0)
+            await send_stream.send({"type": "lifespan.shutdown"})
 
 
 @pytest.mark.anyio
@@ -2607,3 +2613,200 @@ async def test_a_renewal_that_barely_moves_is_flagged(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "ATTENTION" in err
     assert "n'a pas délivré un jeton neuf" in err
+
+
+@pytest.mark.anyio
+async def test_an_unchanged_deadline_is_not_announced_as_a_renewal(
+        tmp_path, capsys):
+    """Un AS qui rend la MÊME échéance n'a pas renouvelé, et rien ne va mal.
+
+    La version précédente annonçait « renouvelé (+0s) » puis se contredisait
+    par un ATTENTION, sur la seule dérive d'horloge entre les deux lectures.
+    Le jeton court toujours : on le dit calmement, une fois, et on ne prétend
+    pas avoir renouvelé (retour False). Mesuré sur WSO2 le 2026-09-08.
+    """
+    _store_token(tmp_path, expires_in=147, lifetime=300)
+    authorizer = _authorizer(tmp_path, interactive=False)
+    provider = authorizer.provider()
+    provider._initialized = True
+    provider.context.current_tokens = _token(refresh_token="r")
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            # Même échéance, à la dérive d'horloge près : l'AS n'a rien réémis.
+            _store_token(tmp_path, expires_in=147.5, lifetime=300)
+            return object()
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is False
+
+    err = capsys.readouterr().err
+    assert "non renouvelé" in err
+    assert "ATTENTION" not in err
+    assert "+0s" not in err
+    # Le jeton reste bon : ne pas envoyer l'utilisateur réautoriser.
+    assert authorizer.authorization_pending is False
+
+
+@pytest.mark.anyio
+async def test_an_unchanged_deadline_is_reported_once_per_episode(
+        tmp_path, capsys):
+    """Le non-événement se répète à chaque réveil tant que le jeton est dans
+    la fenêtre — trois fois par durée de vie. Le dire une fois suffit."""
+    _store_token(tmp_path, expires_in=147, lifetime=300)
+    authorizer = _authorizer(tmp_path, interactive=False)
+    provider = authorizer.provider()
+    provider._initialized = True
+    provider.context.current_tokens = _token(refresh_token="r")
+
+    remaining = [147.5, 95.5]
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            _store_token(tmp_path, expires_in=remaining.pop(0), lifetime=300)
+            return object()
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is False
+        _store_token(tmp_path, expires_in=95, lifetime=300)
+        assert await authorizer.refresh_if_due() is False
+
+    assert capsys.readouterr().err.count("non renouvelé") == 1
+
+
+@pytest.mark.anyio
+async def test_a_real_renewal_rearms_the_noop_notice(tmp_path, capsys):
+    """Après un vrai renouvellement, un nouvel épisode de non-renouvellement
+    doit être dit à son tour : le silence ne vaut que pour l'épisode courant."""
+    _store_token(tmp_path, expires_in=147, lifetime=300)
+    authorizer = _authorizer(tmp_path, interactive=False)
+    provider = authorizer.provider()
+    provider._initialized = True
+    provider.context.current_tokens = _token(refresh_token="r")
+    authorizer._renewal_noop_reported = True
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            _store_token(tmp_path, expires_in=300, lifetime=300)
+            return object()
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is True
+
+    assert authorizer._renewal_noop_reported is False
+
+
+# ---------------------------------------------------------------------------
+# --debug-auth : la liste des loggers instrumentés
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _restore_logging():
+    """`enable_auth_debug` modifie l'état GLOBAL du module logging.
+
+    Sans restauration, le premier test qui l'appelle laisse des handlers et des
+    `propagate = False` derrière lui, et les suivants observent un état qui
+    n'est pas le leur.
+    """
+    import logging
+
+    names = ("mcp.client.auth", "mcp.client.streamable_http", "client", "httpx")
+    saved = {
+        n: (
+            logging.getLogger(n).level,
+            list(logging.getLogger(n).handlers),
+            logging.getLogger(n).propagate,
+        )
+        for n in names
+    }
+    saved_flag = mcp_proxy._AUTH_DEBUG
+    yield
+    for n, (level, handlers, propagate) in saved.items():
+        logger = logging.getLogger(n)
+        logger.setLevel(level)
+        logger.handlers = handlers
+        logger.propagate = propagate
+    mcp_proxy._AUTH_DEBUG = saved_flag
+
+
+def test_debug_auth_instruments_the_post_boot_transport(_restore_logging):
+    """`--debug-auth` doit rester actif APRÈS le démarrage.
+
+    Première version : seuls `mcp.client.auth` et `httpx` étaient instrumentés.
+    On voyait les URL d'AS essayées au boot puis plus rien — le trafic ensuite
+    passe par le transport streamable-http, qui journalise sous SON nom.
+    """
+    import logging
+
+    mcp_proxy.enable_auth_debug()
+
+    transport = logging.getLogger("mcp.client.streamable_http")
+    assert transport.level == logging.DEBUG
+    assert transport.handlers, "le transport doit porter un handler"
+
+
+def test_debug_auth_targets_loggers_that_actually_exist(_restore_logging):
+    """Nommer un logger qui n'émet jamais est SILENCIEUX.
+
+    C'est ainsi que la première liste a pu paraître correcte : `mcp.client.auth`
+    ne journalise rien du tout dans le SDK installé. Ce test vérifie les noms
+    contre la SOURCE des modules, pas contre une liste recopiée — sans quoi il
+    se contenterait de répéter l'erreur qu'il doit attraper.
+    """
+    import importlib
+    import inspect
+    import logging
+
+    mcp_proxy.enable_auth_debug()
+
+    # Le transport et la session client journalisent, et sous ces noms-là.
+    for module_name, logger_name in (
+        ("mcp.client.streamable_http", "mcp.client.streamable_http"),
+        ("mcp.client.session", "client"),
+    ):
+        module = importlib.import_module(module_name)
+        source = inspect.getsource(module)
+        assert "logger." in source, f"{module_name} n'émet plus rien"
+        assert f'getLogger("{logger_name}")' in source or \
+            "getLogger(__name__)" in source, \
+            f"{module_name} ne journalise plus sous '{logger_name}'"
+        assert logging.getLogger(logger_name).level == logging.DEBUG
+
+
+def test_debug_auth_redacts_sensitive_urls(_restore_logging, capsys):
+    """Le masquage doit valoir pour les loggers ajoutés, pas seulement httpx."""
+    import logging
+
+    mcp_proxy.enable_auth_debug()
+    logging.getLogger("mcp.client.streamable_http").debug(
+        "GET https://as.example/authorize?code=SECRETVALUE&state=x"
+    )
+    err = capsys.readouterr().err
+    assert "SECRETVALUE" not in err

@@ -158,6 +158,7 @@ async def test_fetch_http_error_returns_string():
     err = urllib.error.HTTPError("http://example.com", 404, "Not Found", {}, None)
     with patch("urllib.request.OpenerDirector.open", side_effect=err):
         result = await _TM.call_tool("fetch_url", {"url": "http://example.com/missing"})
+    err.close()   # sinon ResourceWarning au GC
     assert isinstance(result, str)
     assert "404" in result
 

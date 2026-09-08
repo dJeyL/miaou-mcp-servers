@@ -128,6 +128,7 @@ async def test_brave_401_returns_specific_error():
     with patch.dict(os.environ, {"BRAVE_API_KEY": "bad-key"}), \
          patch("urllib.request.OpenerDirector.open", side_effect=err):
         result = await _TM.call_tool("brave_search", {"query": "python"})
+    err.close()   # sinon ResourceWarning au GC
     assert isinstance(result, str)
     assert "401" in result or "invalide" in result.lower()
 
@@ -140,6 +141,7 @@ async def test_brave_429_returns_quota_error():
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", side_effect=err):
         result = await _TM.call_tool("brave_search", {"query": "python"})
+    err.close()   # sinon ResourceWarning au GC
     assert isinstance(result, str)
     assert "429" in result or "quota" in result.lower()
 
@@ -313,6 +315,7 @@ async def test_image_search_401_returns_error():
     with patch.dict(os.environ, {"BRAVE_API_KEY": "bad-key"}), \
          patch("urllib.request.OpenerDirector.open", side_effect=err):
         result = await _TM.call_tool("brave_image_search", {"query": "python"})
+    err.close()   # sinon ResourceWarning au GC
     assert isinstance(result, str)
     assert "401" in result or "invalide" in result.lower()
 
@@ -325,6 +328,7 @@ async def test_image_search_429_returns_quota_error():
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", side_effect=err):
         result = await _TM.call_tool("brave_image_search", {"query": "python"})
+    err.close()   # sinon ResourceWarning au GC
     assert isinstance(result, str)
     assert "429" in result or "quota" in result.lower()
 

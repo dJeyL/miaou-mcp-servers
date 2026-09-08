@@ -32,6 +32,28 @@ Les noms exposés côté proxy dépendent des clés dans `config.json` (`mcpServ
 Blocs de résultat : `text` (D9), `image`/`resource` binaire (D8.1), `resource` texte (D8.2).
 Si `isError: true`, MIAOU marque l'ack en rouge dans le thread.
 
+### `instructions` de l'`InitializeResult`
+
+Le proxy publie une consigne de portée serveur dans le champ `instructions` de
+l'`InitializeResult` (cf. `docs/proxy.md`) : c'est le seul emplacement du
+protocole pour une consigne qui vaut pour un serveur entier, les seuls champs
+relayés au modèle par outil étant `name`/`description`/`inputSchema`. MIAOU lit
+ce champ sur la réponse à `initialize` — la même dont il capte
+`Mcp-Session-Id` — et l'injecte dans le system prompt, rattaché à son serveur
+d'origine.
+
+Le préambule écrit par le proxy énonce `<serveur>__<outil>`, forme vraie pour
+un client qui lui parle en direct. MIAOU re-préfixe du slug de la carte serveur
+(`miaou-proxy__bench__echo` ici, `proxy__…` chez un collègue), et est seul à
+connaître ce slug — raison pour laquelle le proxy ne le porte pas en config :
+l'y mettre dupliquerait une donnée qui vit côté client, avec dérive garantie au
+premier renommage de carte serveur.
+
+Vérifié de bout en bout : sur un `gemma4:e4b` local, la ligne témoin de
+`mcp_bench` apparaît après `dns_lookup` et `reverse_dns`, et pas après
+`get_weather`. Le marqueur portant le mot `bench`, cette asymétrie atteste que
+le champ est lu ET rattaché au bon serveur malgré le double préfixe.
+
 ## Contrat partagé `mcp_docs` ↔ MIAOU (dispatcher, lot A/D6)
 
 Contrat entre le dispatcher client MIAOU et `mcp_docs` (et tout futur outil inflatable) —

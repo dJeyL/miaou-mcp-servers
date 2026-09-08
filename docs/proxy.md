@@ -78,8 +78,9 @@ mcp_proxy.py (racine)
 ├── build_proxy_server()   : mcp.server.Server avec list_tools / call_tool dynamiques
 │   ├── list_tools → agrège tous les upstreams, préfixe les noms avec "{name}__"
 │   └── call_tool  → dépréfixe, route vers l'upstream concerné
+├── aggregate_instructions() : compose le champ `instructions` de l'InitializeResult
 ├── build_app()            : Starlette + StreamableHTTPSessionManager + CORSMiddleware
-│   ├── lifespan : start/stop de chaque upstream
+│   ├── lifespan : start/stop de chaque upstream, puis écriture des instructions
 │   └── auth (facultative) : routes RFC 9728 + RequireAuthMiddleware sur /mcp
 └── run_with_dev_auth()    : --with-dev-auth — proxy ET AS de développement dans
                              ce process, sur DEUX ports (deux origines)
@@ -90,6 +91,65 @@ mcp_proxy.py (racine)
 certains clients MCP ne suivent pas les redirections sur POST/DELETE. Le wrapper réécrit
 `scope["path"]` de `/mcp` vers `/mcp/` avant le routeur pour servir la requête directement,
 sans redirection.
+
+
+## Consigne de portée serveur (`instructions`)
+
+Une consigne qui vaut pour un serveur ENTIER (« lire telle documentation avant
+d'appeler ces outils ») n'a pas d'emplacement au niveau outil : les seuls champs
+qu'un client relaie au modèle par outil sont `name`, `description` et
+`inputSchema`. La recopier dans chaque docstring donne N copies d'un texte qui ne
+discrimine aucun outil — ce qui reste dans une docstring d'outil doit être ce qui
+distingue CET outil.
+
+Le protocole prévoit `instructions` sur l'`InitializeResult`, destiné au system
+prompt du modèle. Côté serveur, `MiaouMCPBase(..., instructions=...)` le passe à
+`FastMCP`. Côté proxy, trois captures, une par type d'upstream :
+
+| Upstream | Capture |
+|---|---|
+| `InProcessUpstream` | `fastmcp.instructions` — pas d'`initialize` sur ce chemin |
+| `StdioUpstream` | retour d'`await session.initialize()` |
+| `HttpUpstream` | retour d'`await session.initialize()` |
+
+`aggregate_instructions()` compose le champ unique du proxy à partir des N
+upstreams : un préambule, puis une section `## <nom>` par upstream qui en
+déclare. **Le titre de section est le préfixe d'outil** (`bench` pour
+`bench__echo`) — c'est ce qui rend la portée d'une consigne déductible par le
+modèle sans convention supplémentaire à lui faire connaître. Un upstream sans
+instructions n'a pas de section ; si aucun n'en a, le champ vaut `None` et
+l'`InitializeResult` est celui d'avant le lot, à l'octet près.
+
+Trois points qui ne se devinent pas :
+
+- **Écriture différée, pas paramètre de construction.** `build_proxy_server()`
+  s'exécute AVANT `start()` : les instructions y seraient vides pour tout le
+  monde, en silence (même piège que l'état d'upstream figé à la construction).
+  Le lifespan écrit `mcp_server.instructions` après `_start_upstreams()`. C'est
+  sûr parce que le SDK relit l'attribut à chaque
+  `create_initialization_options()`, et qu'aucun client n'a pu faire son
+  handshake avant — `session_manager.run()` n'a pas encore démarré.
+
+- **Le préambule énonce `<serveur>__<outil>`, non préfixé.** Littéralement vrai
+  pour un client parlant à ce proxy en direct. Un client qui agrège LUI-MÊME
+  plusieurs serveurs re-préfixe (MIAOU expose `miaou-proxy__bench__echo`, et le
+  slug est celui de la carte serveur : `proxy` ailleurs) : la forme est alors
+  fausse d'un cran, et c'est à ce client de réécrire la phrase — il est seul à
+  connaître le slug sous lequel il publie ce proxy. Le mettre en `config.json`
+  dupliquerait une information qui vit chez le client, avec dérive garantie au
+  premier renommage de carte serveur.
+
+- **Un upstream non autorisé garde sa section.** C'est de la documentation, pas
+  une capability, et `initialize` ne se rejoue pas après une autorisation
+  obtenue en cours de route : une section omise manquerait définitivement, alors
+  qu'une section décrivant un outil temporairement absent ne coûte qu'un
+  paragraphe. Observé au passage sur un upstream Jira derrière WSO2 : `tools/list`
+  y répond avant autorisation, seul `tools/call` refuse.
+
+Le champ n'atteint le modèle que si le CLIENT le lit et l'injecte dans son system
+prompt : le proxy le publie correctement, mais un client qui ignore
+l'`InitializeResult` n'en transmet rien. MIAOU le fait (cf.
+`docs/miaou-contract.md`) ; un client tiers, pas forcément.
 
 
 ## Configuration du proxy (`config.json`)

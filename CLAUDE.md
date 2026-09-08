@@ -262,7 +262,9 @@ lots — piège déjà payé côté MIAOU.
 
 - **`docs/servers.md`** — les six serveurs en détail : outils exposés, contrats,
   variables d'environnement, décisions de conception. `mcp_bench` (chemins de
-  résultat D8/D9), `mcp_weather` (`astronomy`/`hourly` séparés et pourquoi, `extract`
+  résultat D8/D9, seul serveur à publier des `instructions` — consigne durable qui
+  se nomme au lieu de se désigner, et qui lui interdit de servir d'upstream muet
+  dans les tests), `mcp_weather` (`astronomy`/`hourly` séparés et pourquoi, `extract`
   et le nom de ressource `weather-<lieu>-<yyyymmdd>.json`), `mcp_web` (cache par
   checksum d'URL, caps
   `READ_CAP`/`LIST_CAP`, `fetch_resource` et le canal bytes→client), `mcp_ddg`,
@@ -272,8 +274,11 @@ lots — piège déjà payé côté MIAOU.
 - **`docs/proxy.md`** — `mcp_proxy.py` hors auth : les trois types d'upstream
   (inprocess/stdio/http), `build_upstreams`/`build_proxy_server`/`build_app` et le
   wrapper ASGI qui évite le 307 sur `/mcp`, l'override `--proxy`/`--noproxy` et ses
-  trois chemins d'application, le format de `config.json`, et le pattern
-  `build(config)` pour plusieurs instances d'un même module.
+  trois chemins d'application, le format de `config.json`, le pattern
+  `build(config)` pour plusieurs instances d'un même module, et
+  `aggregate_instructions` (consigne de portée serveur : les trois captures par type
+  d'upstream, la section titrée par le préfixe d'outil, l'écriture différée après
+  `start()`, le préambule non préfixé que le client re-préfixant doit réécrire).
 - **`docs/auth.md`** — campagne AB, les deux sens sans rapport entre eux. Entrante
   (AB-1 : le proxy est Resource Server, `JwtTokenVerifier`, validation d'audience
   RFC 8707 non désactivable, `dev_auth_server.py`). Sortante (AB-2 : le proxy est
@@ -285,7 +290,9 @@ lots — piège déjà payé côté MIAOU.
   `AUTHORIZATION_REQUIRED`, `authorize_path` et le `_meta` de `tools/list`,
   l'attente sur événement de `/authorize/{name}`, `_provoke_refusal` qui déroule
   la séquence jusqu'à `tools/call` (seul refusé sur un déploiement
-  d'entreprise), `--debug-auth` et son masquage, `HttpUpstream` et la contrainte
+  d'entreprise), `--debug-auth`, son masquage et la LISTE de loggers qui doit
+  couvrir l'après-boot (`mcp.client.streamable_http`, pas seulement `httpx` ;
+  nommer un logger muet est silencieux), `HttpUpstream` et la contrainte
   anyio des cancel scopes). Renouvellement (AB-3 : le refresh du SDK est passif et
   vise `<hôte-du-serveur-MCP>/token` quand la découverte échoue — d'où
   `build_oauth_metadata_override` et les endpoints déclarés ENSEMBLE en config —,
@@ -293,11 +300,15 @@ lots — piège déjà payé côté MIAOU.
   boot parce que « utilisable » inclut un jeton expiré à rafraîchir, écriture par
   le provider partagé pour rester écrivain unique, marge et période CALIBRÉES sur
   la durée de vie émise — `observed_lifetime`, les constantes ne sont que des
-  plafonds — et succès jugé sur l'avancement de l'échéance).
+  plafonds —, succès jugé sur l'avancement de l'échéance, et le TROISIÈME cas
+  d'une échéance inchangée : ni renouvellement ni anomalie, trace calme une
+  fois par épisode).
 - **`docs/miaou-contract.md`** — surface de contact avec MIAOU : transport
   streamable-http et table de configuration des cartes serveur, séquence attendue
   (`initialize` → `tools/list` → `tools/call`) et les trois familles de blocs de
-  résultat, et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
+  résultat, le champ `instructions` de l'`InitializeResult` que MIAOU lit et
+  injecte dans le system prompt (et le préambule qu'il re-préfixe, étant seul à
+  connaître son slug), et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
   `ref`+`content_b64`, `session_id`, idempotence de la matérialisation, REF_UNKNOWN
   et son rejeu qui ne marche que derrière le proxy, formats de `ref` acceptés).
 - **`docs/tls.md`** — `enable_system_trust_store()` : pourquoi une AC d'entreprise
