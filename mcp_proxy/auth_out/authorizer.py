@@ -14,7 +14,7 @@ from typing import Any
 
 from starlette.routing import Route
 
-from ..contract import AuthorizationRequired, authorize_path
+from ..contract import AuthorizationRequired, authorize_path, is_disabled
 from ..logging import _log
 from ..upstream import HttpUpstream, Upstream
 from .debug import _auth_debug_enabled, _redact_url
@@ -1102,10 +1102,15 @@ def build_upstream_authorizers(
     """
     authorizers: dict[str, UpstreamAuthorizer] = {}
     for name, srv in cfg.get("mcpServers", {}).items():
-        if srv.get("_disabled") or name not in upstreams:
+        # Pas de test de désactivation ici : build_upstreams() a déjà retiré
+        # les entrées neutralisées, donc `name not in upstreams` les couvre.
+        # Le refaire ferait sortir DEUX fois l'avertissement de migration
+        # `_disabled` pour une même entrée, les deux boucles lisant
+        # `mcpServers` au même démarrage.
+        if name not in upstreams:
             continue
         auth = srv.get("auth")
-        if not isinstance(auth, dict) or auth.get("_disabled"):
+        if not isinstance(auth, dict) or is_disabled(auth, f"mcpServers.{name}.auth"):
             continue
         upstream = upstreams[name]
         if not isinstance(upstream, HttpUpstream):

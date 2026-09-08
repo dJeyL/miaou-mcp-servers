@@ -109,7 +109,16 @@ def test_auth_absent_from_config_disables_auth():
 
 
 def test_auth_disabled_flag_respected():
+    assert resolve_auth_config(_auth_cfg(disabled=True)) is None
+
+
+def test_auth_legacy_underscore_disabled_still_read():
+    """`_disabled` est l'ancienne orthographe : tolérée, plus écrite."""
     assert resolve_auth_config(_auth_cfg(_disabled=True)) is None
+
+
+def test_auth_canonical_disabled_wins_over_legacy():
+    assert resolve_auth_config(_auth_cfg(disabled=False, _disabled=True)) is not None
 
 
 def test_no_auth_cli_overrides_config():
@@ -122,7 +131,7 @@ def test_auth_cli_without_config_key_is_an_error():
 
 
 def test_auth_cli_forces_disabled_config():
-    resolved = resolve_auth_config(_auth_cfg(_disabled=True), cli_auth=True)
+    resolved = resolve_auth_config(_auth_cfg(disabled=True), cli_auth=True)
     assert resolved is not None
 
 

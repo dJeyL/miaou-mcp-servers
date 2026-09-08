@@ -105,12 +105,57 @@ def test_build_upstreams_disabled_skipped():
         "port": 8765,
         "mcpServers": {
             "bench": {"type": "inprocess", "module": "mcp_bench"},
-            "off": {"_disabled": True, "command": "uv", "args": []},
+            "off": {"disabled": True, "command": "uv", "args": []},
+            # `_disabled` est l'ancienne orthographe, encore lue.
+            "legacy_off": {"_disabled": True, "command": "uv", "args": []},
+            # La clé canonique l'emporte sur elle quand les deux sont là.
+            "on": {
+                "disabled": False,
+                "_disabled": True,
+                "type": "inprocess",
+                "module": "mcp_bench",
+            },
         },
     }
     upstreams = build_upstreams(cfg)
     assert "bench" in upstreams
     assert "off" not in upstreams
+    assert "legacy_off" not in upstreams
+    assert "on" in upstreams
+
+
+def test_legacy_disabled_key_warns_once_per_block(capsys):
+    """La tolérance doit se voir : sinon l'ancienne orthographe ne migre jamais."""
+    cfg = {
+        "port": 8765,
+        "mcpServers": {
+            "legacy_off": {"_disabled": True, "command": "uv", "args": []},
+            "both": {
+                "disabled": False,
+                "_disabled": True,
+                "type": "inprocess",
+                "module": "mcp_bench",
+            },
+        },
+    }
+    build_upstreams(cfg)
+    err = capsys.readouterr().err
+    assert "mcpServers.legacy_off" in err
+    assert "former spelling" in err
+    assert "mcpServers.both" in err
+    assert "'disabled' wins" in err
+
+
+def test_canonical_disabled_key_stays_silent(capsys):
+    cfg = {
+        "port": 8765,
+        "mcpServers": {
+            "off": {"disabled": True, "command": "uv", "args": []},
+            "bench": {"type": "inprocess", "module": "mcp_bench"},
+        },
+    }
+    build_upstreams(cfg)
+    assert "_disabled" not in capsys.readouterr().err
 
 
 def test_build_upstreams_stdio_missing_command():

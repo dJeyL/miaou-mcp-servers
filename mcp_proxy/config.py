@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .contract import is_disabled
 from .netproxy import merge_proxy_env_overrides
 from .upstream import (
     HttpUpstream,
@@ -38,7 +39,7 @@ def build_upstreams(
     process (trust_env=True par défaut), déjà modifié au même endroit."""
     upstreams: dict[str, Upstream] = {}
     for name, srv in cfg.get("mcpServers", {}).items():
-        if srv.get("_disabled"):
+        if is_disabled(srv, f"mcpServers.{name}"):
             continue
         srv_type = srv.get("type", "stdio")
         if srv_type == "inprocess":

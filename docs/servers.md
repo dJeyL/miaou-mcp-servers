@@ -217,7 +217,7 @@ diffère.
 > lui-même (zip, PDF, Excel, Word, PowerPoint), sans serveur. Ce serveur reste en
 > place et intact pour un seul usage, qui reste réel : le travail **hors
 > connexion**, l'ouverture native de MIAOU téléchargeant ses moteurs depuis un CDN.
-> `config.sample.json` porte `_disabled: true` sur son entrée `docs` ; le retirer
+> `config.sample.json` porte `disabled: true` sur son entrée `docs` ; le retirer
 > suffit à le réveiller. Rien n'a été supprimé ici — ne pas « faire le ménage »
 > dans ce package au motif qu'il ne sert plus par défaut. Détail et raisons dans
 > le README (section « `mcp_docs` : obsolète, mais conservé pour le

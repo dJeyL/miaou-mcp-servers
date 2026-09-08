@@ -7,6 +7,8 @@ plutôt que dans l'un des deux pour que leur dépendance reste à sens unique :
 
 from __future__ import annotations
 
+from .logging import _log
+
 
 AUTHORIZATION_REQUIRED = "AUTHORIZATION_REQUIRED"
 """Code applicatif du refus d'un outil dont l'upstream n'est pas autorisé.
@@ -56,3 +58,40 @@ class AuthorizationRequired(Exception):
             f"L'upstream '{upstream_name}' exige une autorisation OAuth."
         )
         self.upstream_name = upstream_name
+
+
+def is_disabled(block: dict, where: str) -> bool:
+    """Neutralisation d'un bloc de config : `disabled`, ou l'ancien `_disabled`.
+
+    La clé canonique est `disabled`. `_disabled` reste lu pour les configs
+    existantes, mais son préfixe est trompeur : dans ce fichier, `_comment`
+    et `_comment_auth` désignent des clés IGNORÉES, et le souligné laissait
+    croire que celle-ci l'était aussi — alors qu'elle est le seul interrupteur
+    du bloc. `disabled` l'emporte quand les deux sont présentes ; c'est la
+    forme qu'on écrit, l'autre n'est qu'un vestige toléré.
+
+    `where` nomme le bloc dans l'avertissement de migration (`auth`,
+    `mcpServers.brave`…), qui est en ANGLAIS comme le reste de ce qui
+    s'affiche au démarrage (listing des upstreams, états d'autorisation) —
+    le français des traces d'auth est une exception à ne pas propager ici.
+    Le message sort une fois par bloc au démarrage, et seulement pour une
+    config qui porte encore l'ancienne clé : une config déjà migrée reste
+    silencieuse. Sans lui, la tolérance serait invisible —
+    ce qui marche sans rien dire ne se migre jamais, et l'orthographe morte
+    survivrait dans les configs jusqu'au jour où on la retirerait pour de bon.
+    """
+    legacy = "_disabled" in block
+    if "disabled" in block:
+        if legacy:
+            _log(
+                f"config: {where} sets both 'disabled' and '_disabled' — "
+                f"'disabled' wins, '_disabled' is ignored. Drop '_disabled'."
+            )
+        return bool(block["disabled"])
+    if legacy:
+        _log(
+            f"config: {where} uses '_disabled', the former spelling of "
+            f"'disabled'. Still honoured — rename it."
+        )
+        return bool(block["_disabled"])
+    return False

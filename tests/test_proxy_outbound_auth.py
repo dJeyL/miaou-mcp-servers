@@ -586,17 +586,38 @@ def test_auth_on_a_non_http_upstream_is_refused(tmp_path):
         )
 
 
-def test_disabled_auth_block_is_ignored(tmp_path):
+@pytest.mark.parametrize("key", ["disabled", "_disabled"])
+def test_disabled_auth_block_is_ignored(tmp_path, key):
+    """`_disabled` est l'ancienne orthographe du même interrupteur."""
     cfg = {
         "port": 8799,
         "mcpServers": {
-            "guarded": {"type": "http", "url": "http://y/mcp", "auth": {"_disabled": True}}
+            "guarded": {"type": "http", "url": "http://y/mcp", "auth": {key: True}}
         },
     }
     upstreams = mcp_proxy.build_upstreams(cfg)
     assert mcp_proxy.build_upstream_authorizers(
         cfg, upstreams, tmp_path / "t.json", "http://127.0.0.1:8799/callback"
     ) == {}
+
+
+def test_canonical_disabled_wins_over_legacy_on_auth_block(tmp_path):
+    cfg = {
+        "port": 8799,
+        "mcpServers": {
+            "guarded": {
+                "type": "http",
+                "url": "http://y/mcp",
+                "auth": {"disabled": False, "_disabled": True},
+            }
+        },
+    }
+    upstreams = mcp_proxy.build_upstreams(cfg)
+    assert set(
+        mcp_proxy.build_upstream_authorizers(
+            cfg, upstreams, tmp_path / "t.json", "http://127.0.0.1:8799/callback"
+        )
+    ) == {"guarded"}
 
 
 def test_config_credentials_reach_the_provider_storage(tmp_path):

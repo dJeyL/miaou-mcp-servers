@@ -28,7 +28,7 @@ native de MIAOU télécharge ses moteurs (pdf.js, mammoth, SheetJS, fflate) depu
 un CDN au premier document d'un format donné. **Hors connexion, elle ne peut pas
 s'amorcer** — là où ce serveur, tournant en local, le fait très bien. C'est le
 seul usage qui lui reste, et il est réel : quiconque travaille déconnecté a une
-raison de le réactiver, en retirant `_disabled` de son entrée `docs`.
+raison de le réactiver, en retirant `disabled` de son entrée `docs`.
 
 Sur deux points, le natif fait d'ailleurs mieux que ce serveur, et les réactiver
 ensemble ne les met pas à égalité : `python-docx` détecte les titres par le **nom
@@ -83,7 +83,7 @@ uv run mcp_proxy
 inprocess. brave est désactivé jusqu'à ce qu'une clef d'API soit renseignée : sans
 clef il refuse de démarrer, et le proxy l'écarte en servant les autres serveurs.
 docs est désactivé lui aussi, mais pour une autre raison : il est devenu obsolète
-(voir plus bas). Dans les deux cas, retirer `_disabled` suffit à le réveiller.
+(voir plus bas). Dans les deux cas, retirer `disabled` suffit à le réveiller.
 
 ## Configuration MIAOU
 
@@ -152,7 +152,8 @@ Le proxy accepte en plus :
 ```
 
 `type` absent → `stdio`. `port` est obligatoire, `host` optionnel.
-`"_disabled": true` sur une entrée → upstream ignoré au démarrage.
+`"disabled": true` sur une entrée → upstream ignoré au démarrage.
+L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'est plus celle qu'on écrit — dans ce fichier, un souligné en tête signale ailleurs (`_comment`) une clé ignorée, ce que cet interrupteur n'est justement pas. Le proxy le signale au démarrage, une ligne par bloc concerné, pour que la migration se voie plutôt que de traîner indéfiniment ; une config déjà en `disabled` ne dit rien.
 `env` sur une entrée inprocess → variables d'environnement injectées avant l'import.
 `"type": "http"` + `url` → serveur MCP **distant** en streamable-http (cf. `docs/proxy.md`).
 Un bloc `auth` sur une entrée `http` → le proxy devient **client OAuth** de ce
@@ -242,7 +243,7 @@ jeton valide et indique où s'authentifier.
 Seul `issuer_url` (le serveur d'autorisation dont on accepte les jetons) est
 obligatoire. `resource_url` est l'identité publique de ce proxy, celle que le client
 renvoie et à laquelle son jeton doit être destiné ; dérivée de l'adresse d'écoute si
-omise. `_disabled: true` neutralise le bloc sans le supprimer, et `--no-auth` fait
+omise. `disabled: true` neutralise le bloc sans le supprimer, et `--no-auth` fait
 de même à la volée.
 
 Un jeton présenté est vérifié pour de bon : signature contre les clefs publiques de
@@ -320,7 +321,7 @@ explicitement, et c'est la **seule** différence entre les deux saveurs :
 `client_secret` est facultatif : sans lui le client est public et la méthode
 d'authentification devient `none` au lieu de `client_secret_post`. `redirect_uri` ne
 sert que si l'AS impose une URL déclarée chez lui plutôt que celle du proxy.
-`_disabled: true` neutralise le bloc sans le supprimer, comme pour l'`auth`
+`disabled: true` neutralise le bloc sans le supprimer, comme pour l'`auth`
 entrante.
 
 `scope`, lui, vaut pour **les deux saveurs** : il demande des droits précis et

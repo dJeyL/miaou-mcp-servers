@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .contract import is_disabled
 from .logging import _log
 
 
@@ -60,7 +61,7 @@ def resolve_auth_config(
         return None
     if not isinstance(raw, dict):
         raise AuthConfigError("La clé 'auth' de la config doit être un objet.")
-    if raw.get("_disabled") and cli_auth is not True:
+    if is_disabled(raw, "auth") and cli_auth is not True:
         return None
 
     issuer_url = raw.get("issuer_url")

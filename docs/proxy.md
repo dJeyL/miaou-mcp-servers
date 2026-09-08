@@ -180,12 +180,12 @@ l'`InitializeResult` n'en transmet rien. MIAOU le fait (cf.
     },
     "docs": { "type": "inprocess", "module": "mcp_docs" },
     "_example_http": {
-      "_disabled": true,
+      "disabled": true,
       "type": "http",
       "url": "http://127.0.0.1:8798/mcp"
     },
     "_example_stdio": {
-      "_disabled": true,
+      "disabled": true,
       "command": "uv",
       "args": ["run", "servers/mcp_bench.py", "--transport", "stdio"]
     }
@@ -198,7 +198,8 @@ Une entrée `http` exige `url` ; `headers` et `timeout` y sont optionnels. Un bl
 `auth` sur une entrée `http` active l'auth **sortante** (le proxy devient client
 OAuth de ce serveur) ; il n'a de sens que là, et l'exiger ailleurs est une erreur
 de config signalée au démarrage.
-`"_disabled": true` sur une entrée `mcpServers` → upstream ignoré au démarrage.
+`"disabled": true` sur une entrée `mcpServers` → upstream ignoré au démarrage.
+L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'est plus celle qu'on écrit — dans ce fichier, un souligné en tête signale ailleurs (`_comment`) une clé ignorée, ce que cet interrupteur n'est justement pas. Le proxy le signale au démarrage, une ligne par bloc concerné, pour que la migration se voie plutôt que de traîner indéfiniment ; une config déjà en `disabled` ne dit rien.
 `env` sur une entrée inprocess → variables posées via `os.environ.setdefault` avant l'import.
 
 ### Multi-instance inprocess (clé `config`)
