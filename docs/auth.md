@@ -358,6 +358,17 @@ durée de vie ne se lit qu'**à l'émission** — relu plus tard, `expires_in` e
 qu'il en RESTE — d'où sa mémorisation par `set_tokens()` sous la clé `lifetime`,
 rendue par `observed_lifetime()`.
 
+**Un jeton relu n'est pas un jeton frais**, et `set_tokens()` doit s'en garder.
+`get_tokens()` écrase `expires_in` par le RESTANT — nécessaire, le SDK ne
+repassant pas par `update_token_expiry()` au chargement — mais le SDK garde cet
+objet dégradé dans `context.current_tokens` et il lui arrive de le réécrire tel
+quel. Pris pour une émission, il donnait `lifetime: 0` et un `expires_at` dans le
+passé : le jeton était marqué expiré à l'instant où il venait d'être renouvelé,
+et la trace annonçait « valide 0s ». Deux gardes, sans avoir à deviner d'où vient
+l'objet : une durée de vie ne rétrécit jamais (on retient la plus longue vue), et
+l'échéance d'un access token **inchangé** ne recule pas — un jeton réellement
+différent repart, lui, de celle qu'il annonce.
+
 Le succès se juge sur l'**avancement de l'échéance**, jamais sur le franchissement
 d'une marge. Exiger d'un jeton frais qu'il dépasse `_REFRESH_MARGIN_S` classait en
 échec un renouvellement parfaitement réussi de 5 minutes : rien n'était

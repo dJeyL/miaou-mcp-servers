@@ -1617,12 +1617,42 @@ class UpstreamTokenStorage:
         fields: dict[str, Any] = {"tokens": payload}
         if tokens.expires_in is not None:
             fields["expires_at"] = time.time() + tokens.expires_in
-            # DURÉE DE VIE À L'ÉMISSION, mémorisée ici parce que c'est le seul
+            # DURÉE DE VIE À L'ÉMISSION, mémorisée parce que c'est le seul
             # endroit où on la voit : relu plus tard, `expires_in` est ce qu'il
             # RESTE. C'est elle qui calibre la marge de renouvellement, laquelle
             # ne peut pas être une constante — un AS qui émet des jetons de 5
             # minutes rendrait « bientôt expiré » tout jeton dès son émission.
-            fields["lifetime"] = tokens.expires_in
+            #
+            # MAIS ce qui arrive ici n'est pas toujours un jeton frais. Le SDK
+            # garde en mémoire l'objet rendu par `get_tokens()`, dont on a
+            # justement écrasé `expires_in` par le RESTANT, et il lui arrive de
+            # le réécrire tel quel. Prendre cette valeur pour une durée de vie
+            # donnait `lifetime: 0` sur un jeton relu périmé, donc un
+            # `expires_at` dans le passé : le jeton se retrouvait marqué expiré
+            # à l'instant même où il venait d'être renouvelé, et la trace
+            # annonçait « valide 0s ». Mesuré le 2026-09-08.
+            #
+            # Une durée de vie ne RÉTRÉCIT jamais : on ne retient donc que la
+            # plus longue vue, ce qui ignore les réécritures dégradées sans
+            # avoir à deviner d'où vient l'objet.
+            known = self.observed_lifetime() or 0
+            fields["lifetime"] = max(known, tokens.expires_in)
+
+            # Même cause, autre dégât : réécrit depuis un objet relu, cet
+            # `expires_at` RECULE l'échéance au lieu de la porter. On ne la
+            # laisse jamais reculer pour un access token inchangé — le seul
+            # cas où une échéance doit se rapprocher est une révocation, qui
+            # ne passe pas par ici. Un jeton VRAIMENT différent repart, lui,
+            # de l'échéance qu'il annonce.
+            previous = self._read_entry()
+            same_token = (
+                (previous.get("tokens") or {}).get("access_token")
+                == tokens.access_token
+            )
+            if same_token and previous.get("expires_at") is not None:
+                fields["expires_at"] = max(
+                    float(previous["expires_at"]), fields["expires_at"]
+                )
         else:
             fields["expires_at"] = None
         self._update_entry(**fields)

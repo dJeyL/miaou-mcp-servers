@@ -2382,3 +2382,57 @@ async def test_nothing_is_renewed_when_there_is_no_token():
 
     assert authorizer.refreshed is False
     assert authorizer.authorization_pending is True
+
+
+# ---------------------------------------------------------------------------
+# Le jeton relu ne doit pas se faire passer pour un jeton frais
+#
+# `get_tokens()` écrase `expires_in` par le RESTANT (le SDK ne repasse pas par
+# update_token_expiry() au chargement). Le SDK garde cet objet dégradé en
+# mémoire et il lui arrive de le réécrire tel quel : le prendre pour une
+# émission donnait `lifetime: 0` et une échéance dans le passé — « valide 0s »
+# sur un jeton tout juste renouvelé, mesuré le 2026-09-08.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_rewriting_a_stale_token_does_not_erase_the_lifetime(tmp_path):
+    """Une durée de vie ne rétrécit jamais : seule la plus longue vue compte,
+    ce qui ignore les réécritures dégradées sans deviner d'où vient l'objet."""
+    _store_token(tmp_path, "jira", expires_in=-10, lifetime=300)
+    storage = UpstreamTokenStorage(tmp_path / "t.json", "jira")
+
+    stale = await storage.get_tokens()
+    assert stale.expires_in == 0        # le restant, pas la durée de vie
+    await storage.set_tokens(stale)
+
+    assert storage.observed_lifetime() == 300
+
+
+@pytest.mark.anyio
+async def test_rewriting_the_same_token_never_moves_its_deadline_back(tmp_path):
+    """Le seul cas où une échéance doit se rapprocher est une révocation, qui
+    ne passe pas par ici."""
+    _store_token(tmp_path, "jira", expires_in=120, lifetime=300)
+    storage = UpstreamTokenStorage(tmp_path / "t.json", "jira")
+    before = json.loads((tmp_path / "t.json").read_text())["jira"]["expires_at"]
+
+    reloaded = await storage.get_tokens()
+    await storage.set_tokens(reloaded)
+
+    after = json.loads((tmp_path / "t.json").read_text())["jira"]["expires_at"]
+    assert after >= before
+
+
+@pytest.mark.anyio
+async def test_a_genuinely_new_token_carries_its_own_deadline(tmp_path):
+    """La garde ne doit pas figer l'échéance : un jeton DIFFÉRENT repart de
+    celle qu'il annonce, y compris plus courte."""
+    _store_token(tmp_path, "jira", expires_in=3000, lifetime=3000)
+    storage = UpstreamTokenStorage(tmp_path / "t.json", "jira")
+
+    await storage.set_tokens(
+        _token(access_token="tout-autre", expires_in=300, refresh_token="r2")
+    )
+
+    renewed = await storage.get_tokens()
+    assert 290 <= renewed.expires_in <= 300
