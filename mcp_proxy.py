@@ -2058,9 +2058,18 @@ def _refresh_poll_interval(authorizers: dict[str, Any] | None) -> float:
 
     Un tiers de la marge la plus courte parmi les upstreams, pour que trois
     réveils au moins tombent dans la fenêtre de chacun. Plafonné à
-    `_REFRESH_POLL_INTERVAL_S` — un AS généreux n'a pas à être sondé plus
-    souvent — et borné en bas pour ne pas tourner en boucle serrée sur un AS
-    aux jetons très courts.
+    `_REFRESH_POLL_INTERVAL_S` : un AS généreux n'a pas à être sondé plus
+    souvent.
+
+    PAS DE PLANCHER FIXE. Un plancher de 30 s (première version) rendait la
+    période PLUS LONGUE que la fenêtre qu'elle doit échantillonner dès que les
+    jetons descendent sous la minute : sur des jetons de 30 s — WSO2 en émet,
+    mesuré le 2026-09-08 — la marge vaut 15 s pour un réveil toutes les 30 s,
+    donc une fenêtre sur deux sautée. La boucle se réveillait après
+    l'expiration et trouvait un jeton mort. Le plancher, posé pour « ne pas
+    tourner en boucle serrée », cassait exactement l'invariant qu'il devait
+    protéger : c'est la fréquence des jetons courts qui commande, et un AS qui
+    en émet toutes les 30 s impose de le sonder souvent.
     """
     margins = []
     for authorizer in (authorizers or {}).values():
@@ -2071,7 +2080,9 @@ def _refresh_poll_interval(authorizers: dict[str, Any] | None) -> float:
             margins.append(min(_REFRESH_MARGIN_S, lifetime / 2))
     if not margins:
         return _REFRESH_POLL_INTERVAL_S
-    return max(30.0, min(_REFRESH_POLL_INTERVAL_S, min(margins) / 3))
+    # Borne basse à la seconde, uniquement pour qu'une durée de vie aberrante
+    # (0, valeur négative) ne produise pas une boucle sans attente.
+    return max(1.0, min(_REFRESH_POLL_INTERVAL_S, min(margins) / 3))
 """Ce que /authorize/{name} attend avant de rendre la main au navigateur.
 
 Borne la DÉCOUVERTE de l'AS (métadonnées, éventuel enregistrement de client),

@@ -2510,3 +2510,30 @@ async def test_a_token_still_expired_afterwards_is_not_a_renewal(tmp_path):
         assert await authorizer.refresh_if_due() is False
 
     assert authorizer.authorization_pending is True
+
+
+@pytest.mark.parametrize("lifetime", [30, 60, 300, 3600, 86400])
+def test_the_window_is_sampled_at_every_scale(lifetime):
+    """L'INVARIANT, exprimé comme propriété : la fenêtre de renouvellement doit
+    contenir plusieurs réveils, QUELLE QUE SOIT la durée de vie émise.
+
+    Un plancher fixe de 30 s le cassait sous la minute — sur des jetons de 30 s
+    la marge vaut 15 s pour un réveil toutes les 30 s, donc une fenêtre sur deux
+    sautée, et la boucle se réveillait après l'expiration."""
+    class _S:
+        def observed_lifetime(self):
+            return lifetime
+
+    class _A:
+        _storage = _S()
+
+    authorizer = _A()
+    margin = mcp_proxy.UpstreamAuthorizer._refresh_margin(
+        authorizer, type("T", (), {"expires_in": lifetime})()
+    )
+    period = mcp_proxy._refresh_poll_interval({"jira": authorizer})
+
+    assert period <= margin / 2, (
+        f"durée de vie {lifetime}s : fenêtre de {margin}s échantillonnée "
+        f"toutes les {period}s — l'expiration peut passer entre deux réveils"
+    )

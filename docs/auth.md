@@ -353,7 +353,15 @@ devant un AS à rotation.
 
 La marge est donc plafonnée à la **moitié de la durée de vie réellement émise**
 (`_refresh_margin`), et la période de réveil dérivée du tiers de la plus courte
-marge en vigueur (`_refresh_poll_interval`), recalculée à chaque tour. Cette
+marge en vigueur (`_refresh_poll_interval`), recalculée à chaque tour — **sans
+plancher fixe**. Un plancher de 30 s rendait la période plus longue que la
+fenêtre qu'elle échantillonne dès que les jetons descendent sous la minute : sur
+des jetons de **30 s**, que ce WSO2 émet aussi, la marge vaut 15 s pour un réveil
+toutes les 30 s, donc une fenêtre sur deux sautée et un réveil qui arrive après
+l'expiration. Posé pour « ne pas tourner en boucle serrée », il cassait
+l'invariant qu'il devait protéger : c'est la fréquence des jetons courts qui
+commande. Un test de propriété (`test_the_window_is_sampled_at_every_scale`)
+vérifie l'invariant de 30 s à 24 h plutôt que sur des valeurs choisies. Cette
 durée de vie ne se lit qu'**à l'émission** — relu plus tard, `expires_in` est ce
 qu'il en RESTE — d'où sa mémorisation par `set_tokens()` sous la clé `lifetime`,
 rendue par `observed_lifetime()`.
