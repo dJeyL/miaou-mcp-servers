@@ -366,6 +366,15 @@ durée de vie ne se lit qu'**à l'émission** — relu plus tard, `expires_in` e
 qu'il en RESTE — d'où sa mémorisation par `set_tokens()` sous la clé `lifetime`,
 rendue par `observed_lifetime()`.
 
+**La trace dit le GAIN, pas seulement le restant.** `expires_in` relu est ce
+qu'il reste à courir : deux traces successives affichent donc des valeurs
+différentes pour un AS qui émet toujours la même durée. Lues comme des durées de
+jeton, elles ont fait conclure à tort que l'AS émettait des jetons de 30 s
+(2026-09-08). Un renouvellement effectif se voit au **gain d'échéance**, jamais
+au restant — d'où `+Ns, reste Ns, émis pour Ns`, et un avertissement explicite
+quand le gain tombe sous la moitié de la durée émise : l'AS a bougé le jeton sans
+en délivrer un neuf, et la boucle perdra la course.
+
 **Un jeton relu n'est pas un jeton frais**, et `set_tokens()` doit s'en garder.
 `get_tokens()` écrase `expires_in` par le RESTANT — nécessaire, le SDK ne
 repassant pas par `update_token_expiry()` au chargement — mais le SDK garde cet

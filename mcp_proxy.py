@@ -2630,8 +2630,32 @@ class UpstreamAuthorizer:
         deadline_after = time.time() + renewed.expires_in
         if deadline_after <= deadline_before:
             return False
-        _log(f"Jeton de '{self.name}' renouvelé "
-             f"(valide {int(renewed.expires_in)}s).")
+
+        # CE QUI EST AFFICHÉ EST LE RESTANT, PAS LA DURÉE ÉMISE. `expires_in`
+        # relu est ce qu'il reste à courir (cf. get_tokens), donc deux traces
+        # successives montrent des valeurs différentes pour un AS qui émet
+        # toujours la même durée — on lit « valide 30s » puis « valide 60s »
+        # sans que l'AS ait rien changé. Journaliser les deux, plus le gain,
+        # est ce qui permet de conclure sans deviner : un renouvellement
+        # effectif se voit au GAIN, pas au restant. Mesuré le 2026-09-08, où
+        # cette ambiguïté m'a fait conclure à tort que l'AS émettait des
+        # jetons de 30 s.
+        gained = int(deadline_after - deadline_before)
+        issued = self._storage.observed_lifetime() if hasattr(
+            self._storage, "observed_lifetime") else None
+        detail = f"+{gained}s, reste {int(renewed.expires_in)}s"
+        if issued:
+            detail += f", émis pour {int(issued)}s"
+        _log(f"Jeton de '{self.name}' renouvelé ({detail}).")
+
+        # Un gain très inférieur à la durée émise n'est pas un renouvellement
+        # complet : le jeton a bougé sans repartir à neuf, et la boucle
+        # reviendra très vite. Le dire, plutôt que de laisser croire que tout
+        # va bien jusqu'à ce que l'appel échoue.
+        if issued and gained < issued / 2:
+            _log(f"  ATTENTION : gain de {gained}s pour un jeton émis pour "
+                 f"{int(issued)}s — l'AS n'a pas délivré un jeton neuf. "
+                 f"Vérifier la rotation des refresh tokens côté serveur.")
         self.authorization_pending = False
         return True
 

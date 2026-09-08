@@ -2537,3 +2537,73 @@ def test_the_window_is_sampled_at_every_scale(lifetime):
         f"durée de vie {lifetime}s : fenêtre de {margin}s échantillonnée "
         f"toutes les {period}s — l'expiration peut passer entre deux réveils"
     )
+
+
+@pytest.mark.anyio
+async def test_the_renewal_trace_reports_the_gain_not_just_the_remainder(
+    tmp_path, capsys
+):
+    """`expires_in` relu est le RESTANT : deux traces successives montrent des
+    valeurs différentes pour un AS qui émet toujours la même durée, ce qui a
+    fait conclure à tort que l'AS émettait des jetons de 30 s. Le gain, lui,
+    mesure le renouvellement."""
+    _store_token(tmp_path, expires_in=10, lifetime=300)
+    authorizer = _authorizer(tmp_path, interactive=False)
+    provider = authorizer.provider()
+    provider._initialized = True
+    provider.context.current_tokens = _token(refresh_token="r")
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            _store_token(tmp_path, expires_in=300, lifetime=300)
+            return object()
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is True
+
+    err = capsys.readouterr().err
+    assert "émis pour 300s" in err
+    assert "+2" in err or "+29" in err      # gain, pas seulement le restant
+
+
+@pytest.mark.anyio
+async def test_a_renewal_that_barely_moves_is_flagged(tmp_path, capsys):
+    """Un gain très inférieur à la durée émise n'est pas un renouvellement
+    complet : le dire, plutôt que de laisser croire que tout va bien jusqu'à ce
+    que l'appel échoue."""
+    _store_token(tmp_path, expires_in=5, lifetime=300)
+    authorizer = _authorizer(tmp_path, interactive=False)
+    provider = authorizer.provider()
+    provider._initialized = True
+    provider.context.current_tokens = _token(refresh_token="r")
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            # L'AS rend un jeton à peine plus frais : 20s pour 300s émis.
+            _store_token(tmp_path, expires_in=20, lifetime=300)
+            return object()
+
+    with patch("httpx.AsyncClient", _Client):
+        assert await authorizer.refresh_if_due() is True
+
+    err = capsys.readouterr().err
+    assert "ATTENTION" in err
+    assert "n'a pas délivré un jeton neuf" in err
