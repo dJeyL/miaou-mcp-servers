@@ -31,6 +31,30 @@ async def test_add_returns_formatted_sum():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "asked,expected",
+    [
+        (1.5, 1.5),  # nominal
+        (0, 0.0),
+        (-5, 0.0),  # clamp bas
+        (1000, 60.0),  # clamp haut
+        (float("inf"), 60.0),
+        (float("-inf"), 0.0),
+        (float("nan"), 0.0),  # asyncio.sleep(NaN) ne terminerait jamais
+    ],
+)
+async def test_sleep_clamps_and_reports_actual_duration(asked, expected):
+    """La durée passée à asyncio.sleep est la valeur clampée, et c'est elle
+    qu'annonce le message de retour — le texte de l'outil promet les deux."""
+    sleep_mock = AsyncMock()
+    with patch("asyncio.sleep", new=sleep_mock):
+        tm = bench_server.mcp._tool_manager
+        result = await tm.call_tool("sleep", {"seconds": asked})
+    sleep_mock.assert_awaited_once_with(expected)
+    assert str(expected) in result
+
+
+@pytest.mark.asyncio
 async def test_dns_lookup_success():
     mock_infos = [
         (None, None, None, None, ("93.184.216.34", 0)),
@@ -107,10 +131,18 @@ async def test_get_json_resource_returns_embedded_resource():
 
 
 def test_tool_list_contains_all_expected():
-    """Six outils doivent être enregistrés."""
+    """Sept outils doivent être enregistrés."""
     tools = bench_server.mcp._tool_manager.list_tools()
     names = {t.name for t in tools}
-    assert names == {"echo", "add", "dns_lookup", "reverse_dns", "get_image", "get_json_resource"}
+    assert names == {
+        "echo",
+        "add",
+        "sleep",
+        "dns_lookup",
+        "reverse_dns",
+        "get_image",
+        "get_json_resource",
+    }
 
 
 def test_main_legacy_positional_invalid_port_exits_clean(monkeypatch, capsys):

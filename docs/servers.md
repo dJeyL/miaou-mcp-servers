@@ -13,6 +13,7 @@ Sert à exercer les différents chemins de traitement des résultats dans MIAOU 
 |---|---|---|
 | `echo(text)` | bloc `text` | D9 : texte réinjecté au modèle |
 | `add(a, b)` | bloc `text` | D9 |
+| `sleep(seconds)` | bloc `text` | D9 — attente volontaire, simule un appel lent |
 | `dns_lookup(hostname)` | bloc `text` | D9 — résolution via réseau local du serveur |
 | `reverse_dns(ip)` | bloc `text` | D9 — PTR record |
 | `get_image()` | bloc `image` (PNG) | D8.1 : binaire → IDB → `<img>` dans l'UI, descripteur statique au modèle |
@@ -21,6 +22,23 @@ Sert à exercer les différents chemins de traitement des résultats dans MIAOU 
 Les outils ont un `asyncio.sleep(2)` intentionnel pour simuler la latence réseau et
 vérifier que le patienteur animé et les acks MCP (`mcp_call`) s'affichent correctement
 pendant le round-trip.
+
+`sleep(seconds)` sert le même objectif mais sur une durée **choisie par l'appelant**,
+pour les cas que 2 secondes en dur n'atteignent pas (timeout client, patienteur sur une
+attente longue). C'est ce qui lui vaut un plafond : la durée vient du modèle, et non
+bornée elle immobiliserait la session (`sleep(86400)`). D'où `_SLEEP_CAP = 60.0` et un
+clamp dans `[0, 60]` — silencieux, pas une erreur : hors plage, la valeur est ramenée
+au plus proche. La valeur du cap est citée littéralement dans la description de l'outil
+et dans celle de son paramètre, donc la changer demande de rééditer les deux.
+
+Deux détails du clamp qui ne se devinent pas :
+
+- **NaN est testé à part** (`seconds != seconds`), avant le clamp. `max(0, min(60, NaN))`
+  renvoie NaN — NaN échoue toute comparaison, donc `max`/`min` le laissent passer — et
+  `asyncio.sleep(NaN)` ne termine jamais : un vrai blocage, pas une lenteur simulée.
+  `±inf`, lui, traverse le clamp correctement (60 et 0).
+- **Le retour annonce la durée réellement attendue**, pas celle demandée, pour que le
+  clamp soit observable côté client.
 
 **Seul serveur du dépôt à publier des `instructions`** (consigne de portée serveur,
 champ de l'`InitializeResult` — cf. `docs/proxy.md`) : il demande au modèle de

@@ -1,0 +1,21 @@
+services:
+  mcp-proxy:
+    build: .
+    image: miaou-mcp
+    container_name: miaou-mcp
+    ports:
+      - "8765:8765"
+    environment:
+      # Dossiers de travail des upstreams inprocess qui font du cache disque —
+      # sans ça, ils écrivent dans le répertoire de travail du conteneur
+      # (WORKDIR /app) et le cache disparaît à chaque recréation du conteneur.
+      MIAOU_WEB_WORKDIR: /data/miaou-web
+      MIAOU_DOCS_WORKDIR: /data/miaou-docs
+    volumes:
+      - miaou-web:/data/miaou-web
+      - miaou-docs:/data/miaou-docs
+    restart: unless-stopped
+
+volumes:
+  miaou-web:
+  miaou-docs:

@@ -76,7 +76,7 @@ Six serveurs de banc d'essai plus un proxy qui les agrège. Le détail de chacun
 
 | Serveur | Port | Rôle | Outils |
 |---|---|---|---|
-| `mcp_bench.py` | 8766 | Banc d'essai général : exerce les chemins de résultat de MIAOU (texte, image, resource) | `echo`, `add`, `dns_lookup`, `reverse_dns`, `get_image`, `get_json_resource` |
+| `mcp_bench.py` | 8766 | Banc d'essai général : exerce les chemins de résultat de MIAOU (texte, image, resource) | `echo`, `add`, `sleep`, `dns_lookup`, `reverse_dns`, `get_image`, `get_json_resource` |
 | `mcp_weather.py` | 8767 | Météo réelle via wttr.in | `get_weather` (`astronomy`, `hourly`, `extract`) |
 | `mcp_web/` | 8768 | Téléchargement d'URL, cache disque par checksum, pagination | `fetch_url`, `fetch_read`, `fetch_list`, `fetch_resource` |
 | `mcp_ddg.py` | 8769 | Recherche DuckDuckGo (HTML scrapé) | `ddg_search` |
@@ -282,7 +282,9 @@ lots — piège déjà payé côté MIAOU.
   variables d'environnement, décisions de conception. `mcp_bench` (chemins de
   résultat D8/D9, seul serveur à publier des `instructions` — consigne durable qui
   se nomme au lieu de se désigner, et qui lui interdit de servir d'upstream muet
-  dans les tests), `mcp_weather` (`astronomy`/`hourly` séparés et pourquoi, `extract`
+  dans les tests ; `sleep` et son `_SLEEP_CAP`, dont le clamp teste NaN à part parce
+  qu'il traverse `max`/`min` et qu'`asyncio.sleep(NaN)` ne termine jamais),
+  `mcp_weather` (`astronomy`/`hourly` séparés et pourquoi, `extract`
   et le nom de ressource `weather-<lieu>-<yyyymmdd>.json`), `mcp_web` (cache par
   checksum d'URL, caps
   `READ_CAP`/`LIST_CAP`, `fetch_resource` et le canal bytes→client), `mcp_ddg`,

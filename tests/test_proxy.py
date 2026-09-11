@@ -202,7 +202,15 @@ async def test_inprocess_upstream_list_tools():
     await upstream.start()
     tools = await upstream.list_tools()
     names = {t.name for t in tools}
-    assert {"echo", "add", "get_image", "get_json_resource", "dns_lookup", "reverse_dns"} == names
+    assert {
+        "echo",
+        "add",
+        "sleep",
+        "get_image",
+        "get_json_resource",
+        "dns_lookup",
+        "reverse_dns",
+    } == names
 
 
 @pytest.mark.asyncio
