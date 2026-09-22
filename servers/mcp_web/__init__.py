@@ -53,6 +53,7 @@ import base64
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from typing import Annotated
 
 import html2text
@@ -139,13 +140,59 @@ def _load_structure_blocking(url: str, html_text: str) -> list[dict]:
     return entries
 
 
-def _fetch_bytes(req: urllib.request.Request, max_bytes: int) -> tuple[str, bytes]:
-    """I/O bloquante isolée pour asyncio.to_thread (T2). Renvoie (content_type, corps)."""
+def _decompress(raw: bytes, encoding: str) -> bytes:
+    """Décompresse un corps selon son Content-Encoding, en tolérant une fin
+    manquante (WEB9).
+
+    On ne sollicite AUCUN encodage (pas d'Accept-Encoding dans la requête) :
+    urllib n'en envoie pas et on ne décompresse donc que ce qu'un serveur
+    impose de lui-même. python.org le fait sur /downloads/release/, mesuré le
+    2026-09-22 — et le corps gzip partait alors en decode(errors="replace"),
+    d'où un texte de remplacement que le modèle lisait comme du contenu.
+
+    `raw` est déjà tronqué à max_bytes+1 OCTETS COMPRESSÉS, donc le flux est
+    coupé en plein milieu dès que le cap mord : `decompress()` lèverait sur la
+    fin absente. Les objets de décompression, eux, rendent ce qu'ils ont pu
+    lire — c'est exactement le comportement voulu, la troncature étant déjà
+    signalée par ailleurs.
+
+    Un encodage inconnu (ou un corps illisible) rend `raw` inchangé : ce qui
+    était déjà envoyé avant cette fonction. Un cas non couvert ne doit pas
+    faire échouer un fetch qui aboutissait."""
+    enc = encoding.strip().lower()
+    try:
+        if enc == "gzip" or enc == "x-gzip":
+            return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw)
+        if enc == "deflate":
+            try:
+                return zlib.decompressobj().decompress(raw)
+            except zlib.error:
+                # deflate « brut », sans en-tête zlib : toléré par les navigateurs.
+                return zlib.decompressobj(-zlib.MAX_WBITS).decompress(raw)
+    except (zlib.error, OSError):
+        return raw
+    return raw
+
+
+def _fetch_bytes(req: urllib.request.Request, max_bytes: int) -> tuple[str, bytes, bool]:
+    """I/O bloquante isolée pour asyncio.to_thread (T2). Renvoie
+    (content_type, corps, truncated).
+
+    La troncature est décidée ICI, sur les octets tels qu'ils arrivent du
+    réseau, et jamais en aval : après `_decompress` le corps est plus GROS que
+    `max_bytes` sans avoir rien perdu, si bien qu'un `len(corps) > max_bytes`
+    calculé plus loin signalerait une troncature qui n'a pas eu lieu."""
     opener = make_opener()
     with opener.open(req, timeout=10) as resp:
         content_type = resp.headers.get("Content-Type", "application/octet-stream")
+        encoding = resp.headers.get("Content-Encoding") or ""
         raw = resp.read(max_bytes + 1)
-        return content_type, raw
+        truncated = len(raw) > max_bytes
+        if truncated:
+            raw = raw[:max_bytes]
+        if encoding:
+            raw = _decompress(raw, encoding)
+        return content_type, raw, truncated
 
 
 async def _guarded_fetch(
@@ -154,7 +201,11 @@ async def _guarded_fetch(
     """Gardes + téléchargement communs à fetch_url/fetch_resource (WEB4) : schéma
     http/https, clamp max_bytes vers [1, cap], requête + erreurs réseau en
     chaînes. Renvoie soit un message d'erreur (str), soit
-    (content_type, corps_tronqué, truncated)."""
+    (content_type, corps_tronqué, truncated).
+
+    La troncature et la décompression appartiennent à `_fetch_bytes` (WEB9) :
+    le corps rendu ici peut dépasser `max_bytes` — c'est le cas nominal d'une
+    réponse compressée non tronquée."""
     scheme = urllib.parse.urlsplit(url).scheme.lower()
     if scheme not in _ALLOWED_SCHEMES:
         return f"Schéma d'URL non autorisé ({scheme or '?'}) — http/https uniquement : {url}"
@@ -164,7 +215,9 @@ async def _guarded_fetch(
 
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     try:
-        content_type, raw = await asyncio.to_thread(_fetch_bytes, req, max_bytes)
+        content_type, raw, truncated = await asyncio.to_thread(
+            _fetch_bytes, req, max_bytes
+        )
     except urllib.error.HTTPError as e:
         return f"Erreur HTTP {e.code} ({e.reason}) — {url}"
     except urllib.error.URLError as e:
@@ -174,9 +227,6 @@ async def _guarded_fetch(
     except Exception as e:
         return f"Erreur inattendue ({type(e).__name__}: {e}) — {url}"
 
-    truncated = len(raw) > max_bytes
-    if truncated:
-        raw = raw[:max_bytes]
     return content_type, raw, truncated
 
 

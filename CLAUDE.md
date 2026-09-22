@@ -287,7 +287,9 @@ lots — piège déjà payé côté MIAOU.
   `mcp_weather` (`astronomy`/`hourly` séparés et pourquoi, `extract`
   et le nom de ressource `weather-<lieu>-<yyyymmdd>.json`), `mcp_web` (cache par
   checksum d'URL, caps
-  `READ_CAP`/`LIST_CAP`, `fetch_resource` et le canal bytes→client), `mcp_ddg`,
+  `READ_CAP`/`LIST_CAP`, `fetch_resource` et le canal bytes→client, décompression
+  `Content-Encoding` non sollicitée — `_decompress`, WEB9 — et la troncature décidée
+  sur les octets reçus qu'elle impose), `mcp_ddg`,
   `mcp_brave` (`resolve_api_key`, refus d'init sans clef), `mcp_docs` (obsolète mais
   conservé pour le hors-connexion : sessions, pagination, `search`, `extract` hors
   `READ_CAP`, sécurité archives, locales des headings docx).
@@ -337,7 +339,9 @@ lots — piège déjà payé côté MIAOU.
   d'appel (l'ordre contractuel dans `mcp_proxy.main()`, la copie assumée dans
   `tests/live_call.py`), le best-effort assumé.
 - **`docs/tests.md`** — ce que chaque suite mocke (aucun appel réseau réel, aucune
-  clef requise), l'isolation filesystem par `tmp_path`, et les deux bancs manuels
+  clef requise), l'isolation filesystem par `tmp_path`, les deux pièges de fixture
+  du mock de réponse de `test_web.py` (queue de remplissage compressible, garde
+  verte des deux côtés), et les deux bancs manuels
   non collectés : `tests/live_call.py`, qui parle le vrai transport
   streamable-http comme MIAOU (`-H/--header`, truststore), et
   `tests/live_auth_probe.py`, qui mesure ce qu'un upstream répond SANS jeton

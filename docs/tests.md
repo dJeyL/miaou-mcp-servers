@@ -16,6 +16,19 @@ Les tests de mcp_web monkeypatchent `mcp_web.cache.WORKDIR` (fixture `tmp_path`,
 pour la même raison ; `tests/test_web_structure.py` exerce `mcp_web.structure.extract_structure`
 en isolation (pas de HTTP, pas de cache) sur des fragments HTML construits à la main.
 
+Le mock de réponse de `test_web.py` (`_make_mock_resp`) porte un `Content-Encoding`
+optionnel, ce qui fait traverser `_decompress` (WEB9) au vrai chemin `fetch_url` /
+`fetch_resource` — le stub est l'opener, pas `_fetch_bytes`. Deux pièges de fixture y
+sont posés, parce qu'aucun des deux ne fait échouer un test naïf :
+
+- une queue de remplissage **répétée** (`b"x" * 40000`) se gzippe en ~90 octets et ne
+  franchit donc jamais `max_bytes` : le test de troncature mid-stream passerait sans avoir
+  rien tronqué. D'où `os.urandom`, incompressible.
+- les deux tests de troncature restent **verts sur le code d'avant** (la décompression
+  n'est pas ce qu'ils gardent) ; seuls les cinq tests de décompression y tombent. Vérifié
+  en neutralisant `_decompress` — un test de non-régression qui passe des deux côtés ne
+  prouve rien.
+
 ### `tests/live_call.py` — appel réel d'un outil
 
 Script PEP 723 (dépendances : `mcp`, `truststore`), **pas un test pytest** : son nom ne commence

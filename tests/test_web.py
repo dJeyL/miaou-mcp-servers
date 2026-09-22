@@ -1,9 +1,11 @@
 """Tests unitaires pour servers/mcp_web/ (package)."""
 import base64
+import gzip
 import os
 import sys
 import time
 import urllib.error
+import zlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -24,11 +26,21 @@ def _isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_web_cache, "WORKDIR", tmp_path)
 
 
-def _make_mock_resp(body: bytes, content_type: str = "text/html; charset=utf-8"):
+def _make_mock_resp(
+    body: bytes,
+    content_type: str = "text/html; charset=utf-8",
+    content_encoding: str | None = None,
+):
     headers = MagicMock()
-    headers.get.side_effect = (
-        lambda key, default="": content_type if key == "Content-Type" else default
-    )
+
+    def _get(key, default=""):
+        if key == "Content-Type":
+            return content_type
+        if key == "Content-Encoding":
+            return content_encoding if content_encoding is not None else default
+        return default
+
+    headers.get.side_effect = _get
     mock = MagicMock()
     mock.__enter__ = lambda s: s
     mock.__exit__ = MagicMock(return_value=False)
@@ -151,6 +163,106 @@ async def test_fetch_truncation_adds_note():
         result = await _TM.call_tool("fetch_url", {"url": "http://example.com", "max_bytes": 10})
     assert "Tronqué" in result.resource.text
     assert "10" in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_gzipped_html_is_decompressed():
+    """WEB9 : un serveur peut gzipper SANS qu'on l'ait demandé (python.org le
+    fait, mesuré le 2026-09-22). Sans décompression le corps partait en
+    decode(errors='replace') et le modèle lisait un texte de remplacement en
+    croyant lire la page."""
+    body = gzip.compress(b"<html><body><p>Hello gzipped</p></body></html>")
+    mock_resp = _make_mock_resp(body, "text/html; charset=utf-8", "gzip")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_url", {"url": "http://example.com"})
+    assert "Hello gzipped" in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_gzipped_text_plain_is_decompressed():
+    body = gzip.compress(b"contenu textuel compresse")
+    mock_resp = _make_mock_resp(body, "text/plain", "gzip")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_url", {"url": "http://example.com/t"})
+    assert "contenu textuel compresse" in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_deflate_is_decompressed():
+    body = zlib.compress(b"deflate lisible")
+    mock_resp = _make_mock_resp(body, "text/plain", "deflate")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_url", {"url": "http://example.com/d"})
+    assert "deflate lisible" in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_raw_deflate_is_decompressed():
+    """deflate « brut », sans en-tête zlib : toléré par les navigateurs, donc
+    servi par certains serveurs. Le fallback wbits négatif le couvre."""
+    obj = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    body = obj.compress(b"deflate brut lisible") + obj.flush()
+    mock_resp = _make_mock_resp(body, "text/plain", "deflate")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_url", {"url": "http://example.com/dr"})
+    assert "deflate brut lisible" in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_unknown_encoding_passes_body_through():
+    """Un encodage non géré (br, zstd) ne doit pas faire ÉCHOUER un fetch : on
+    rend le corps tel quel, soit ce qui partait déjà avant WEB9."""
+    mock_resp = _make_mock_resp(b"corps non compresse", "text/plain", "br")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_url", {"url": "http://example.com/b"})
+    assert "corps non compresse" in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_gzip_truncated_midstream_still_yields_text():
+    """Le cap mord sur les octets COMPRESSÉS, donc le flux gzip est coupé en
+    plein milieu. L'objet de décompression rend ce qu'il a pu lire là où
+    gzip.decompress() lèverait sur la fin absente."""
+    # Queue INCOMPRESSIBLE : une répétition (b"x" * 40000) se gzippe en ~90
+    # octets et ne dépasserait jamais le cap — le test passerait alors sans
+    # avoir tronqué quoi que ce soit.
+    body = gzip.compress(b"DEBUT LISIBLE " + os.urandom(40000))
+    assert len(body) > 200
+    mock_resp = _make_mock_resp(body, "text/plain", "gzip")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool(
+            "fetch_url", {"url": "http://example.com/tr", "max_bytes": 200}
+        )
+    assert "DEBUT LISIBLE" in result.resource.text
+    assert "Tronqué" in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_gzip_not_truncated_despite_body_larger_than_max_bytes():
+    """La troncature se décide sur les octets REÇUS, jamais après
+    décompression : un corps décompressé plus gros que max_bytes n'a rien
+    perdu, et l'annoncer tronqué serait faux."""
+    payload = b"z" * 5000
+    body = gzip.compress(payload)
+    assert len(body) < 1000 < len(payload)
+    mock_resp = _make_mock_resp(body, "text/plain", "gzip")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool(
+            "fetch_url", {"url": "http://example.com/nt", "max_bytes": 1000}
+        )
+    assert "Tronqué" not in result.resource.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_gzipped_blob_is_decompressed():
+    """fetch_resource partage _guarded_fetch : le blob transféré au client doit
+    être le corps décompressé, pas le gzip brut."""
+    payload = b"\x89PNG\r\n\x1a\n" + b"fake image bytes"
+    mock_resp = _make_mock_resp(gzip.compress(payload), "image/png", "gzip")
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await _TM.call_tool("fetch_resource", {"url": "http://example.com/i.png"})
+    blob = next(b for b in result if isinstance(b, types.EmbeddedResource))
+    assert base64.b64decode(blob.resource.blob) == payload
 
 
 @pytest.mark.asyncio

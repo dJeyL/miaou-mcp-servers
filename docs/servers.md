@@ -124,6 +124,35 @@ Quatre outils. `fetch_url(url, max_bytes=5242880)` branch sur le `Content-Type` 
 Taille *téléchargée* bornée à `max_bytes` (défaut 5 Mo), troncature notée dans le texte.
 Erreurs réseau retournées comme chaînes (pas de stack trace).
 
+**Décompression du corps selon `Content-Encoding` (`_decompress`, WEB9).** On ne
+sollicite **aucun** encodage — urllib n'envoie pas d'`Accept-Encoding` et on n'en ajoute
+pas — mais un serveur peut gzipper sans qu'on l'ait demandé : `python.org` le fait sur
+`/downloads/release/` (mesuré le 2026-09-22), là où `docs.python.org`, `example.com` ou
+Wikipédia servent du clair. Sans décompression le corps gzip partait tel quel en
+`decode(errors="replace")`, et le modèle recevait un texte de remplacement qu'il lisait
+comme étant la page — un défaut **silencieux**, sans erreur nulle part, que rien ne
+distingue d'une page réellement illisible. `gzip`/`x-gzip` et `deflate` (avec le fallback
+deflate brut, sans en-tête zlib, que tolèrent les navigateurs) sont traités ; un encodage
+non géré (`br`, `zstd`) rend le corps **inchangé**, soit ce qui partait avant — un cas non
+couvert ne doit pas faire échouer un fetch qui aboutissait. `zlib` est stdlib : rien à
+ajouter à `requirements.txt` ni à `[project.dependencies]`.
+
+Deux conséquences sur les bornes, qui tiennent au fait que le cap mord sur les octets
+**compressés** :
+
+- La troncature se décide dans `_fetch_bytes`, sur les octets tels qu'ils arrivent du
+  réseau, et **jamais en aval** : après décompression le corps est légitimement plus gros
+  que `max_bytes` sans avoir rien perdu, si bien qu'un `len(corps) > max_bytes` calculé
+  plus loin annoncerait une troncature qui n'a pas eu lieu. `_guarded_fetch` relaie
+  désormais le flag au lieu de le calculer, et son corps rendu peut dépasser `max_bytes`.
+- Un flux gzip coupé au milieu ne se décompresse pas intégralement, d'où
+  `zlib.decompressobj()` (qui rend ce qu'il a pu lire) plutôt que `gzip.decompress()` (qui
+  lèverait sur la fin absente) : une page tronquée reste lisible jusqu'à sa coupure.
+
+`max_bytes` borne donc le **transfert**, pas ce qui atteint le modèle : côté texte c'est
+`MIAOU_WEB_READ_CAP` qui plafonne la sortie (paragraphe suivant), et `fetch_read` qui
+pagine au-delà.
+
 Le texte produit (HTML converti ou `text/*`) est en plus plafonné en sortie à
 `MIAOU_WEB_READ_CAP` caractères (défaut 20000, cf. `servers/mcp_web/cache.py`) — une page
 HTML de plusieurs Mo convertie par html2text peut sinon saturer la fenêtre de contexte de
