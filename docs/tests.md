@@ -15,6 +15,14 @@ pas seulement l'appel direct à l'outil.
 Les tests de mcp_web monkeypatchent `mcp_web.cache.WORKDIR` (fixture `tmp_path`, autouse)
 pour la même raison ; `tests/test_web_structure.py` exerce `mcp_web.structure.extract_structure`
 en isolation (pas de HTTP, pas de cache) sur des fragments HTML construits à la main.
+`tests/test_web_pagemeta.py` couvre le `_meta` de `fetch_url` : les purs de `pagemeta.py`
+en isolation, puis `fetch_url` de bout en bout derrière un opener patché qui **route par
+URL** (`_Router`) — la page, sa favicon et `/favicon.ico` répondent chacune leur corps, et
+les URL demandées sont comptées (sonde unique par origine, pas de requête pour une favicon
+`data:`). Le cache de favicons vivant dans le processus, les deux fichiers de tests web le
+vident en fixture autouse : sans quoi un test hériterait de la sonde ratée du précédent.
+`fetch_url` rendant un `CallToolResult`, `test_web.py` passe par `_fetch_url`, qui en
+extrait le bloc unique et vérifie au passage `isError` faux.
 
 Le mock de réponse de `test_web.py` (`_make_mock_resp`) porte un `Content-Encoding`
 optionnel, ce qui fait traverser `_decompress` (WEB9) au vrai chemin `fetch_url` /
@@ -49,7 +57,8 @@ uv run tests/live_call.py -H 'Authorization: Bearer xxx' --list   # header libre
 Arguments JSON optionnels. L'outil est vérifié contre `tools/list` avant l'appel (nom
 inconnu → liste des disponibles, code 2). Rendu des trois familles de blocs : `text` brut,
 `image`/`resource` binaire résumés (mime + taille base64, jamais le base64 lui-même),
-`resource` texte avec son URI, plus `structuredContent` s'il existe. Codes de sortie : 0
+`resource` texte avec son URI, plus `structuredContent` et `_meta` s'ils existent (c'est le
+seul moyen de voir que le `_meta` d'un appel traverse le fil). Codes de sortie : 0
 succès, 1 `isError` ou échec de connexion, 2 erreur d'usage. Les `ExceptionGroup` d'anyio
 sont aplatis avant affichage (`_flatten`) — sans ça, un serveur injoignable ne produit que
 « unhandled errors in a TaskGroup », sans la cause.

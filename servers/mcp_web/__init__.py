@@ -23,6 +23,9 @@ Outils exposés :
     (headings + liens, dans l'ordre d'apparition) du HTML déjà mis en cache par
     fetch_url, paginée par index d'entrée.
 
+fetch_url pose en plus, hors du contenu servi au modèle, un `_meta` destiné au
+client (clé `miaou/web` : titre, nom de site, URL finale, favicon) — cf. pagemeta.py.
+
 Variables d'environnement (toutes optionnelles, défauts constants) :
     MIAOU_WEB_WORKDIR      (défaut : "./miaou-web", relatif au répertoire de travail)
     MIAOU_WEB_CACHE_TTL_H  (défaut : 24, sweep opportuniste comme mcp_docs)
@@ -30,7 +33,8 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
     MIAOU_WEB_LIST_CAP     (défaut : 100, en nombre d'entrées, pour fetch_list)
 
 Module éclaté en package (servers/mcp_web/) : cache.py (cache disque par checksum
-d'URL), structure.py (extraction stdlib html.parser des headings/liens). Ce fichier
+d'URL), structure.py (extraction stdlib html.parser des headings/liens), pagemeta.py
+(métadonnées de page et favicon du `_meta` de fetch_url). Ce fichier
 ne porte que le serveur FastMCP et ses outils.
 
 Lancement (package, pas un script plat — `uv run servers/mcp_web.py` ne s'applique
@@ -64,6 +68,15 @@ from mcp_base import MiaouMCPBase, make_opener
 
 from . import cache as web_cache
 from .cache import CacheMiss
+from .pagemeta import (
+    FAVICON_CACHE_MAX,
+    META_KEY,
+    _FaviconCache,
+    build_web_meta,
+    extract_head_meta,
+    origin_of,
+    resolve_favicon_blocking,
+)
 from .structure import extract_structure
 
 _DEFAULT_MAX_BYTES = 5 * 1024 * 1024  # 5 Mo
@@ -72,6 +85,9 @@ _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+favicon_cache = _FaviconCache(FAVICON_CACHE_MAX, web_cache.TTL_HOURS * 3600)
+"""Favicon par origine, partagée par tous les appels du processus (cf. pagemeta)."""
 
 
 def _charset_from_content_type(content_type: str) -> str:
@@ -174,9 +190,14 @@ def _decompress(raw: bytes, encoding: str) -> bytes:
     return raw
 
 
-def _fetch_bytes(req: urllib.request.Request, max_bytes: int) -> tuple[str, bytes, bool]:
+def _fetch_bytes(
+    req: urllib.request.Request, max_bytes: int
+) -> tuple[str, bytes, bool, str | None]:
     """I/O bloquante isolée pour asyncio.to_thread (T2). Renvoie
-    (content_type, corps, truncated).
+    (content_type, corps, truncated, url_finale).
+
+    `url_finale` est l'adresse atteinte après les redirections suivies par
+    urllib (`geturl()`), None si la réponse n'en donne pas une chaîne http(s).
 
     La troncature est décidée ICI, sur les octets tels qu'ils arrivent du
     réseau, et jamais en aval : après `_decompress` le corps est plus GROS que
@@ -192,16 +213,28 @@ def _fetch_bytes(req: urllib.request.Request, max_bytes: int) -> tuple[str, byte
             raw = raw[:max_bytes]
         if encoding:
             raw = _decompress(raw, encoding)
-        return content_type, raw, truncated
+        return content_type, raw, truncated, _final_url(resp)
+
+
+def _final_url(resp) -> str | None:
+    try:
+        final = resp.geturl()
+    except Exception:  # noqa: BLE001 — l'URL finale est un bonus, jamais une panne
+        return None
+    if not isinstance(final, str):
+        return None
+    if urllib.parse.urlsplit(final).scheme.lower() not in _ALLOWED_SCHEMES:
+        return None
+    return final
 
 
 async def _guarded_fetch(
     url: str, max_bytes: int, cap: int
-) -> tuple[str, bytes, bool] | str:
+) -> tuple[str, bytes, bool, str | None] | str:
     """Gardes + téléchargement communs à fetch_url/fetch_resource (WEB4) : schéma
     http/https, clamp max_bytes vers [1, cap], requête + erreurs réseau en
     chaînes. Renvoie soit un message d'erreur (str), soit
-    (content_type, corps_tronqué, truncated).
+    (content_type, corps_tronqué, truncated, url_finale).
 
     La troncature et la décompression appartiennent à `_fetch_bytes` (WEB9) :
     le corps rendu ici peut dépasser `max_bytes` — c'est le cas nominal d'une
@@ -215,10 +248,14 @@ async def _guarded_fetch(
 
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     try:
-        content_type, raw, truncated = await asyncio.to_thread(
+        content_type, raw, truncated, final_url = await asyncio.to_thread(
             _fetch_bytes, req, max_bytes
         )
     except urllib.error.HTTPError as e:
+        # Une HTTPError EST la réponse, socket comprise (`e.fp`) : sans ce
+        # close, elle reste ouverte jusqu'au passage du GC — cyclique, le plus
+        # souvent, l'exception ayant traversé to_thread et son futur.
+        e.close()
         return f"Erreur HTTP {e.code} ({e.reason}) — {url}"
     except urllib.error.URLError as e:
         return f"Erreur réseau ({e.reason}) — {url}"
@@ -227,7 +264,35 @@ async def _guarded_fetch(
     except Exception as e:
         return f"Erreur inattendue ({type(e).__name__}: {e}) — {url}"
 
-    return content_type, raw, truncated
+    return content_type, raw, truncated, final_url
+
+
+async def _favicon_for(page_url: str, icons: list[tuple[str, str]]) -> str | None:
+    """Favicon de l'origine de `page_url`, depuis le cache ou sondée une fois."""
+    origin = origin_of(page_url)
+    found, value = favicon_cache.get(origin)
+    if found:
+        return value
+    value = await asyncio.to_thread(resolve_favicon_blocking, page_url, icons, _UA)
+    favicon_cache.put(origin, value)
+    return value
+
+
+def _tool_result(
+    block: str | types.EmbeddedResource, web_meta: dict | None = None
+) -> types.CallToolResult:
+    """Résultat de fetch_url, `_meta` compris quand il y a quelque chose à dire.
+
+    `**{"_meta": ...}` et non `meta=...`, comme côté proxy : pydantic ne
+    sérialise sous l'alias que si le champ a été peuplé PAR l'alias. Un texte
+    d'erreur reste un résultat ordinaire (isError faux), comme avant que
+    fetch_url rende un CallToolResult."""
+    content: list[types.ContentBlock] = (
+        [types.TextContent(type="text", text=block)] if isinstance(block, str) else [block]
+    )
+    if not web_meta:
+        return types.CallToolResult(content=content)
+    return types.CallToolResult(content=content, **{"_meta": {META_KEY: web_meta}})
 
 
 def _format_entry(index: int, entry: dict) -> str:
@@ -252,11 +317,15 @@ class WebServer(MiaouMCPBase):
                     )
                 ),
             ] = _DEFAULT_MAX_BYTES,
-        ) -> str | types.EmbeddedResource:
+        ) -> types.CallToolResult:
+            # Retour CallToolResult, seule forme par laquelle FastMCP laisse un
+            # outil poser le `_meta` de son résultat. Effet de bord assumé :
+            # plus d'outputSchema ni de structuredContent, qui recopiait le
+            # contenu entier sur le fil (et que le proxy ne publie pas).
             fetched = await _guarded_fetch(url, max_bytes, _DEFAULT_MAX_BYTES)
             if isinstance(fetched, str):
-                return fetched
-            content_type, raw, truncated = fetched
+                return _tool_result(fetched)
+            content_type, raw, truncated, final_url = fetched
             max_bytes = min(max_bytes, _DEFAULT_MAX_BYTES)
 
             mime = content_type.split(";")[0].strip().lower()
@@ -268,16 +337,25 @@ class WebServer(MiaouMCPBase):
                     html_text = raw.decode(charset, errors="replace")
                 except LookupError:
                     html_text = raw.decode("utf-8", errors="replace")
-                text = await asyncio.to_thread(
-                    _render_html_blocking, url, html_text, truncation_note
-                )
-                return types.EmbeddedResource(
-                    type="resource",
-                    resource=types.TextResourceContents(
-                        uri=url,  # type: ignore[arg-type]
-                        mimeType="text/plain",
-                        text=text,
+                head = await asyncio.to_thread(extract_head_meta, html_text)
+                # Favicon sondée PENDANT la conversion html2text, pas après :
+                # sur une grosse page, la sonde ne rallonge alors rien.
+                text, favicon = await asyncio.gather(
+                    asyncio.to_thread(
+                        _render_html_blocking, url, html_text, truncation_note
                     ),
+                    _favicon_for(final_url or url, head["icons"]),
+                )
+                return _tool_result(
+                    types.EmbeddedResource(
+                        type="resource",
+                        resource=types.TextResourceContents(
+                            uri=url,  # type: ignore[arg-type]
+                            mimeType="text/plain",
+                            text=text,
+                        ),
+                    ),
+                    build_web_meta(canonical_url=final_url, head=head, favicon=favicon),
                 )
             elif _is_textual_mime(mime):
                 try:
@@ -285,23 +363,29 @@ class WebServer(MiaouMCPBase):
                 except LookupError:
                     text = raw.decode("utf-8", errors="replace")
                 full_text = text + truncation_note
-                return types.EmbeddedResource(
-                    type="resource",
-                    resource=types.TextResourceContents(
-                        uri=url,  # type: ignore[arg-type]
-                        mimeType=mime,
-                        text=await asyncio.to_thread(_cache_and_cap, url, full_text, purge_html=True),
+                return _tool_result(
+                    types.EmbeddedResource(
+                        type="resource",
+                        resource=types.TextResourceContents(
+                            uri=url,  # type: ignore[arg-type]
+                            mimeType=mime,
+                            text=await asyncio.to_thread(_cache_and_cap, url, full_text, purge_html=True),
+                        ),
                     ),
+                    build_web_meta(canonical_url=final_url),
                 )
             else:
                 await asyncio.to_thread(web_cache.purge, url)
-                return types.EmbeddedResource(
-                    type="resource",
-                    resource=types.BlobResourceContents(
-                        uri=url,  # type: ignore[arg-type]
-                        mimeType=mime,
-                        blob=base64.b64encode(raw).decode(),
+                return _tool_result(
+                    types.EmbeddedResource(
+                        type="resource",
+                        resource=types.BlobResourceContents(
+                            uri=url,  # type: ignore[arg-type]
+                            mimeType=mime,
+                            blob=base64.b64encode(raw).decode(),
+                        ),
                     ),
+                    build_web_meta(canonical_url=final_url),
                 )
 
         fetch_url.__doc__ = f"""Télécharge une URL et renvoie son contenu : HTML converti
@@ -430,7 +514,7 @@ class WebServer(MiaouMCPBase):
             fetched = await _guarded_fetch(url, max_bytes, web_cache.RESOURCE_MAX_BYTES)
             if isinstance(fetched, str):
                 return fetched
-            content_type, raw, truncated = fetched
+            content_type, raw, truncated, _final = fetched
             max_bytes = min(max_bytes, web_cache.RESOURCE_MAX_BYTES)
 
             mime = content_type.split(";")[0].strip().lower()

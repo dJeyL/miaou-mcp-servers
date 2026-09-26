@@ -91,6 +91,9 @@ async def _brave_call(
     try:
         return await asyncio.to_thread(_fetch_brave_bytes, req)
     except urllib.error.HTTPError as e:
+        # Une HTTPError EST la réponse, socket comprise : la fermer, sinon
+        # elle reste ouverte jusqu'au GC (même correctif que mcp_web).
+        e.close()
         if e.code == 401:
             return "Erreur 401 : clé API Brave invalide ou expirée."
         if e.code == 429:

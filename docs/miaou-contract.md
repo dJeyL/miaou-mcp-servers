@@ -32,6 +32,21 @@ Les noms exposés côté proxy dépendent des clés dans `config.json` (`mcpServ
 Blocs de résultat : `text` (D9), `image`/`resource` binaire (D8.1), `resource` texte (D8.2).
 Si `isError: true`, MIAOU marque l'ack en rouge dans le thread.
 
+### `_meta` d'un résultat `tools/call` (lot AI)
+
+Un résultat peut porter, à côté de `content`, un `_meta` adressé au **client** et jamais
+servi au modèle. Premier usage : `fetch_url` de `mcp_web` pose
+`_meta["miaou/web"] = {title, site_name, canonical_url, favicon}`, tous facultatifs, pour
+que MIAOU affiche la source d'une citation (libellé, favicon) sans rien payer en contexte.
+Détail des champs et de leur validation : `docs/servers.md`, section `mcp_web`. `favicon`
+est une data-URL dont le type a été reconnu aux octets (PNG, ICO, GIF, JPEG, WebP ; jamais
+SVG), plafonnée à 16 384 caractères : le client la revalide quand même avant de la poser.
+
+Précédent neuf des deux côtés : jusque-là MIAOU ne lisait que le `_meta` de `tools/list`
+(`miaou/unauthorized_upstreams`), et aucun serveur de ce dépôt n'en posait sur un appel. Le
+proxy relaie ce `_meta` quel que soit le type d'upstream (cf. `docs/proxy.md`) ; vérifié sur
+le vrai transport streamable-http, en inprocess comme derrière un upstream http.
+
 ### `instructions` de l'`InitializeResult`
 
 Le proxy publie une consigne de portée serveur dans le champ `instructions` de

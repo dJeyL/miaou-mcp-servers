@@ -110,6 +110,7 @@ servers/mcp_web/
 ├── __init__.py    # serveur FastMCP + définition des outils (fetch_url/fetch_read/fetch_list/fetch_resource)
 ├── __main__.py    # point d'entrée `python -m mcp_web` / `uv run servers/mcp_web`
 ├── cache.py        # cache disque par checksum d'URL (texte, HTML brut, structure JSON)
+├── pagemeta.py     # `_meta` de fetch_url : en-tête de page, favicon validée, cache par origine
 └── structure.py    # extraction stdlib (html.parser) des headings/liens, sans dépendance tierce
 ```
 
@@ -122,7 +123,10 @@ Quatre outils. `fetch_url(url, max_bytes=5242880)` branch sur le `Content-Type` 
 | tout le reste | base64 | `BlobResourceContents` |
 
 Taille *téléchargée* bornée à `max_bytes` (défaut 5 Mo), troncature notée dans le texte.
-Erreurs réseau retournées comme chaînes (pas de stack trace).
+Erreurs réseau retournées comme chaînes (pas de stack trace). Une `HTTPError` est
+**fermée** avant d'être convertie (`_guarded_fetch`) : elle EST la réponse, socket
+comprise, qui restait sinon ouverte jusqu'au GC — cyclique le plus souvent, l'exception
+ayant traversé `to_thread`. Les tests la fermaient eux-mêmes, ce qui masquait le défaut.
 
 **Décompression du corps selon `Content-Encoding` (`_decompress`, WEB9).** On ne
 sollicite **aucun** encodage — urllib n'envoie pas d'`Accept-Encoding` et on n'en ajoute
@@ -172,6 +176,65 @@ problème de saturation de contexte que le cap sur `fetch_url` visait à élimin
 si l'URL n'a jamais été passée à `fetch_url`, ou si le cache a expiré. Le contenu binaire
 (image, etc.) n'est pas concerné par ce cache : déjà borné par `max_bytes`, ce n'est pas lui
 qui sature le contexte du modèle.
+
+**`_meta` du résultat de `fetch_url` : ce que le client affiche, hors modèle (lot AI).**
+`fetch_url` rend un `CallToolResult` complet — seule forme par laquelle FastMCP laisse un
+outil poser le `_meta` de son résultat — et y range, sous la clé `miaou/web`
+(`pagemeta.META_KEY`), ce qu'il faut à MIAOU pour afficher la source d'une citation :
+
+| Champ | Source | Présent |
+|---|---|---|
+| `title` | `<title>` de l'en-tête, sinon `og:title` | HTML |
+| `site_name` | `og:site_name` | HTML |
+| `canonical_url` | URL finale après les redirections suivies par urllib (`geturl()`), http(s) seulement | tout succès |
+| `favicon` | data-URL base64, type reconnu aux octets | HTML, si trouvée et sous le plafond |
+
+Tous facultatifs, clé absente plutôt que vide ; aucun `_meta` sur un résultat d'erreur.
+Rien de tout cela n'entre dans `content` : le modèle cite une URL et n'a pas besoin du
+titre, et les octets d'une favicon y seraient payés à chaque tour. Préfixe `miaou/` pour
+la même raison que `miaou/unauthorized_upstreams` côté proxy (`_meta` est un espace
+partagé). `canonical_url` n'est PAS le `<link rel="canonical">` de la page : c'est l'adresse
+réellement atteinte, ce qui répond à « où ai-je lu ça ? » sans croire la page sur parole.
+
+L'en-tête est lu par `html.parser` (stdlib) sur le HTML coupé à `</head>` ou au premier
+`<body>` (et à 256 Ko) : un `<title>` de `<svg>` dans le corps n'est jamais pris pour celui
+de la page. Textes aplatis et bornés à 300 caractères.
+
+La favicon est cherchée dans cet ordre : les `<link rel~="icon">` de la page (résolus
+contre l'URL **finale** ; `apple-touch-icon` écarté, 180 px et presque toujours hors
+plafond ; SVG écarté par type ou extension ; `data:` base64 accepté sans requête), puis
+`/favicon.ico` de l'hôte final — trois tentatives au plus, timeout de 3 s chacune. Son
+type est décidé **aux octets** (PNG, ICO, GIF, JPEG, WebP) et jamais au `Content-Type` : un
+serveur sert volontiers une page d'erreur HTML en 200 sur `/favicon.ico`. SVG refusé en
+toute circonstance (il porte du script). Plafond : data-URL de 16 384 caractères
+(`FAVICON_MAX_CHARS`) ; au-delà, absente. Le téléchargement, lui, est borné plus large
+(`FAVICON_DOWNLOAD_MAX`, 64 Ko) : un ICO multi-résolution dépasse souvent le plafond
+AVANT réduction.
+
+**Réduction d'un ICO (`shrink_ico`).** Un ICO porte souvent plusieurs images (16, 32,
+48 px…) : on n'en garde qu'une, la plus petite d'au moins `FAVICON_TARGET_PX` (32 px, soit
+16 px CSS en densité 2 — Retina, 4K à 200 %), à côté égal la plus profonde ; faute d'image
+assez grande, la plus grande en dessous ; et si la retenue ne tient pas au plafond, la
+suivante dans cet ordre. Une image PNG embarquée sort en `image/png` telle quelle ; une
+image BMP est ré-emballée dans un ICO d'une seule entrée, octets de l'image inchangés
+(seul l'offset du répertoire change). Répertoire incohérent (entrée hors du fichier, zéro
+entrée) : favicon absente. Un PNG seul n'est jamais redimensionné (il faudrait une
+bibliothèque d'image) : il passe s'il tient au plafond.
+
+Mesuré le 2026-09-26 sur le vrai transport : docs.python.org (lien SVG écarté, puis
+`favicon.ico` de 15 Ko à trois images) → ICO 32 px, 5 741 caractères ; Wikipédia → ICO
+32 px, 1 049 ; GitHub, Le Monde, BBC → PNG 32 px, sous 1 300 ; Hacker News → PNG 256 px
+non réduit, 10 030. Toute erreur rend une favicon absente, jamais un `fetch_url` en échec.
+
+La sonde tourne **pendant** la conversion html2text (`asyncio.gather`), et son résultat est
+gardé en mémoire **par origine** (`favicon_cache`, 256 origines, durée de vie
+`MIAOU_WEB_CACHE_TTL_H`), échec compris : lire dix pages d'un site ne sonde qu'une fois, et
+un site sans favicon valide ne coûte pas trois requêtes à chaque page.
+
+Effet de bord du retour `CallToolResult` : `fetch_url` ne publie plus d'`outputSchema`, et
+son résultat plus de `structuredContent` — lequel recopiait le contenu entier sur le fil,
+sans lecteur (le proxy ne publie pas l'`outputSchema` de ses upstreams, MIAOU ne lit que
+`content`). Un texte d'erreur reste un résultat ordinaire (`isError` faux), comme avant.
 
 `fetch_list(url, entry_start=0, entry_end=None)` extrait la structure de navigation (headings
 h1-h6 et liens `<a href>`, dans l'ordre d'apparition, un lien sans texte ou un heading vide

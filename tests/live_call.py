@@ -128,6 +128,11 @@ async def run(
             if getattr(result, "structuredContent", None):
                 print("--- structuredContent ---")
                 print(json.dumps(result.structuredContent, indent=2, ensure_ascii=False))
+            if result.meta:
+                # Surface adressée au client, jamais au modèle (ex. `miaou/web`
+                # de fetch_url) : c'est ici qu'on vérifie qu'elle traverse le fil.
+                print("--- _meta ---")
+                print(json.dumps(result.meta, indent=2, ensure_ascii=False))
             return 1 if result.isError else 0
 
 

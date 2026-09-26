@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from mcp import types
 
 _ROOT = Path(__file__).parent.parent
 _SERVERS = _ROOT / "servers"
@@ -1774,10 +1775,9 @@ async def test_a_normal_call_is_unaffected():
 
     class _OkSession:
         async def call_tool(self, name, arguments):
-            class _Result:
-                content = ["ok"]
-
-            return _Result()
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="ok")]
+            )
 
     upstream = mcp_proxy.HttpUpstream("https://jira.test/mcp")
     upstream._session = _OkSession()
@@ -1785,7 +1785,8 @@ async def test_a_normal_call_is_unaffected():
     upstream._serving = True
 
     with anyio.move_on_after(5) as scope:
-        assert await upstream.call_tool("search", {}) == ["ok"]
+        result = await upstream.call_tool("search", {})
+        assert [b.text for b in result.content] == ["ok"]
     assert not scope.cancelled_caught
 
 

@@ -97,6 +97,17 @@ mcp_proxy/ (paquet, à la racine du projet)
                    ET AS de développement dans ce process, sur DEUX ports
 ```
 
+**Ce que `call_tool` relaie.** Un upstream stdio ou http rend son `CallToolResult` à travers
+`relay_call_result` (upstream.py) : `content`, `isError` et `_meta` passent, pas
+`structuredContent` — par cohérence avec `tools/list`, qui ne publie pas l'`outputSchema` des
+upstreams. Jusqu'au lot AI, seul `content` passait : le SDK ré-enveloppait la liste en
+`isError=False`, si bien qu'un échec signalé par l'upstream arrivait au client comme un
+succès, et le `_meta` d'un résultat (`miaou/web` de `mcp_web`) disparaissait. Un upstream
+inprocess dont l'outil rend lui-même un `CallToolResult` le voit traverser tel quel
+(`convert_result` le rend sans le toucher, et le SDK ne valide pas un `CallToolResult` rendu
+par le handler) ; les autres outils inprocess sont inchangés. Les wrappers REF_UNKNOWN et
+AUTHORIZATION_REQUIRED lisent le résultat sans le reconstruire : le `_meta` leur survit.
+
 `build_app()` ne retourne pas directement le `Starlette` mais une fonction ASGI qui l'enveloppe :
 `Mount("/mcp", ...)` redirige `/mcp` → `/mcp/` en 307 par défaut (strict-slash Starlette), et
 certains clients MCP ne suivent pas les redirections sur POST/DELETE. Le wrapper réécrit

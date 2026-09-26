@@ -131,6 +131,9 @@ class DDGServer(MiaouMCPBase):
             try:
                 html = await asyncio.to_thread(_fetch_ddg_html, req)
             except urllib.error.HTTPError as e:
+                # Une HTTPError EST la réponse, socket comprise : la fermer, sinon
+                # elle reste ouverte jusqu'au GC (même correctif que mcp_web).
+                e.close()
                 return f"Erreur HTTP {e.code} ({e.reason}) — DuckDuckGo"
             except urllib.error.URLError as e:
                 return f"Erreur réseau ({e.reason}) — DuckDuckGo"

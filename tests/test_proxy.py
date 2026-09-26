@@ -933,12 +933,87 @@ async def test_http_upstream_delegates_to_session():
     session = MagicMock()
     tool = types.Tool(name="echo", description="d", inputSchema={})
     session.list_tools = AsyncMock(return_value=MagicMock(tools=[tool]))
-    session.call_tool = AsyncMock(return_value=MagicMock(content=["block"]))
+    block = types.TextContent(type="text", text="hi")
+    session.call_tool = AsyncMock(return_value=types.CallToolResult(content=[block]))
     up._session = session
 
     assert await up.list_tools() == [tool]
-    assert await up.call_tool("echo", {"text": "hi"}) == ["block"]
+    relayed = await up.call_tool("echo", {"text": "hi"})
+    assert relayed.content == [block]
+    assert relayed.isError is False
     session.call_tool.assert_awaited_once_with("echo", {"text": "hi"})
+
+
+async def test_http_upstream_relays_is_error_and_meta():
+    """`isError` et `_meta` de l'upstream traversent le proxy (lot AI).
+
+    Avant, seul `content` passait : le SDK ré-enveloppait la liste en
+    isError=False (un échec d'upstream arrivait comme un succès) et le `_meta`
+    d'un résultat disparaissait. structuredContent reste filtré, comme
+    l'outputSchema dans tools/list."""
+    up = mcp_proxy.HttpUpstream("https://example.test/mcp")
+    session = MagicMock()
+    block = types.TextContent(type="text", text="boom")
+    upstream_result = types.CallToolResult(
+        content=[block],
+        isError=True,
+        structuredContent={"result": "boom"},
+        **{"_meta": {"miaou/web": {"title": "T"}}},
+    )
+    session.call_tool = AsyncMock(return_value=upstream_result)
+    up._session = session
+
+    relayed = await up.call_tool("echo", {})
+    assert relayed.isError is True
+    assert relayed.meta == {"miaou/web": {"title": "T"}}
+    assert relayed.structuredContent is None
+    wire = relayed.model_dump_json(by_alias=True, exclude_none=True)
+    assert '"_meta":{"miaou/web":{"title":"T"}}' in wire
+
+
+async def test_stdio_upstream_relays_meta():
+    """Même relais sur StdioUpstream, qui a son propre call_tool."""
+    up = StdioUpstream(command="does-not-matter", args=[])
+    session = MagicMock()
+    session.call_tool = AsyncMock(
+        return_value=types.CallToolResult(
+            content=[types.TextContent(type="text", text="x")],
+            **{"_meta": {"k": 1}},
+        )
+    )
+    up._session = session
+    relayed = await up.call_tool("t", {})
+    assert relayed.meta == {"k": 1}
+    assert relayed.isError is False
+
+
+async def test_proxy_passes_call_tool_result_through_with_meta():
+    """Bout en bout dans le handler du proxy : le `_meta` rendu par un
+    upstream arrive dans le ServerResult émis, sur la CHAÎNE JSON (un test sur
+    l'objet passerait aussi sur une clé mal sérialisée)."""
+    mock_upstream = MagicMock()
+    mock_upstream.list_tools = AsyncMock(
+        return_value=[types.Tool(name="fetch_url", description="", inputSchema={})]
+    )
+    mock_upstream.call_tool = AsyncMock(
+        return_value=types.CallToolResult(
+            content=[types.TextContent(type="text", text="page")],
+            **{"_meta": {"miaou/web": {"site_name": "S"}}},
+        )
+    )
+    server = build_proxy_server({"web": mock_upstream}, {})
+    await server.request_handlers[types.ListToolsRequest](
+        types.ListToolsRequest(method="tools/list", params=None)
+    )
+    result = await server.request_handlers[types.CallToolRequest](
+        types.CallToolRequest(
+            method="tools/call",
+            params=types.CallToolRequestParams(name="web__fetch_url", arguments={}),
+        )
+    )
+    wire = result.model_dump_json(by_alias=True, exclude_none=True)
+    assert '"_meta":{"miaou/web":{"site_name":"S"}}' in wire
+    assert result.root.isError is False
 
 
 def test_mcp_sdk_http_client_still_trusts_env():

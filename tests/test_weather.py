@@ -101,7 +101,7 @@ async def test_get_weather_http_error_returns_clear_string():
     with patch("urllib.request.OpenerDirector.open", side_effect=err):
         tm = weather_server.mcp._tool_manager
         result = await tm.call_tool("get_weather", {"city": "Paris"})
-    err.close()   # sinon ResourceWarning au GC
+    assert err.fp.closed   # fermée par le serveur, pas par le test
     assert isinstance(result, str)
     assert "503" in result
 

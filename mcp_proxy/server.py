@@ -494,7 +494,10 @@ def build_proxy_server(
     @server.call_tool()
     async def handle_call_tool(
         name: str, arguments: dict[str, Any] | None
-    ) -> list[Any]:
+    ) -> list[Any] | types.CallToolResult:
+        # Un upstream peut rendre un CallToolResult complet (stdio/http, ou un
+        # outil inprocess qui pose son `_meta`) : le SDK le laisse traverser
+        # tel quel, `isError` et `_meta` compris (cf. relay_call_result).
         # Nom NU : traité AVANT la résolution par préfixe, qui partirait sinon
         # chercher un upstream appelé « status ».
         if name == STATUS_TOOL_NAME and authorizers:

@@ -107,7 +107,7 @@ async def test_ddg_search_http_error_returns_string():
     err = urllib.error.HTTPError("https://html.duckduckgo.com/html/", 503, "Service Unavailable", {}, None)
     with patch("urllib.request.OpenerDirector.open", side_effect=err):
         result = await _TM.call_tool("ddg_search", {"query": "python"})
-    err.close()   # sinon ResourceWarning au GC
+    assert err.fp.closed   # fermée par le serveur, pas par le test
     assert isinstance(result, str)
     assert "503" in result
 

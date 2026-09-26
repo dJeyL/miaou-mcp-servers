@@ -38,7 +38,7 @@ miaou-mcp-servers/
 │   ├── mcp_base.py       # classe de base partagée (MiaouMCPBase + make_opener)
 │   ├── mcp_bench.py      # banc d'essai général (port 8766)
 │   ├── mcp_weather.py    # météo réelle via wttr.in (port 8767)
-│   ├── mcp_web/          # téléchargement d'URL (port 8768), package
+│   ├── mcp_web/          # téléchargement d'URL (port 8768), package — `_meta` client sur fetch_url
 │   ├── mcp_ddg.py        # recherche DuckDuckGo HTML (port 8769)
 │   ├── mcp_brave.py      # recherche Brave Search API (port 8770)
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — OBSOLÈTE, désactivé par défaut
@@ -51,6 +51,7 @@ miaou-mcp-servers/
 │   ├── test_weather.py
 │   ├── test_web.py
 │   ├── test_web_structure.py
+│   ├── test_web_pagemeta.py  # `_meta` de fetch_url : titre, site, URL finale, favicon (lot AI)
 │   ├── test_ddg.py
 │   ├── test_brave.py
 │   ├── test_docs.py
@@ -174,6 +175,11 @@ synchrone dédiée (ex. `_fetch_bytes`, `_fetch_ddg_html`, `_fetch_brave_bytes`)
 l'appeler via `await asyncio.to_thread(...)` est le pattern à suivre pour tout
 nouvel outil qui ferait de l'I/O.
 
+Une `urllib.error.HTTPError` attrapée pour être convertie en message **se ferme**
+(`e.close()`) : elle est aussi la réponse, socket comprise, qui resterait sinon ouverte
+jusqu'au GC. Les tests vérifient `err.fp.closed` après l'appel plutôt que de la fermer
+eux-mêmes — c'est ce geste, dans chaque test, qui a masqué la fuite dans tous les serveurs.
+
 ## Tests
 
 ```bash
@@ -289,7 +295,10 @@ lots — piège déjà payé côté MIAOU.
   checksum d'URL, caps
   `READ_CAP`/`LIST_CAP`, `fetch_resource` et le canal bytes→client, décompression
   `Content-Encoding` non sollicitée — `_decompress`, WEB9 — et la troncature décidée
-  sur les octets reçus qu'elle impose), `mcp_ddg`,
+  sur les octets reçus qu'elle impose ; `_meta["miaou/web"]` de `fetch_url` — titre,
+  `site_name`, URL finale, favicon reconnue aux octets et plafonnée, ICO réduit à
+  une image de 32 px (`shrink_ico`), cache par origine —, la `HTTPError` fermée
+  par `_guarded_fetch`, et le retour `CallToolResult` qui l'impose), `mcp_ddg`,
   `mcp_brave` (`resolve_api_key`, refus d'init sans clef), `mcp_docs` (obsolète mais
   conservé pour le hors-connexion : sessions, pagination, `search`, `extract` hors
   `READ_CAP`, sécurité archives, locales des headings docx).
@@ -297,7 +306,9 @@ lots — piège déjà payé côté MIAOU.
   (inprocess/stdio/http), `build_upstreams`/`build_proxy_server`/`build_app` et le
   wrapper ASGI qui évite le 307 sur `/mcp`, l'override `--proxy`/`--noproxy` et ses
   trois chemins d'application, le format de `config.json`, le pattern
-  `build(config)` pour plusieurs instances d'un même module, et
+  `build(config)` pour plusieurs instances d'un même module, ce que `call_tool`
+  relaie d'un upstream stdio/http (`relay_call_result` : `content`, `isError`,
+  `_meta`, pas `structuredContent`), et
   `aggregate_instructions` (consigne de portée serveur : les trois captures par type
   d'upstream, la section titrée par le préfixe d'outil, l'écriture différée après
   `start()`, le préambule non préfixé que le client re-préfixant doit réécrire).
@@ -330,7 +341,8 @@ lots — piège déjà payé côté MIAOU.
   (`initialize` → `tools/list` → `tools/call`) et les trois familles de blocs de
   résultat, le champ `instructions` de l'`InitializeResult` que MIAOU lit et
   injecte dans le system prompt (et le préambule qu'il re-préfixe, étant seul à
-  connaître son slug), et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
+  connaître son slug), le `_meta` d'un résultat `tools/call` adressé au client
+  (`miaou/web`, premier usage), et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
   `ref`+`content_b64`, `session_id`, idempotence de la matérialisation, REF_UNKNOWN
   et son rejeu qui ne marche que derrière le proxy, formats de `ref` acceptés).
 - **`docs/tls.md`** — `enable_system_trust_store()` : pourquoi une AC d'entreprise
@@ -341,9 +353,11 @@ lots — piège déjà payé côté MIAOU.
 - **`docs/tests.md`** — ce que chaque suite mocke (aucun appel réseau réel, aucune
   clef requise), l'isolation filesystem par `tmp_path`, les deux pièges de fixture
   du mock de réponse de `test_web.py` (queue de remplissage compressible, garde
-  verte des deux côtés), et les deux bancs manuels
+  verte des deux côtés), l'opener qui route par URL de `test_web_pagemeta.py`
+  (favicon, sonde unique par origine) et le cache de favicons vidé en fixture,
+  et les deux bancs manuels
   non collectés : `tests/live_call.py`, qui parle le vrai transport
-  streamable-http comme MIAOU (`-H/--header`, truststore), et
+  streamable-http comme MIAOU (`-H/--header`, truststore, affiche le `_meta`), et
   `tests/live_auth_probe.py`, qui mesure ce qu'un upstream répond SANS jeton
   (séquence complète avec `Mcp-Session-Id`, `--tool`/`--args`, et le filtre
   `_looks_mutating` qui interdit d'appeler un outil d'écriture pour sonder).

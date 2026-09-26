@@ -36,7 +36,32 @@ class Upstream(ABC):
     async def list_tools(self) -> list[types.Tool]: ...
 
     @abstractmethod
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> list[Any]: ...
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> list[Any] | types.CallToolResult: ...
+
+
+def relay_call_result(call_result: types.CallToolResult) -> types.CallToolResult:
+    """Résultat d'un upstream stdio/http tel que le proxy le rend à son client.
+
+    Relaie `content`, `isError` et `_meta`. Jusqu'au lot AI, seul `content`
+    passait : le SDK ré-enveloppait la liste en `isError=False`, si bien qu'un
+    échec signalé par l'upstream arrivait au client comme un succès, et que le
+    `_meta` d'un résultat (`miaou/web` de mcp_web) disparaissait.
+
+    `structuredContent` n'est PAS relayé, par cohérence avec `tools/list` : le
+    proxy ne publie pas l'`outputSchema` des upstreams. Un CallToolResult rendu
+    par le handler traverse le SDK sans validation de sortie.
+
+    `**{"_meta": ...}` : pydantic ne sérialise sous l'alias que si le champ a
+    été peuplé par l'alias (même remarque que pour `tools/list`)."""
+    fields: dict[str, Any] = {
+        "content": list(call_result.content),
+        "isError": bool(call_result.isError),
+    }
+    if call_result.meta:
+        fields["_meta"] = dict(call_result.meta)
+    return types.CallToolResult(**fields)
 
 
 class InProcessUpstream(Upstream):
@@ -117,7 +142,12 @@ class InProcessUpstream(Upstream):
             for t in tools
         ]
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> list[Any]:
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> list[Any] | types.CallToolResult:
+        # Un outil qui rend lui-même un CallToolResult (fetch_url de mcp_web,
+        # pour poser son `_meta`) le voit rendu tel quel par convert_result, et
+        # le SDK du proxy le laisse traverser : rien à relayer à la main ici.
         return await self._tool_manager.call_tool(name, arguments, convert_result=True)
 
 
@@ -177,9 +207,9 @@ class StdioUpstream(Upstream):
         result = await self._session.list_tools()
         return result.tools
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> list[Any]:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
         result = await self._session.call_tool(name, arguments)
-        return result.content
+        return relay_call_result(result)
 
 
 # Borne du handshake d'un upstream HTTP. Constante distincte de celle des
@@ -357,7 +387,7 @@ class HttpUpstream(Upstream):
         result = await self._session.list_tools()
         return result.tools
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> list[Any]:
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
         """Appelle l'outil, en surveillant la MORT DE LA TÂCHE DE SERVICE.
 
         La session vit dans `_serve()`, une autre tâche (patron des cancel
@@ -386,13 +416,13 @@ class HttpUpstream(Upstream):
                 f"Le serveur MCP distant '{self._url}' n'a pas de session ouverte."
             )
 
-        result: list[Any] = []
+        result: types.CallToolResult | None = None
         done = False
 
         async def _call() -> None:
             nonlocal result, done
             call_result = await session.call_tool(name, arguments)
-            result = call_result.content
+            result = relay_call_result(call_result)
             done = True
             task_group.cancel_scope.cancel()
 
