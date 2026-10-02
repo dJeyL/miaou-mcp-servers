@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "truststore"]
+# dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "truststore"]
 # ///
 """
 Serveur MCP de banc d'essai pour MIAOU (V2 — délégation distante).
@@ -38,7 +38,7 @@ import socket
 from typing import Annotated
 
 from mcp import types
-from mcp.server.fastmcp import Image
+from mcp.server.mcpserver import Image
 from pydantic import Field
 
 from mcp_base import MiaouMCPBase
@@ -157,7 +157,7 @@ class BenchServer(MiaouMCPBase):
         async def get_json_resource() -> types.EmbeddedResource:
             """Renvoie une resource texte JSON embarquée (cascade D8.2, surlignage UI).
 
-            On renvoie un vrai EmbeddedResource (pas un dict, que FastMCP sérialiserait en
+            On renvoie un vrai EmbeddedResource (pas un dict, que le SDK sérialiserait en
             bloc `text` réinjecté au modèle) pour exercer le chemin non-text de MIAOU."""
             await asyncio.sleep(2)
             return types.EmbeddedResource(

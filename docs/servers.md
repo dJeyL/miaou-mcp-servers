@@ -107,7 +107,7 @@ distinctes — serveur, cache disque, extraction de structure) :
 
 ```
 servers/mcp_web/
-├── __init__.py    # serveur FastMCP + définition des outils (fetch_url/fetch_read/fetch_list/fetch_resource)
+├── __init__.py    # serveur MCP (MCPServer) + définition des outils (fetch_url/fetch_read/fetch_list/fetch_resource)
 ├── __main__.py    # point d'entrée `python -m mcp_web` / `uv run servers/mcp_web`
 ├── cache.py        # cache disque par checksum d'URL (texte, HTML brut, structure JSON)
 ├── pagemeta.py     # `_meta` de fetch_url : en-tête de page, favicon validée, cache par origine
@@ -178,7 +178,7 @@ si l'URL n'a jamais été passée à `fetch_url`, ou si le cache a expiré. Le c
 qui sature le contexte du modèle.
 
 **`_meta` du résultat de `fetch_url` : ce que le client affiche, hors modèle (lot AI).**
-`fetch_url` rend un `CallToolResult` complet — seule forme par laquelle FastMCP laisse un
+`fetch_url` rend un `CallToolResult` complet — seule forme par laquelle MCPServer laisse un
 outil poser le `_meta` de son résultat — et y range, sous la clé `miaou/web`
 (`pagemeta.META_KEY`), ce qu'il faut à MIAOU pour afficher la source d'une citation :
 
@@ -343,7 +343,7 @@ Organisé en package plutôt qu'en fichier plat (module trop volumineux sinon), 
 
 ```
 servers/mcp_docs/
-├── __init__.py    # serveur FastMCP + définition des outils (docs__*)
+├── __init__.py    # serveur MCP (MCPServer) + définition des outils (docs__*)
 ├── __main__.py     # point d'entrée `python -m mcp_docs` / `uv run servers/mcp_docs`
 ├── session.py      # sessions, sanitization, matérialisation, contrat REF_UNKNOWN
 ├── formats.py      # détection de type + parsers pdf/docx/xlsx/pptx/zip

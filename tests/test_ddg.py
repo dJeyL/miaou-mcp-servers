@@ -39,16 +39,16 @@ def _make_mock_resp(body: bytes):
 async def test_ddg_search_returns_embedded_resource():
     mock_resp = _make_mock_resp(_DDG_HTML)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("ddg_search", {"query": "python"})
+        result = await _TM.call_tool("ddg_search", {"query": "python"}, None)
     assert isinstance(result, types.EmbeddedResource)
-    assert result.resource.mimeType == "application/json"
+    assert result.resource.mime_type == "application/json"
 
 
 @pytest.mark.asyncio
 async def test_ddg_search_extracts_fields():
     mock_resp = _make_mock_resp(_DDG_HTML)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("ddg_search", {"query": "python"})
+        result = await _TM.call_tool("ddg_search", {"query": "python"}, None)
     items = json.loads(result.resource.text)
     assert len(items) > 0
     first = items[0]
@@ -61,7 +61,7 @@ async def test_ddg_search_extracts_fields():
 async def test_ddg_search_max_results():
     mock_resp = _make_mock_resp(_DDG_HTML)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("ddg_search", {"query": "python", "max_results": 2})
+        result = await _TM.call_tool("ddg_search", {"query": "python", "max_results": 2}, None)
     items = json.loads(result.resource.text)
     assert len(items) <= 2
 
@@ -71,7 +71,7 @@ async def test_ddg_search_max_results_clamped_to_30():
     """B9 : max_results ne doit pas dépasser 30, ni être négatif/nul."""
     mock_resp = _make_mock_resp(_DDG_HTML)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("ddg_search", {"query": "python", "max_results": 500})
+        result = await _TM.call_tool("ddg_search", {"query": "python", "max_results": 500}, None)
     items = json.loads(result.resource.text)
     assert len(items) <= 30
 
@@ -80,7 +80,7 @@ async def test_ddg_search_max_results_clamped_to_30():
 async def test_ddg_search_max_results_clamped_to_1():
     mock_resp = _make_mock_resp(_DDG_HTML)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("ddg_search", {"query": "python", "max_results": -5})
+        result = await _TM.call_tool("ddg_search", {"query": "python", "max_results": -5}, None)
     items = json.loads(result.resource.text)
     assert len(items) <= 1
 
@@ -89,7 +89,7 @@ async def test_ddg_search_max_results_clamped_to_1():
 async def test_ddg_search_uri_contains_query():
     mock_resp = _make_mock_resp(_DDG_HTML)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("ddg_search", {"query": "asyncio"})
+        result = await _TM.call_tool("ddg_search", {"query": "asyncio"}, None)
     assert "asyncio" in str(result.resource.uri)
 
 
@@ -97,7 +97,7 @@ async def test_ddg_search_uri_contains_query():
 async def test_ddg_search_empty_results():
     mock_resp = _make_mock_resp(b"<html><body><p>No results</p></body></html>")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("ddg_search", {"query": "xyzzy"})
+        result = await _TM.call_tool("ddg_search", {"query": "xyzzy"}, None)
     assert isinstance(result, types.EmbeddedResource)
     assert json.loads(result.resource.text) == []
 
@@ -106,7 +106,7 @@ async def test_ddg_search_empty_results():
 async def test_ddg_search_http_error_returns_string():
     err = urllib.error.HTTPError("https://html.duckduckgo.com/html/", 503, "Service Unavailable", {}, None)
     with patch("urllib.request.OpenerDirector.open", side_effect=err):
-        result = await _TM.call_tool("ddg_search", {"query": "python"})
+        result = await _TM.call_tool("ddg_search", {"query": "python"}, None)
     assert err.fp.closed   # fermée par le serveur, pas par le test
     assert isinstance(result, str)
     assert "503" in result
@@ -116,7 +116,7 @@ async def test_ddg_search_http_error_returns_string():
 async def test_ddg_search_url_error_returns_string():
     err = urllib.error.URLError("Network unreachable")
     with patch("urllib.request.OpenerDirector.open", side_effect=err):
-        result = await _TM.call_tool("ddg_search", {"query": "python"})
+        result = await _TM.call_tool("ddg_search", {"query": "python"}, None)
     assert isinstance(result, str)
     assert "réseau" in result.lower() or "Network unreachable" in result
 

@@ -26,6 +26,7 @@ for p in (_ROOT, _SERVERS):
         sys.path.insert(0, str(p))
 
 import mcp_proxy
+from tests.proxy_client import call_tool, list_tools
 from mcp_proxy import (
     UpstreamTokenStorage,
     build_client_info_override,
@@ -335,21 +336,21 @@ def _patch_authorize_transport(monkeypatch, handler):
     portant le provider en `auth` (c'est ce qui fait dérouler au SDK son chemin
     nominal). Les tests remplacent donc le transport, jamais `start()`.
     """
-    import httpx
+    import httpx2
 
-    original = httpx.AsyncClient.__init__
+    original = httpx2.AsyncClient.__init__
 
     def _init(self, *args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(handler)
+        kwargs["transport"] = httpx2.MockTransport(handler)
         original(self, *args, **kwargs)
 
-    monkeypatch.setattr(httpx.AsyncClient, "__init__", _init)
+    monkeypatch.setattr(httpx2.AsyncClient, "__init__", _init)
 
 
 def _unauthorized(request):
-    import httpx
+    import httpx2
 
-    return httpx.Response(401)
+    return httpx2.Response(401)
 
 
 def _authorizer(tmp_path, name="remote", interactive=True, **kw):
@@ -444,9 +445,10 @@ async def test_callback_resolves_the_pending_wait(tmp_path):
             authorizer.pending.resolve("code-1", "s1")
 
         tg.start_soon(_resolve)
-        code, state = await authorizer._on_callback()
+        result = await authorizer._on_callback()
 
-    assert (code, state) == ("code-1", "s1")
+    # La forme qu'attend le SDK 2.x : un AuthorizationCodeResult, plus un tuple.
+    assert (result.code, result.state, result.iss) == ("code-1", "s1", None)
     # Le rendez-vous est consommé : un second callback ne doit pas rejouer.
     assert authorizer.pending is None
 
@@ -499,12 +501,12 @@ def test_callback_page_is_rendered_on_refusal_too():
 def _callback_client(authorizers):
     """Même patron que test_proxy_auth.py : ASGITransport, pas TestClient
     (déprécié côté Starlette avec httpx 0.x)."""
-    import httpx
+    import httpx2
     from starlette.applications import Starlette
 
     app = Starlette(routes=[mcp_proxy.build_callback_route(authorizers)])
-    return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    return httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url="http://testserver"
     )
 
 
@@ -520,6 +522,26 @@ async def test_callback_route_routes_by_exact_state(tmp_path):
     assert resp.status_code == 200
     assert b.pending._code == "c-1"
     assert a.pending._code is None
+
+
+async def test_callback_route_relays_the_iss_parameter(tmp_path):
+    """RFC 9207 : le SDK 2.x compare l'`iss` de la redirection à l'issuer de
+    l'AS. Ne pas le relayer ferait échouer le parcours contre un AS qui annonce
+    le paramètre, et sauterait le contrôle en silence contre les autres."""
+    import anyio
+
+    a = _authorizer(tmp_path)
+    await a._on_redirect("https://as.test/authorize?state=s1")
+
+    async with _callback_client({"remote": a}) as client:
+        resp = await client.get(
+            "/callback",
+            params={"code": "c-1", "state": "s1", "iss": "https://as.test/realms/r"},
+        )
+    assert resp.status_code == 200
+    with anyio.fail_after(1):
+        result = await a._on_callback()
+    assert result.iss == "https://as.test/realms/r"
 
 
 async def test_callback_route_reports_error_status(tmp_path):
@@ -559,7 +581,7 @@ def test_authorizers_built_only_for_http_upstreams_with_auth(tmp_path):
 
 def test_auth_wires_the_provider_into_the_transport(tmp_path):
     """Le seul endroit où l'auth entre dans le transport : le paramètre
-    httpx.Auth de HttpUpstream. Sans ce câblage, tout le reste tourne à vide."""
+    httpx2.Auth de HttpUpstream. Sans ce câblage, tout le reste tourne à vide."""
     cfg = {
         "port": 8799,
         "mcpServers": {"guarded": {"type": "http", "url": "http://y/mcp", "auth": {}}},
@@ -673,10 +695,10 @@ async def test_authorize_lifts_the_flag_only_for_the_attempt(tmp_path, monkeypat
     seen = []
 
     def _handler(request):
-        import httpx
+        import httpx2
 
         seen.append(authorizer.interactive)
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
+        return httpx2.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
 
     _patch_authorize_transport(monkeypatch, _handler)
     await authorizer.authorize(_NoopUpstream())
@@ -702,11 +724,11 @@ async def test_the_probe_replays_the_session_and_ends_on_a_tool_call(tmp_path, m
     seen = []
 
     def _handler(request):
-        import httpx
+        import httpx2
 
         body = json.loads(request.content.decode())
         seen.append((body.get("method"), request.headers.get("mcp-session-id")))
-        return httpx.Response(
+        return httpx2.Response(
             200,
             headers={"Mcp-Session-Id": "sess-42"},
             json={"jsonrpc": "2.0", "id": 1, "result": {}},
@@ -725,12 +747,12 @@ async def test_the_probe_replays_the_session_and_ends_on_a_tool_call(tmp_path, m
 
 def _tools_list_response(names):
     """Réponse `tools/list` au format SSE de ce transport."""
-    import httpx
+    import httpx2
 
     tools = ", ".join(
         f'{{"name":"{n}","description":"","inputSchema":{{}}}}' for n in names
     )
-    return httpx.Response(
+    return httpx2.Response(
         200,
         text=f'event: message\ndata: {{"jsonrpc":"2.0","id":2,'
              f'"result":{{"tools":[{tools}]}}}}\n\n',
@@ -740,7 +762,7 @@ def _tools_list_response(names):
 def _probe_handler(names, called, session="S1"):
     """Serveur qui liste `names` et note l'outil appelé."""
     def _handler(request):
-        import httpx
+        import httpx2
 
         body = json.loads(request.content.decode())
         method = body.get("method")
@@ -748,8 +770,8 @@ def _probe_handler(names, called, session="S1"):
             return _tools_list_response(names)
         if method == "tools/call":
             called.append(body["params"]["name"])
-            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 3, "result": {}})
-        return httpx.Response(
+            return httpx2.Response(200, json={"jsonrpc": "2.0", "id": 3, "result": {}})
+        return httpx2.Response(
             200, headers={"Mcp-Session-Id": session},
             json={"jsonrpc": "2.0", "id": 1, "result": {}},
         )
@@ -926,13 +948,12 @@ def test_the_meta_key_is_namespaced():
 
 
 async def _list_tools_result(server):
-    """Passe par le vrai handler de requête du SDK, pas par la fonction
-    décorée : c'est lui qui enveloppe un retour de style ancien, et donc lui
-    qui décide si un `_meta` survit."""
+    """Passe par un vrai client, sur le chemin JSON-RPC : le résultat a été
+    sérialisé puis relu, donc un `_meta` mal aliasé n'y survivrait pas (la 2.x
+    jette à la relecture les champs inconnus)."""
     import mcp.types as types
 
-    req = types.ListToolsRequest(method="tools/list")
-    return (await server.request_handlers[types.ListToolsRequest](req)).root
+    return await list_tools(server)
 
 
 async def test_unauthorized_upstreams_reach_the_wire_under_the_meta_key(tmp_path):
@@ -1083,13 +1104,11 @@ async def test_unauthorized_upstream_still_lists_its_tools(tmp_path):
     server = mcp_proxy.build_proxy_server(
         upstreams, {}, authorizers={"remote": _FakeAuthorizer()}, catalog=cat
     )
-    result = await server.request_handlers[types.ListToolsRequest](
-        types.ListToolsRequest(method="tools/list")
-    )
-    names = [t.name for t in result.root.tools]
+    result = await list_tools(server)
+    names = [t.name for t in result.tools]
     assert "remote__echo" in names
 
-    described = next(t for t in result.root.tools if t.name == "remote__echo")
+    described = next(t for t in result.tools if t.name == "remote__echo")
     assert "non autorisé" in described.description
 
 
@@ -1097,18 +1116,14 @@ async def test_calling_an_unauthorized_tool_raises_the_contract(tmp_path):
     """LE contrat consommé par MIAOU (AB-3) : une vraie erreur JSON-RPC dont
     `data.code` est testable par ÉGALITÉ de constante."""
     import mcp.types as types
-    from mcp.shared.exceptions import McpError
+    from mcp.shared.exceptions import MCPError
 
     upstreams = {"remote": _unauthorized_upstream()}
     server = mcp_proxy.build_proxy_server(
         upstreams, {}, authorizers={"remote": _FakeAuthorizer()}, catalog=None
     )
-    req = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(name="remote__echo", arguments={}),
-    )
-    with pytest.raises(McpError) as excinfo:
-        await server.request_handlers[types.CallToolRequest](req)
+    with pytest.raises(MCPError) as excinfo:
+        await call_tool(server, "remote__echo", {})
 
     data = excinfo.value.error.data
     assert data["code"] == mcp_proxy.AUTHORIZATION_REQUIRED
@@ -1118,24 +1133,21 @@ async def test_calling_an_unauthorized_tool_raises_the_contract(tmp_path):
     assert data["authorization_url"] == "/authorize/remote"
 
 
-async def test_refusal_message_does_not_leak_the_internal_sentinel(tmp_path):
-    """Le sentinel est une plomberie interne : il traverse le `except Exception`
-    du SDK, il n'a rien à faire dans un message rendu au client."""
+async def test_refusal_message_is_addressed_to_the_reader(tmp_path):
+    """Le message est lu par un modèle : il nomme le serveur et qui peut agir,
+    sans rien de la plomberie du proxy en tête (le sentinel qu'il portait avant
+    la 2.x, entre autres)."""
     import mcp.types as types
-    from mcp.shared.exceptions import McpError
+    from mcp.shared.exceptions import MCPError
 
     upstreams = {"remote": _unauthorized_upstream()}
     server = mcp_proxy.build_proxy_server(
         upstreams, {}, authorizers={"remote": _FakeAuthorizer()}
     )
-    req = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(name="remote__echo", arguments={}),
-    )
-    with pytest.raises(McpError) as excinfo:
-        await server.request_handlers[types.CallToolRequest](req)
+    with pytest.raises(MCPError) as excinfo:
+        await call_tool(server, "remote__echo", {})
 
-    assert mcp_proxy._AUTHORIZATION_SENTINEL not in excinfo.value.error.message
+    assert excinfo.value.error.message.startswith("Le serveur 'remote'")
     assert "autorisation" in excinfo.value.error.message
 
 
@@ -1147,15 +1159,9 @@ async def test_live_upstream_is_never_refused():
     await upstreams["bench"].start()
     server = mcp_proxy.build_proxy_server(upstreams, {}, authorizers={})
 
-    req = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(
-            name="bench__echo", arguments={"text": "salut"}
-        ),
-    )
     with patch("asyncio.sleep", new=AsyncMock()):
-        result = await server.request_handlers[types.CallToolRequest](req)
-    assert result.root.isError is False
+        result = await call_tool(server, "bench__echo", {"text": "salut"})
+    assert result.is_error is False
 
 
 # --- l'outil status -------------------------------------------------------
@@ -1169,10 +1175,8 @@ async def test_status_tool_is_listed_without_a_prefix(tmp_path):
     server = mcp_proxy.build_proxy_server(
         upstreams, {}, authorizers={"remote": _FakeAuthorizer()}
     )
-    result = await server.request_handlers[types.ListToolsRequest](
-        types.ListToolsRequest(method="tools/list")
-    )
-    assert "status" in [t.name for t in result.root.tools]
+    result = await list_tools(server)
+    assert "status" in [t.name for t in result.tools]
 
 
 async def test_status_is_routed_despite_having_no_prefix(tmp_path):
@@ -1184,13 +1188,9 @@ async def test_status_is_routed_despite_having_no_prefix(tmp_path):
     server = mcp_proxy.build_proxy_server(
         upstreams, {}, authorizers={"remote": _FakeAuthorizer()}
     )
-    req = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(name="status", arguments={}),
-    )
-    result = await server.request_handlers[types.CallToolRequest](req)
-    assert result.root.isError is False
-    assert "remote" in result.root.content[0].text
+    result = await call_tool(server, "status", {})
+    assert result.is_error is False
+    assert "remote" in result.content[0].text
 
 
 def test_status_report_names_who_can_authorize():
@@ -1243,10 +1243,8 @@ async def test_no_status_tool_without_outbound_auth():
     await upstreams["bench"].start()
     server = mcp_proxy.build_proxy_server(upstreams, {})
 
-    result = await server.request_handlers[types.ListToolsRequest](
-        types.ListToolsRequest(method="tools/list")
-    )
-    assert "status" not in [t.name for t in result.root.tools]
+    result = await list_tools(server)
+    assert "status" not in [t.name for t in result.tools]
 
 
 # ---------------------------------------------------------------------------
@@ -1362,11 +1360,8 @@ async def test_list_tools_meta_names_a_live_but_unauthorized_upstream():
     )
     import mcp.types as types
 
-    handler = server.request_handlers[types.ListToolsRequest]
-    result = await handler(
-        types.ListToolsRequest(method="tools/list", params=None)
-    )
-    meta = result.root.meta or {}
+    result = await list_tools(server)
+    meta = result.meta or {}
     entries = meta.get(mcp_proxy.UNAUTHORIZED_UPSTREAMS_META_KEY) or []
     assert [e["name"] for e in entries] == ["jira"]
     assert entries[0]["authorize_path"] == "/authorize/jira"
@@ -1459,7 +1454,7 @@ async def test_a_completed_authorization_clears_the_flag(tmp_path, monkeypatch):
     authorizer.authorization_pending = True
 
     def _grant(request):
-        import httpx
+        import httpx2
 
         # Ce que fait un parcours abouti : le jeton est en stockage.
         path.write_text(json.dumps({
@@ -1471,7 +1466,7 @@ async def test_a_completed_authorization_clears_the_flag(tmp_path, monkeypatch):
                 "expires_at": time.time() + 3600,
             }
         }))
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
+        return httpx2.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
 
     _patch_authorize_transport(monkeypatch, _grant)
     upstream = _NoopUpstream()
@@ -1498,9 +1493,9 @@ async def test_an_upstream_that_asks_for_nothing_grants_nothing(tmp_path, monkey
     authorizer.authorization_pending = True
 
     def _ok(request):
-        import httpx
+        import httpx2
 
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
+        return httpx2.Response(200, json={"jsonrpc": "2.0", "id": 0, "result": {}})
 
     _patch_authorize_transport(monkeypatch, _ok)
     upstream = _NoopUpstream()
@@ -1835,16 +1830,16 @@ async def test_debug_mode_names_the_absence_of_a_refusal(tmp_path, monkeypatch, 
     monkeypatch.setattr(mcp_proxy.auth_out.debug, "_AUTH_DEBUG", True)
 
     def _never_refuses(request):
-        import httpx
+        import httpx2
 
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+        return httpx2.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
 
     authorizer = _authorizer(tmp_path, interactive=True)
     _patch_authorize_transport(monkeypatch, _never_refuses)
 
-    import httpx
+    import httpx2
 
-    async with httpx.AsyncClient() as client:
+    async with httpx2.AsyncClient() as client:
         await authorizer._provoke_refusal(client)
 
     err = capsys.readouterr().err
@@ -1855,14 +1850,14 @@ async def test_debug_mode_names_the_absence_of_a_refusal(tmp_path, monkeypatch, 
 def _probe_verdict(monkeypatch, tmp_path, capsys, handler):
     """Déroule la sonde en mode debug et rend ce qui a été journalisé."""
     import anyio
-    import httpx
+    import httpx2
 
     monkeypatch.setattr(mcp_proxy.auth_out.debug, "_AUTH_DEBUG", True)
     authorizer = _authorizer(tmp_path, interactive=True)
     _patch_authorize_transport(monkeypatch, handler)
 
     async def _run():
-        async with httpx.AsyncClient() as client:
+        async with httpx2.AsyncClient() as client:
             await authorizer._provoke_refusal(client)
 
     anyio.run(_run)
@@ -1874,11 +1869,11 @@ def test_debug_mode_separates_a_bare_401_from_a_usable_one(monkeypatch, tmp_path
     d'autorisation à découvrir : les deux cas ne se corrigent pas au même
     endroit, donc ils ne doivent pas se lire pareil."""
     def _bare(request):
-        import httpx
+        import httpx2
 
         if b"tools/call" in (request.content or b""):
-            return httpx.Response(401)
-        return httpx.Response(200, headers={"Mcp-Session-Id": "S1"},
+            return httpx2.Response(401)
+        return httpx2.Response(200, headers={"Mcp-Session-Id": "S1"},
                               json={"jsonrpc": "2.0", "id": 1, "result": {}})
 
     err = _probe_verdict(monkeypatch, tmp_path, capsys, _bare)
@@ -1889,11 +1884,11 @@ def test_debug_mode_flags_a_403_that_carried_a_token(monkeypatch, tmp_path, caps
     """403 AVEC jeton envoyé et 403 sans ne mènent pas au même diagnostic : le
     premier accuse le jeton, le second la requête elle-même."""
     def _forbidden(request):
-        import httpx
+        import httpx2
 
         if b"tools/call" in (request.content or b""):
-            return httpx.Response(403, text="Forbidden")
-        return httpx.Response(200, headers={"Mcp-Session-Id": "S1"},
+            return httpx2.Response(403, text="Forbidden")
+        return httpx2.Response(200, headers={"Mcp-Session-Id": "S1"},
                               json={"jsonrpc": "2.0", "id": 1, "result": {}})
 
     err = _probe_verdict(monkeypatch, tmp_path, capsys, _forbidden)
@@ -1906,9 +1901,9 @@ def test_debug_mode_never_logs_a_token_value(monkeypatch, tmp_path, capsys):
     secret = "SUPERSECRETTOKENVALUE"
 
     def _with_token(request):
-        import httpx
+        import httpx2
 
-        return httpx.Response(200, headers={"Mcp-Session-Id": "S1"},
+        return httpx2.Response(200, headers={"Mcp-Session-Id": "S1"},
                               json={"jsonrpc": "2.0", "id": 1, "result": {}})
 
     monkeypatch.setattr(mcp_proxy.auth_out.debug, "_AUTH_DEBUG", True)
@@ -1916,10 +1911,10 @@ def test_debug_mode_never_logs_a_token_value(monkeypatch, tmp_path, capsys):
     _patch_authorize_transport(monkeypatch, _with_token)
 
     import anyio
-    import httpx
+    import httpx2
 
     async def _run():
-        async with httpx.AsyncClient(
+        async with httpx2.AsyncClient(
             headers={"Authorization": f"Bearer {secret}"}
         ) as client:
             await authorizer._provoke_refusal(client)
@@ -2116,7 +2111,7 @@ async def test_a_token_valid_for_a_long_time_is_left_alone(tmp_path):
     _store_token(tmp_path, expires_in=mcp_proxy._REFRESH_MARGIN_S + 3600)
     authorizer = _authorizer(tmp_path, interactive=False)
 
-    with patch("httpx.AsyncClient") as client:
+    with patch("httpx2.AsyncClient") as client:
         assert await authorizer.refresh_if_due() is False
     client.assert_not_called()
 
@@ -2128,7 +2123,7 @@ async def test_a_token_without_refresh_token_is_not_chased(tmp_path):
     _store_token(tmp_path, expires_in=60, refresh=None)
     authorizer = _authorizer(tmp_path, interactive=False)
 
-    with patch("httpx.AsyncClient") as client:
+    with patch("httpx2.AsyncClient") as client:
         assert await authorizer.refresh_if_due() is False
     client.assert_not_called()
 
@@ -2159,7 +2154,7 @@ async def test_a_token_about_to_expire_is_renewed_through_the_provider(tmp_path)
 
         post = staticmethod(_post)
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is True
 
     # L'auth passée au client est bien le provider partagé, pas un neuf.
@@ -2187,7 +2182,7 @@ async def test_a_background_renewal_never_opens_an_interactive_flow(tmp_path):
         async def post(self, *a, **kw):
             raise mcp_proxy.AuthorizationRequired("remote")
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is False
 
     assert authorizer.interactive is False
@@ -2214,7 +2209,7 @@ async def test_an_unreachable_as_does_not_cost_the_authorization(tmp_path):
         async def post(self, *a, **kw):
             raise OSError("réseau injoignable")
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is False
 
     assert authorizer.authorization_pending is False
@@ -2255,7 +2250,7 @@ async def test_a_short_lived_token_is_not_renewed_on_every_wake(tmp_path):
     _store_token(tmp_path, expires_in=280, lifetime=300)
     authorizer = _authorizer(tmp_path, interactive=False)
 
-    with patch("httpx.AsyncClient") as client:
+    with patch("httpx2.AsyncClient") as client:
         assert await authorizer.refresh_if_due() is False
     client.assert_not_called()
 
@@ -2284,7 +2279,7 @@ async def test_a_renewal_is_judged_on_the_deadline_moving(tmp_path):
             _store_token(tmp_path, expires_in=300, lifetime=300)
             return object()
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is True
 
 
@@ -2502,7 +2497,7 @@ async def test_a_silently_refused_refresh_is_not_a_success(tmp_path):
             provider.context.current_tokens = None
             return object()
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is False
 
     assert authorizer.authorization_pending is True
@@ -2534,7 +2529,7 @@ async def test_a_token_still_expired_afterwards_is_not_a_renewal(tmp_path):
             _store_token(tmp_path, expires_in=0, lifetime=300)
             return object()
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is False
 
     assert authorizer.authorization_pending is True
@@ -2595,7 +2590,7 @@ async def test_the_renewal_trace_reports_the_gain_not_just_the_remainder(
             _store_token(tmp_path, expires_in=300, lifetime=300)
             return object()
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is True
 
     err = capsys.readouterr().err
@@ -2629,7 +2624,7 @@ async def test_a_renewal_that_barely_moves_is_flagged(tmp_path, capsys):
             _store_token(tmp_path, expires_in=20, lifetime=300)
             return object()
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is True
 
     err = capsys.readouterr().err
@@ -2668,7 +2663,7 @@ async def test_an_unchanged_deadline_is_not_announced_as_a_renewal(
             _store_token(tmp_path, expires_in=147.5, lifetime=300)
             return object()
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is False
 
     err = capsys.readouterr().err
@@ -2706,7 +2701,7 @@ async def test_an_unchanged_deadline_is_reported_once_per_episode(
             _store_token(tmp_path, expires_in=remaining.pop(0), lifetime=300)
             return object()
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is False
         _store_token(tmp_path, expires_in=95, lifetime=300)
         assert await authorizer.refresh_if_due() is False
@@ -2739,7 +2734,7 @@ async def test_a_real_renewal_rearms_the_noop_notice(tmp_path, capsys):
             _store_token(tmp_path, expires_in=300, lifetime=300)
             return object()
 
-    with patch("httpx.AsyncClient", _Client):
+    with patch("httpx2.AsyncClient", _Client):
         assert await authorizer.refresh_if_due() is True
 
     assert authorizer._renewal_noop_reported is False
@@ -2759,7 +2754,7 @@ def _restore_logging():
     """
     import logging
 
-    names = ("mcp.client.auth", "mcp.client.streamable_http", "client", "httpx")
+    names = ("mcp.client.auth", "mcp.client.streamable_http", "client", "httpx2")
     saved = {
         n: (
             logging.getLogger(n).level,
@@ -2781,7 +2776,7 @@ def _restore_logging():
 def test_debug_auth_instruments_the_post_boot_transport(_restore_logging):
     """`--debug-auth` doit rester actif APRÈS le démarrage.
 
-    Première version : seuls `mcp.client.auth` et `httpx` étaient instrumentés.
+    Première version : seuls `mcp.client.auth` et `httpx2` étaient instrumentés.
     On voyait les URL d'AS essayées au boot puis plus rien — le trafic ensuite
     passe par le transport streamable-http, qui journalise sous SON nom.
     """
@@ -2823,7 +2818,7 @@ def test_debug_auth_targets_loggers_that_actually_exist(_restore_logging):
 
 
 def test_debug_auth_redacts_sensitive_urls(_restore_logging, capsys):
-    """Le masquage doit valoir pour les loggers ajoutés, pas seulement httpx."""
+    """Le masquage doit valoir pour les loggers ajoutés, pas seulement httpx2."""
     import logging
 
     mcp_proxy.enable_auth_debug()
@@ -2832,3 +2827,53 @@ def test_debug_auth_redacts_sensitive_urls(_restore_logging, capsys):
     )
     err = capsys.readouterr().err
     assert "SECRETVALUE" not in err
+
+
+# --- journal du SDK : le refus volontaire n'est pas une panne ---------------
+
+def _sdk_oauth_record(exc):
+    import logging
+    import sys as _sys
+
+    try:
+        raise exc
+    except Exception:
+        exc_info = _sys.exc_info()
+    return logging.LogRecord(
+        "mcp.client.auth.oauth2", logging.ERROR, __file__, 0,
+        "OAuth flow error", None, exc_info,
+    )
+
+
+def test_the_expected_refusal_is_kept_out_of_the_sdk_log(tmp_path):
+    """Le SDK 2.x journalise en ERROR, traceback compris, l'exception que
+    `_on_redirect` lève VOLONTAIREMENT pour refuser un parcours non
+    interactif — un état normal, déjà annoncé par le proxy en une ligne. Le
+    filtre l'écarte ; toute autre erreur du parcours reste journalisée."""
+    import logging
+
+    _authorizers_for({"scope": "x"}, tmp_path)
+    logger = logging.getLogger("mcp.client.auth.oauth2")
+
+    assert not logger.filter(_sdk_oauth_record(mcp_proxy.AuthorizationRequired("remote")))
+    assert logger.filter(_sdk_oauth_record(RuntimeError("vraie panne")))
+
+
+def test_debug_mode_keeps_the_refusal_in_the_sdk_log(tmp_path, monkeypatch):
+    """Sous --debug-auth, on veut TOUT voir : rien n'est écarté."""
+    import logging
+
+    _authorizers_for({"scope": "x"}, tmp_path)
+    monkeypatch.setattr(mcp_proxy.auth_out.debug, "_AUTH_DEBUG", True)
+    logger = logging.getLogger("mcp.client.auth.oauth2")
+
+    assert logger.filter(_sdk_oauth_record(mcp_proxy.AuthorizationRequired("remote")))
+
+
+def test_the_refusal_filter_is_installed_once(tmp_path):
+    import logging
+
+    _authorizers_for({"scope": "x"}, tmp_path)
+    _authorizers_for({"scope": "x"}, tmp_path)
+    logger = logging.getLogger("mcp.client.auth.oauth2")
+    assert sum(type(f).__name__ == "_ExpectedRefusalFilter" for f in logger.filters) == 1

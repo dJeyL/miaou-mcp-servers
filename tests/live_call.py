@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1,<2", "truststore"]
+# dependencies = ["mcp>=2.2,<3", "truststore"]
 # ///
 """
 Appel réel d'un outil MCP sur un serveur déjà lancé (banc d'essai manuel).
@@ -30,14 +30,14 @@ import json
 import sys
 
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 
 def enable_system_trust_store() -> bool:
     """Vérifie les certificats TLS contre le magasin de confiance du système.
 
     Recopie délibérée du helper de `servers/mcp_base.py` : ce script est un
-    CLIENT autonome (bloc PEP 723), l'importer depuis servers/ tirerait FastMCP
+    CLIENT autonome (bloc PEP 723), l'importer depuis servers/ tirerait le SDK serveur
     et starlette pour quatre lignes. Toute évolution du helper d'origine doit
     être répercutée ici — la doc de référence reste `docs/tls.md`.
 
@@ -82,11 +82,11 @@ def _render_content(block) -> str:
     if kind == "text":
         return block.text
     if kind == "image":
-        return f"[image {block.mimeType} — {len(block.data)} octets base64]"
+        return f"[image {block.mime_type} — {len(block.data)} octets base64]"
     if kind == "resource":
         res = block.resource
         uri = getattr(res, "uri", "?")
-        mime = getattr(res, "mimeType", "?")
+        mime = getattr(res, "mime_type", "?")
         if getattr(res, "text", None) is not None:
             return f"[resource {uri} ({mime})]\n{res.text}"
         blob = getattr(res, "blob", "") or ""
@@ -101,11 +101,22 @@ async def run(
     list_only: bool,
     headers: dict[str, str] | None = None,
 ) -> int:
-    async with streamablehttp_client(url, headers=headers) as (read, write, _get_session_id):
+    import httpx2
+
+    # En-têtes et délais se posent sur le client HTTP depuis le SDK 2.x. Le délai
+    # de lecture reprend celui que l'ancien transport appliquait d'office : sans
+    # lui, httpx2 retombe sur 5 s à plat, trop court pour le flux SSE.
+    http_client = httpx2.AsyncClient(
+        headers=headers, timeout=httpx2.Timeout(30, read=300)
+    )
+    async with http_client, streamable_http_client(url, http_client=http_client) as (
+        read,
+        write,
+    ):
         async with ClientSession(read, write) as session:
             init = await session.initialize()
             print(
-                f"→ connecté à {init.serverInfo.name} {init.serverInfo.version} ({url})",
+                f"→ connecté à {init.server_info.name} {init.server_info.version} ({url})",
                 file=sys.stderr,
             )
 
@@ -122,18 +133,18 @@ async def run(
                 return 2
 
             result = await session.call_tool(tool, arguments)
-            print(f"→ isError={result.isError}", file=sys.stderr)
+            print(f"→ isError={result.is_error}", file=sys.stderr)
             for block in result.content:
                 print(_render_content(block))
-            if getattr(result, "structuredContent", None):
+            if getattr(result, "structured_content", None):
                 print("--- structuredContent ---")
-                print(json.dumps(result.structuredContent, indent=2, ensure_ascii=False))
+                print(json.dumps(result.structured_content, indent=2, ensure_ascii=False))
             if result.meta:
                 # Surface adressée au client, jamais au modèle (ex. `miaou/web`
                 # de fetch_url) : c'est ici qu'on vérifie qu'elle traverse le fil.
                 print("--- _meta ---")
                 print(json.dumps(result.meta, indent=2, ensure_ascii=False))
-            return 1 if result.isError else 0
+            return 1 if result.is_error else 0
 
 
 def _flatten(exc: BaseException) -> list[str]:

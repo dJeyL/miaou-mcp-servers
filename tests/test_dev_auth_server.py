@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import httpx
+import httpx2
 import pytest
 
 _ROOT = Path(__file__).parent.parent
@@ -44,8 +44,8 @@ def _make(keys, auto_approve=True):
 
 
 def _client(app):
-    return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url=_ISSUER
+    return httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app), base_url=_ISSUER
     )
 
 

@@ -21,7 +21,7 @@
 # runtime (DD7) — les paquets sont donc là, même pour du code non emballé,
 # qu'on lance par son chemin depuis la racine.
 
-mcp>=1.28.1,<2
+mcp>=2.2,<3
 uvicorn
 starlette
 anyio

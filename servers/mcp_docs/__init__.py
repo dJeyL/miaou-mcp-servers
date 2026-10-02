@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "pymupdf", "python-docx", "openpyxl", "python-pptx", "truststore"]
+# dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "pymupdf", "python-docx", "openpyxl", "python-pptx", "truststore"]
 # ///
 """
 Serveur MCP d'extraction de documents pour MIAOU (PDF, Office, Zip).
@@ -21,10 +21,10 @@ Cycle de vie des fichiers : chaque conversation MIAOU a une session
 normal (`content_b64`), injectés par le dispatcher MIAOU seulement au premier
 appel pour un `ref` donné (matérialisation idempotente) ; les appels suivants
 ne portent que `ref`. Un `ref` inconnu sans `content_b64` déclenche l'erreur
-machine REF_UNKNOWN (voir `REF_UNKNOWN_SENTINEL` ci-dessous), convertie par le
-proxy (paquet mcp_proxy) en erreur JSON-RPC ; le client MIAOU rejoue alors une fois
-avec le contenu inliné. Ce rejeu ne fonctionne que derrière le proxy — en
-standalone (FastMCP pur) l'appel échoue simplement en isError.
+machine REF_UNKNOWN : une erreur JSON-RPC portant `data.code == "REF_UNKNOWN"`
+(voir `REF_UNKNOWN_SENTINEL` ci-dessous), à laquelle le client MIAOU répond en
+rejouant une fois avec le contenu inliné. Elle est levée directement par l'outil
+(MCPError), donc le rejeu fonctionne en autonome comme derrière le proxy.
 
 Variables d'environnement (toutes optionnelles, défauts constants) :
     MIAOU_DOCS_WORKDIR         (défaut : "./miaou-docs", relatif au répertoire de travail)
@@ -38,7 +38,7 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
 Module éclaté en package (servers/mcp_docs/) : session.py (sessions, sanitization,
 matérialisation, contrat REF_UNKNOWN), formats.py (détection de type + parsers
 PDF/docx/xlsx/pptx/zip), search.py (logique pure de recherche : fold, parsing de
-requête, matching, snippets). Ce fichier ne porte que le serveur FastMCP et ses outils.
+requête, matching, snippets). Ce fichier ne porte que le serveur MCP et ses outils.
 
 Lancement (package, pas un script plat — `uv run servers/mcp_docs.py` ne s'applique
 pas ici, cd dans servers/ ou utiliser --directory) :

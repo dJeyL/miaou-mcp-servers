@@ -82,7 +82,7 @@ def _page(head: str = "", body: str = "<p>Corps</p>") -> bytes:
 
 async def _call(url: str, router: _Router) -> types.CallToolResult:
     with patch("urllib.request.OpenerDirector.open", side_effect=router):
-        result = await _TM.call_tool("fetch_url", {"url": url})
+        result = await _TM.call_tool("fetch_url", {"url": url}, None)
     assert isinstance(result, types.CallToolResult)
     return result
 
@@ -345,7 +345,7 @@ async def test_fetch_url_publishes_meta_without_touching_content():
     assert "Corps" in block.resource.text
     assert "Nom du site" not in block.resource.text
     assert "base64" not in block.resource.text
-    assert result.isError is False
+    assert result.is_error is False
 
 
 async def test_meta_reaches_the_wire_under_its_alias():
@@ -426,7 +426,7 @@ async def test_error_result_has_no_meta():
     result = await _call("https://s.test/missing", _Router({}))
     assert result.meta is None
     assert "404" in result.content[0].text
-    assert result.isError is False
+    assert result.is_error is False
 
 
 async def test_final_url_outside_http_is_dropped():

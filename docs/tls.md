@@ -13,8 +13,11 @@ disparaissent de `tools/list`.
 `truststore.inject_into_ssl()`, qui **remplace la classe `ssl.SSLContext` elle-même**.
 C'est ce qui rend cet appel unique suffisant pour toute la sortie HTTPS du process,
 quelle que soit la bibliothèque : urllib (`make_opener()`, dans weather/ddg/brave/web)
-comme httpx (`HttpUpstream`, et le client OAuth du SDK MCP) construisent leur contexte via
-`ssl.create_default_context()`, donc via la classe patchée. **Aucun appel HTTP n'est
+construit son contexte via `ssl.create_default_context()`, donc via la classe patchée.
+Depuis le SDK MCP 2.x, le client HTTP des upstreams `http` et du parcours OAuth est
+`httpx2`, qui **consulte de lui-même le magasin système** (`truststore.SSLContext` par
+défaut, sauf si `SSL_CERT_FILE` ou `SSL_CERT_DIR` sont posés, qu'il préfère alors) :
+l'injection ne lui est plus nécessaire, et ne le gêne pas. **Aucun appel HTTP n'est
 réécrit, et rien n'est passé explicitement à un client** — c'est la raison d'être du point
 d'injection unique, et pourquoi il n'y a pas eu de migration `requests`→`httpx` ici : ce
 dépôt n'a jamais utilisé `requests`.
@@ -29,7 +32,7 @@ Trois points d'appel, un par mode de lancement, et pas un de plus :
   seulement le fait que l'appel existe.
 - **`tests/live_call.py`**, avant `asyncio.run`. Seul appelant qui **recopie** le helper au
   lieu de l'importer : c'est un client autonome à bloc PEP 723, et importer `mcp_base`
-  y tirerait FastMCP et starlette pour quatre lignes. La contrepartie est explicite —
+  y tirerait le SDK serveur et starlette pour quatre lignes. La contrepartie est explicite —
   toute évolution du helper d'origine est à répercuter dans cette copie. Sans elle, viser
   une URL `https://` sous AC interne échoue côté client seul, ce qui se lit à tort comme
   une panne du serveur.
@@ -42,12 +45,13 @@ non supportée renvoie `False` avec un avertissement sur stderr, sans lever. Sur
 sans AC interne, la vérification par bundle CA fonctionne déjà : faire échouer le démarrage
 y serait une régression pure pour un bénéfice nul.
 
-Un test épingle que le client httpx du SDK construit bien son contexte via la classe
-injectée (`test_sdk_http_client_uses_injected_ssl_context`) — c'est une propriété d'une
-**bibliothèque tierce**, exactement comme `test_mcp_sdk_http_client_still_trusts_env` :
-un SDK qui câblerait un jour un `ssl_context` explicite ou un bundle certifi rendrait
-l'injection silencieusement inopérante sur le seul type d'upstream qui a motivé le
-changement.
+Un test épingle que le client d'un upstream `http` vérifie bien contre le magasin système
+(`test_http_upstream_client_checks_the_system_trust_store`), sur le client que
+`HttpUpstream._build_http_client` construit RÉELLEMENT — c'est une propriété d'une
+**bibliothèque tierce** (httpx2), exactement comme `trust_env` (cf. `docs/proxy.md`) : un
+défaut qui changerait un jour rendrait la vérification silencieusement fausse sur le seul
+type d'upstream qui a motivé le changement. Avant la migration, ce test visait le client
+que construisait le SDK : resté vert, il n'aurait plus rien prouvé.
 
 `truststore` est déclaré aux trois endroits qui gouvernent un environnement
 (blocs PEP 723, `requirements.txt`, `pyproject.toml`), blocs PEP 723 de **tous** les

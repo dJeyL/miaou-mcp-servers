@@ -25,7 +25,7 @@ async def test_unknown_tool_argument_is_rejected():
     tm = bench_server.mcp._tool_manager
     with patch("asyncio.sleep", new=AsyncMock()):
         with pytest.raises(Exception):
-            await tm.call_tool("echo", {"text": "bonjour", "page": 2})
+            await tm.call_tool("echo", {"text": "bonjour", "page": 2}, None)
 
 
 @pytest.mark.asyncio
@@ -36,7 +36,7 @@ async def test_known_tool_argument_still_works():
 
     tm = bench_server.mcp._tool_manager
     with patch("asyncio.sleep", new=AsyncMock()):
-        result = await tm.call_tool("echo", {"text": "bonjour"})
+        result = await tm.call_tool("echo", {"text": "bonjour"}, None)
     assert result == "bonjour"
 
 
@@ -211,12 +211,12 @@ def test_instructions_absent_by_default():
     assert MiaouMCPBase("t", default_port=9999).mcp.instructions is None
 
 
-def test_instructions_reach_fastmcp():
+def test_instructions_reach_the_server():
     """`instructions` est la seule voie du protocole pour une consigne valant
     pour le serveur entier : les seuls champs qu'un client relaie au modèle par
     outil sont name/description/inputSchema."""
     srv = MiaouMCPBase("t", default_port=9999, instructions="Lire la skill `t-usage`.")
     assert srv.mcp.instructions == "Lire la skill `t-usage`."
     # Jusque dans ce que le SDK enverra au client.
-    opts = srv.mcp._mcp_server.create_initialization_options()
+    opts = srv.mcp._lowlevel_server.create_initialization_options()
     assert opts.instructions == "Lire la skill `t-usage`."

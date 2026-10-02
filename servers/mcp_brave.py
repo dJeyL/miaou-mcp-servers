@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "truststore"]
+# dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "truststore"]
 # ///
 """
 Serveur MCP Brave Search pour MIAOU.
@@ -40,7 +40,7 @@ import urllib.request
 from typing import Annotated
 
 from mcp import types
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from mcp_base import MiaouMCPBase, make_opener
@@ -216,7 +216,7 @@ class BraveServer(MiaouMCPBase):
         self.finalize_tools()
 
 
-def build(config: dict | None = None) -> FastMCP:
+def build(config: dict | None = None) -> MCPServer:
     """Factory appelée par InProcessUpstream.start() du proxy.
 
     Lève MissingAPIKeyError si aucune clef n'est disponible : le serveur refuse

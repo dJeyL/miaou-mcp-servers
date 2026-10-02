@@ -237,10 +237,49 @@ def test_materialize_att_and_file_refs_do_not_collide(workdir):
 # resolve_ref — REF_UNKNOWN
 # ---------------------------------------------------------------------------
 
-def test_resolve_ref_unknown_without_content_raises_sentinel(workdir):
-    with pytest.raises(ToolError) as exc_info:
+def test_resolve_ref_unknown_without_content_raises_jsonrpc_error(workdir):
+    """REF_UNKNOWN est une erreur JSON-RPC portant son code machine dans `data`,
+    levée par l'outil lui-même : c'est `data.code` que le client teste."""
+    from mcp.shared.exceptions import MCPError
+
+    with pytest.raises(MCPError) as exc_info:
         resolve_ref("conv-1", "att-99", None)
-    assert str(exc_info.value).startswith(REF_UNKNOWN_SENTINEL)
+    assert exc_info.value.error.code == REF_UNKNOWN_ERROR_CODE
+    assert exc_info.value.error.data == {"code": "REF_UNKNOWN"}
+    assert exc_info.value.error.message.startswith(REF_UNKNOWN_SENTINEL)
+
+
+@pytest.mark.asyncio
+async def test_ref_unknown_surfaces_as_jsonrpc_error_without_proxy(workdir):
+    """En autonome aussi (MCPServer seul, sur le vrai chemin JSON-RPC legacy
+    que parle MIAOU) : la MCPError traverse le serveur en erreur protocolaire,
+    `data` intact, au lieu d'être aplatie en isError textuel."""
+    from mcp.client import Client
+    from mcp.shared.exceptions import MCPError
+
+    from mcp_docs import server as docs_server
+
+    async with Client(docs_server.mcp, mode="legacy") as client:
+        with pytest.raises(MCPError) as exc_info:
+            await client.call_tool("list", {"ref": "att-99", "session_id": "conv-1"})
+    assert exc_info.value.error.code == REF_UNKNOWN_ERROR_CODE
+    assert exc_info.value.error.data == {"code": "REF_UNKNOWN"}
+
+
+@pytest.mark.asyncio
+async def test_tool_error_text_reaches_the_client(workdir):
+    """La ToolError de mcp_docs hérite de celle du SDK : sans cet héritage, la
+    2.x traite l'exception en plantage et ne rend que « Error executing tool
+    <nom> », sans le motif du refus. Vérifié sur le TEXTE reçu, pas sur
+    is_error seul (qui serait vrai dans les deux cas)."""
+    from mcp.client import Client
+
+    from mcp_docs import server as docs_server
+
+    async with Client(docs_server.mcp, mode="legacy") as client:
+        result = await client.call_tool("list", {"ref": "pas-un-ref", "session_id": "conv-1"})
+    assert result.is_error is True
+    assert "ref invalide" in result.content[0].text
 
 
 def test_resolve_ref_materializes_when_content_provided(workdir):
@@ -310,7 +349,7 @@ async def test_drop_session_removes_directory(workdir):
     d = session_dir("conv-1")
     d.mkdir(parents=True)
     tm = docs_server.mcp._tool_manager
-    result = await tm.call_tool("drop_session", {"session_id": "conv-1"})
+    result = await tm.call_tool("drop_session", {"session_id": "conv-1"}, None)
     assert not d.exists()
     assert "conv-1" in result
 
@@ -320,7 +359,7 @@ async def test_drop_session_idempotent_when_absent(workdir):
     from mcp_docs import server as docs_server
 
     tm = docs_server.mcp._tool_manager
-    result = await tm.call_tool("drop_session", {"session_id": "conv-never-existed"})
+    result = await tm.call_tool("drop_session", {"session_id": "conv-never-existed"}, None)
     assert "conv-never-existed" in result
 
 
@@ -341,7 +380,7 @@ async def test_drop_session_sweeps_other_expired_sessions(workdir):
     target.mkdir(parents=True)
 
     tm = docs_server.mcp._tool_manager
-    await tm.call_tool("drop_session", {"session_id": "conv-target"})
+    await tm.call_tool("drop_session", {"session_id": "conv-target"}, None)
 
     assert not other.exists()  # balayée par le sweep, pas par drop_session lui-même
 
@@ -352,10 +391,9 @@ async def test_drop_session_sweeps_other_expired_sessions(workdir):
 
 @pytest.mark.asyncio
 async def test_ref_unknown_through_proxy_raises_jsonrpc_error(workdir):
-    """Le sentinel textuel REF_UNKNOWN doit ressortir en erreur JSON-RPC
+    """REF_UNKNOWN doit ressortir du proxy en erreur JSON-RPC
     data.code == 'REF_UNKNOWN', pas en isError textuel (contrat client, audit §3)."""
-    import mcp.types as types
-    from mcp.shared.exceptions import McpError
+    from mcp.shared.exceptions import MCPError
 
     from mcp_proxy import InProcessUpstream, build_proxy_server
 
@@ -366,20 +404,13 @@ async def test_ref_unknown_through_proxy_raises_jsonrpc_error(workdir):
     tool_map: dict = {}
     server = build_proxy_server(upstreams, tool_map)
 
-    list_handler = server.request_handlers[types.ListToolsRequest]
-    await list_handler(types.ListToolsRequest(method="tools/list", params=None))
+    from tests.proxy_client import call_tool, list_tools
 
-    call_handler = server.request_handlers[types.CallToolRequest]
-    request = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(
-            name="docs__list",
-            arguments={"ref": "att-99", "session_id": "conv-1"},
-        ),
-    )
+    await list_tools(server)
+    call = call_tool(server, "docs__list", {"ref": "att-99", "session_id": "conv-1"})
 
-    with pytest.raises(McpError) as exc_info:
-        await call_handler(request)
+    with pytest.raises(MCPError) as exc_info:
+        await call
 
     assert exc_info.value.error.data["code"] == "REF_UNKNOWN"
     assert exc_info.value.error.code == REF_UNKNOWN_ERROR_CODE
@@ -388,8 +419,7 @@ async def test_ref_unknown_through_proxy_raises_jsonrpc_error(workdir):
 @pytest.mark.asyncio
 async def test_non_ref_unknown_error_stays_iserror_through_proxy(workdir):
     """Une erreur applicative ordinaire (session_id manquant) ne doit pas être
-    convertie en erreur JSON-RPC — seul le sentinel REF_UNKNOWN déclenche McpError."""
-    import mcp.types as types
+    convertie en erreur JSON-RPC — seul REF_UNKNOWN sort en MCPError."""
 
     from mcp_proxy import InProcessUpstream, build_proxy_server
 
@@ -400,20 +430,14 @@ async def test_non_ref_unknown_error_stays_iserror_through_proxy(workdir):
     tool_map: dict = {}
     server = build_proxy_server(upstreams, tool_map)
 
-    list_handler = server.request_handlers[types.ListToolsRequest]
-    await list_handler(types.ListToolsRequest(method="tools/list", params=None))
+    from tests.proxy_client import call_tool, list_tools
 
-    call_handler = server.request_handlers[types.CallToolRequest]
-    request = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(
-            name="docs__list",
-            arguments={"ref": "att-1"},
-        ),
-    )
+    await list_tools(server)
+    call = call_tool(server, "docs__list", {"ref": "att-1"})
 
-    result = await call_handler(request)
-    assert result.root.isError
+    result = await call
+    assert result.is_error
+    assert "session_id" in result.content[0].text
 
 
 # ---------------------------------------------------------------------------
@@ -1344,7 +1368,7 @@ async def test_list_tool_end_to_end_pdf(workdir):
     dest.write_bytes(path.read_bytes())
 
     tm = docs_server.mcp._tool_manager
-    result = await tm.call_tool("list", {"ref": "att-1", "session_id": "conv-1"})
+    result = await tm.call_tool("list", {"ref": "att-1", "session_id": "conv-1"}, None)
     assert "PDF" in result
 
 
@@ -1360,7 +1384,7 @@ async def test_list_tool_end_to_end_resource_ref(workdir):
     dest.write_bytes(path.read_bytes())
 
     tm = docs_server.mcp._tool_manager
-    result = await tm.call_tool("list", {"ref": "res_abc123", "session_id": "conv-1"})
+    result = await tm.call_tool("list", {"ref": "res_abc123", "session_id": "conv-1"}, None)
     assert "PDF" in result
 
 
@@ -1385,13 +1409,13 @@ async def test_read_tool_end_to_end_resource_ref(workdir):
     dest.write_bytes(path.read_bytes())
 
     tm = docs_server.mcp._tool_manager
-    result = await tm.call_tool("read", {"ref": "res_abc123", "session_id": "conv-1"})
+    result = await tm.call_tool("read", {"ref": "res_abc123", "session_id": "conv-1"}, None)
     assert "Resource ref page text" in result
 
 
 @pytest.mark.asyncio
 async def test_read_tool_requires_path_for_zip(workdir):
-    from mcp.server.fastmcp.exceptions import ToolError as FastMCPToolError
+    from mcp.server.mcpserver.exceptions import ToolError as SDKToolError
 
     from mcp_docs import server as docs_server
 
@@ -1401,8 +1425,8 @@ async def test_read_tool_requires_path_for_zip(workdir):
     dest.write_bytes(path.read_bytes())
 
     tm = docs_server.mcp._tool_manager
-    with pytest.raises(FastMCPToolError, match="path"):
-        await tm.call_tool("read", {"ref": "att-1", "session_id": "conv-1"})
+    with pytest.raises(SDKToolError, match="path"):
+        await tm.call_tool("read", {"ref": "att-1", "session_id": "conv-1"}, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1722,7 +1746,7 @@ async def test_extract_tool_returns_blob_resource_with_textual_mime(workdir):
 
     tm = docs_server.mcp._tool_manager
     result = await tm.call_tool(
-        "extract", {"ref": "att-1", "session_id": "conv-1", "path": "data.json"}
+        "extract", {"ref": "att-1", "session_id": "conv-1", "path": "data.json"}, None
     )
     blocks = result.content if hasattr(result, "content") else result
 
@@ -1731,7 +1755,7 @@ async def test_extract_tool_returns_blob_resource_with_textual_mime(workdir):
 
     assert len(resource_blocks) == 1
     resource = resource_blocks[0].resource
-    assert resource.mimeType == "text/plain"
+    assert resource.mime_type == "text/plain"
     assert base64.b64decode(resource.blob).decode("utf-8") == '{"hits": 42}'
 
     for tb in text_blocks:
@@ -1741,7 +1765,7 @@ async def test_extract_tool_returns_blob_resource_with_textual_mime(workdir):
 
 @pytest.mark.asyncio
 async def test_extract_tool_rejects_non_zip_ref(workdir):
-    from mcp.server.fastmcp.exceptions import ToolError as FastMCPToolError
+    from mcp.server.mcpserver.exceptions import ToolError as SDKToolError
 
     from mcp_docs import server as docs_server
 
@@ -1750,9 +1774,9 @@ async def test_extract_tool_rejects_non_zip_ref(workdir):
     dest.write_bytes(b"not a zip")
 
     tm = docs_server.mcp._tool_manager
-    with pytest.raises(FastMCPToolError, match="archive"):
+    with pytest.raises(SDKToolError, match="archive"):
         await tm.call_tool(
-            "extract", {"ref": "att-1", "session_id": "conv-1", "path": "whatever.txt"}
+            "extract", {"ref": "att-1", "session_id": "conv-1", "path": "whatever.txt"}, None
         )
 
 
@@ -1770,7 +1794,7 @@ async def test_list_tool_path_on_nested_docx_member(workdir):
 
     tm = docs_server.mcp._tool_manager
     result = await tm.call_tool(
-        "list", {"ref": "att-1", "session_id": "conv-1", "path": "membre.docx"}
+        "list", {"ref": "att-1", "session_id": "conv-1", "path": "membre.docx"}, None
     )
     assert "Nested Title" in result
 
@@ -1789,14 +1813,14 @@ async def test_read_tool_path_on_nested_docx_member(workdir):
 
     tm = docs_server.mcp._tool_manager
     result = await tm.call_tool(
-        "read", {"ref": "att-1", "session_id": "conv-1", "path": "membre.docx"}
+        "read", {"ref": "att-1", "session_id": "conv-1", "path": "membre.docx"}, None
     )
     assert "Nested body via tool" in result
 
 
 @pytest.mark.asyncio
 async def test_list_tool_path_on_non_zip_raises(workdir):
-    from mcp.server.fastmcp.exceptions import ToolError as FastMCPToolError
+    from mcp.server.mcpserver.exceptions import ToolError as SDKToolError
 
     from mcp_docs import server as docs_server
 
@@ -1806,8 +1830,8 @@ async def test_list_tool_path_on_non_zip_raises(workdir):
     dest.write_bytes(path.read_bytes())
 
     tm = docs_server.mcp._tool_manager
-    with pytest.raises(FastMCPToolError, match="archive"):
-        await tm.call_tool("list", {"ref": "att-1", "session_id": "conv-1", "path": "x.docx"})
+    with pytest.raises(SDKToolError, match="archive"):
+        await tm.call_tool("list", {"ref": "att-1", "session_id": "conv-1", "path": "x.docx"}, None)
 
 
 @pytest.mark.asyncio
@@ -1821,7 +1845,7 @@ async def test_search_tool_end_to_end_pdf(workdir):
 
     tm = docs_server.mcp._tool_manager
     result = await tm.call_tool(
-        "search", {"ref": "att-1", "session_id": "conv-1", "query": "chat noir"}
+        "search", {"ref": "att-1", "session_id": "conv-1", "query": "chat noir"}, None
     )
     assert "1" in result
     assert "chat noir" in result.lower()
@@ -1838,7 +1862,7 @@ async def test_search_tool_end_to_end_zip(workdir):
 
     tm = docs_server.mcp._tool_manager
     result = await tm.call_tool(
-        "search", {"ref": "att-1", "session_id": "conv-1", "query": "chat noir"}
+        "search", {"ref": "att-1", "session_id": "conv-1", "query": "chat noir"}, None
     )
     assert "a.txt" in result
     assert "chat noir" in result.lower()
@@ -1848,8 +1872,7 @@ async def test_search_tool_end_to_end_zip(workdir):
 async def test_search_ref_unknown_through_proxy_raises_jsonrpc_error(workdir):
     """search est inflatable (ref+content_b64) : REF_UNKNOWN doit aussi passer
     par le chemin JSON-RPC du proxy, pas seulement list/read."""
-    import mcp.types as types
-    from mcp.shared.exceptions import McpError
+    from mcp.shared.exceptions import MCPError
 
     from mcp_proxy import InProcessUpstream, build_proxy_server
 
@@ -1860,20 +1883,13 @@ async def test_search_ref_unknown_through_proxy_raises_jsonrpc_error(workdir):
     tool_map: dict = {}
     server = build_proxy_server(upstreams, tool_map)
 
-    list_handler = server.request_handlers[types.ListToolsRequest]
-    await list_handler(types.ListToolsRequest(method="tools/list", params=None))
+    from tests.proxy_client import call_tool, list_tools
 
-    call_handler = server.request_handlers[types.CallToolRequest]
-    request = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(
-            name="docs__search",
-            arguments={"ref": "att-99", "session_id": "conv-1", "query": "chat"},
-        ),
-    )
+    await list_tools(server)
+    call = call_tool(server, "docs__search", {"ref": "att-99", "session_id": "conv-1", "query": "chat"})
 
-    with pytest.raises(McpError) as exc_info:
-        await call_handler(request)
+    with pytest.raises(MCPError) as exc_info:
+        await call
 
     assert exc_info.value.error.data["code"] == "REF_UNKNOWN"
     assert exc_info.value.error.code == REF_UNKNOWN_ERROR_CODE
@@ -2099,6 +2115,7 @@ async def test_read_tool_char_range_end_to_end(workdir, monkeypatch):
     result = await tm.call_tool(
         "read",
         {"ref": "att-1", "session_id": "conv-1", "selector": "1", "char_start": 50},
+        None,
     )
     assert "Y" in result
     assert "char_start" in result
@@ -2106,7 +2123,7 @@ async def test_read_tool_char_range_end_to_end(workdir, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_read_tool_rejects_mixed_range_modes(workdir):
-    from mcp.server.fastmcp.exceptions import ToolError as FastMCPToolError
+    from mcp.server.mcpserver.exceptions import ToolError as SDKToolError
 
     from mcp_docs import server as docs_server
 
@@ -2116,10 +2133,11 @@ async def test_read_tool_rejects_mixed_range_modes(workdir):
     dest.write_bytes(path.read_bytes())
 
     tm = docs_server.mcp._tool_manager
-    with pytest.raises(FastMCPToolError, match="exclusif"):
+    with pytest.raises(SDKToolError, match="exclusif"):
         await tm.call_tool(
             "read",
             {"ref": "att-1", "session_id": "conv-1", "char_start": 0, "line_start": 1},
+            None,
         )
 
 
@@ -2388,6 +2406,7 @@ async def test_list_materializes_off_the_event_loop(workdir, tmp_path):
             return await tm.call_tool(
                 "list",
                 {"ref": "att-1", "session_id": "conv-thread", "content_b64": content_b64},
+                None,
             )
 
     call_task = asyncio.create_task(_call())

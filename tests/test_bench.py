@@ -18,7 +18,7 @@ from mcp_bench import server as bench_server
 async def test_echo_returns_input():
     with patch("asyncio.sleep", new=AsyncMock()):
         tm = bench_server.mcp._tool_manager
-        result = await tm.call_tool("echo", {"text": "bonjour"})
+        result = await tm.call_tool("echo", {"text": "bonjour"}, None)
     assert result == "bonjour"
 
 
@@ -26,7 +26,7 @@ async def test_echo_returns_input():
 async def test_add_returns_formatted_sum():
     with patch("asyncio.sleep", new=AsyncMock()):
         tm = bench_server.mcp._tool_manager
-        result = await tm.call_tool("add", {"a": 3.0, "b": 4.5})
+        result = await tm.call_tool("add", {"a": 3.0, "b": 4.5}, None)
     assert "3.0 + 4.5 = 7.5" in result
 
 
@@ -49,7 +49,7 @@ async def test_sleep_clamps_and_reports_actual_duration(asked, expected):
     sleep_mock = AsyncMock()
     with patch("asyncio.sleep", new=sleep_mock):
         tm = bench_server.mcp._tool_manager
-        result = await tm.call_tool("sleep", {"seconds": asked})
+        result = await tm.call_tool("sleep", {"seconds": asked}, None)
     sleep_mock.assert_awaited_once_with(expected)
     assert str(expected) in result
 
@@ -64,7 +64,7 @@ async def test_dns_lookup_success():
         "socket.getaddrinfo", return_value=mock_infos
     ):
         tm = bench_server.mcp._tool_manager
-        result = await tm.call_tool("dns_lookup", {"hostname": "example.com"})
+        result = await tm.call_tool("dns_lookup", {"hostname": "example.com"}, None)
     assert "example.com" in result
     assert "93.184.216.34" in result
 
@@ -75,7 +75,7 @@ async def test_dns_lookup_failure():
         "socket.getaddrinfo", side_effect=OSError("NXDOMAIN")
     ):
         tm = bench_server.mcp._tool_manager
-        result = await tm.call_tool("dns_lookup", {"hostname": "nope.invalid"})
+        result = await tm.call_tool("dns_lookup", {"hostname": "nope.invalid"}, None)
     assert "Échec" in result
 
 
@@ -85,7 +85,7 @@ async def test_reverse_dns_success():
         "socket.gethostbyaddr", return_value=("host.example.com", [], ["93.184.216.34"])
     ):
         tm = bench_server.mcp._tool_manager
-        result = await tm.call_tool("reverse_dns", {"ip": "93.184.216.34"})
+        result = await tm.call_tool("reverse_dns", {"ip": "93.184.216.34"}, None)
     assert "93.184.216.34" in result
     assert "host.example.com" in result
 
@@ -96,17 +96,17 @@ async def test_reverse_dns_failure():
         "socket.gethostbyaddr", side_effect=OSError("no PTR")
     ):
         tm = bench_server.mcp._tool_manager
-        result = await tm.call_tool("reverse_dns", {"ip": "10.0.0.1"})
+        result = await tm.call_tool("reverse_dns", {"ip": "10.0.0.1"}, None)
     assert "Échec" in result
 
 
 @pytest.mark.asyncio
 async def test_get_image_returns_image_object():
-    from mcp.server.fastmcp import Image
+    from mcp.server.mcpserver import Image
 
     with patch("asyncio.sleep", new=AsyncMock()):
         tm = bench_server.mcp._tool_manager
-        result = await tm.call_tool("get_image", {})
+        result = await tm.call_tool("get_image", {}, None)
     assert isinstance(result, Image)
     # Vérifie que le PNG commence par la signature PNG
     assert result.data is not None
@@ -122,9 +122,9 @@ async def test_get_json_resource_returns_embedded_resource():
 
     with patch("asyncio.sleep", new=AsyncMock()):
         tm = bench_server.mcp._tool_manager
-        result = await tm.call_tool("get_json_resource", {})
+        result = await tm.call_tool("get_json_resource", {}, None)
     assert isinstance(result, types.EmbeddedResource)
-    assert result.resource.mimeType == "application/json"
+    assert result.resource.mime_type == "application/json"
     data = json_mod.loads(result.resource.text)
     assert data["ok"] is True
     assert data["items"] == [1, 2, 3]

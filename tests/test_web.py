@@ -34,9 +34,9 @@ async def _fetch_url(args: dict):
     """fetch_url rend un CallToolResult (pour porter son `_meta`) : on en
     extrait le bloc unique, pour que les tests de contenu restent lisibles —
     l'EmbeddedResource tel quel, ou le texte d'une erreur."""
-    result = await _TM.call_tool("fetch_url", args)
+    result = await _TM.call_tool("fetch_url", args, None)
     assert isinstance(result, types.CallToolResult)
-    assert result.isError is False
+    assert result.is_error is False
     assert len(result.content) == 1
     block = result.content[0]
     if isinstance(block, types.TextContent):
@@ -74,7 +74,7 @@ async def test_fetch_html_returns_text_resource():
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         result = await _fetch_url({"url": "http://example.com"})
     assert isinstance(result, types.EmbeddedResource)
-    assert result.resource.mimeType == "text/plain"
+    assert result.resource.mime_type == "text/plain"
     assert "Hello world" in result.resource.text
 
 
@@ -95,7 +95,7 @@ async def test_fetch_text_plain_returns_raw():
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         result = await _fetch_url({"url": "http://example.com/data.txt"})
     assert isinstance(result, types.EmbeddedResource)
-    assert result.resource.mimeType == "text/plain"
+    assert result.resource.mime_type == "text/plain"
     assert "texte brut ici" in result.resource.text
 
 
@@ -107,7 +107,7 @@ async def test_fetch_json_preserves_mime():
         result = await _fetch_url({"url": "http://api.example.com/data"})
     assert isinstance(result, types.EmbeddedResource)
     assert isinstance(result.resource, types.TextResourceContents)
-    assert result.resource.mimeType == "application/json"
+    assert result.resource.mime_type == "application/json"
     assert '{"ok": true}' in result.resource.text
 
 
@@ -118,7 +118,7 @@ async def test_fetch_json_suffix_mime_returns_text():
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         result = await _fetch_url({"url": "http://api.example.com/vnd"})
     assert isinstance(result.resource, types.TextResourceContents)
-    assert result.resource.mimeType == "application/vnd.api+json"
+    assert result.resource.mime_type == "application/vnd.api+json"
     assert '{"data": []}' in result.resource.text
 
 
@@ -129,7 +129,7 @@ async def test_fetch_xml_returns_text():
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         result = await _fetch_url({"url": "http://example.com/data.xml"})
     assert isinstance(result.resource, types.TextResourceContents)
-    assert result.resource.mimeType == "application/xml"
+    assert result.resource.mime_type == "application/xml"
     assert "<item>1</item>" in result.resource.text
 
 
@@ -140,7 +140,7 @@ async def test_fetch_svg_xml_suffix_returns_text_not_blob():
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         result = await _fetch_url({"url": "http://example.com/icon.svg"})
     assert isinstance(result.resource, types.TextResourceContents)
-    assert result.resource.mimeType == "image/svg+xml"
+    assert result.resource.mime_type == "image/svg+xml"
     assert "<circle" in result.resource.text
 
 
@@ -169,7 +169,7 @@ async def test_fetch_binary_returns_blob():
         result = await _fetch_url({"url": "http://example.com/image.png"})
     assert isinstance(result, types.EmbeddedResource)
     assert isinstance(result.resource, types.BlobResourceContents)
-    assert result.resource.mimeType == "image/png"
+    assert result.resource.mime_type == "image/png"
     assert base64.b64decode(result.resource.blob) == body
 
 
@@ -278,7 +278,7 @@ async def test_fetch_resource_gzipped_blob_is_decompressed():
     payload = b"\x89PNG\r\n\x1a\n" + b"fake image bytes"
     mock_resp = _make_mock_resp(gzip.compress(payload), "image/png", "gzip")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("fetch_resource", {"url": "http://example.com/i.png"})
+        result = await _TM.call_tool("fetch_resource", {"url": "http://example.com/i.png"}, None)
     blob = next(b for b in result if isinstance(b, types.EmbeddedResource))
     assert base64.b64decode(blob.resource.blob) == payload
 
@@ -303,7 +303,7 @@ async def test_http_error_response_is_closed(tool):
     body = io.BytesIO(b"page d'erreur")
     err = urllib.error.HTTPError("http://example.com", 404, "Not Found", {}, body)
     with patch("urllib.request.OpenerDirector.open", side_effect=err):
-        await _TM.call_tool(tool, {"url": "http://example.com/missing"})
+        await _TM.call_tool(tool, {"url": "http://example.com/missing"}, None)
     assert body.closed
 
 
@@ -345,7 +345,7 @@ async def test_fetch_read_paginates_cached_content(monkeypatch):
         await _fetch_url({"url": "http://example.com/paged"})
 
     result = await _TM.call_tool(
-        "fetch_read", {"url": "http://example.com/paged", "char_start": 10}
+        "fetch_read", {"url": "http://example.com/paged", "char_start": 10}, None
     )
     assert result.startswith("ABCDEFGHIJ")
     assert "fetch_read" not in result  # dernière page, pas de notice de suite
@@ -362,6 +362,7 @@ async def test_fetch_read_caps_output_even_with_large_char_end(monkeypatch):
     result = await _TM.call_tool(
         "fetch_read",
         {"url": "http://example.com/verybig", "char_start": 0, "char_end": 30},
+        None,
     )
     assert result.startswith("0123456789")
     assert len(result.split("\n\n[")[0]) == 10  # extrait borné au cap, pas aux 30 demandés
@@ -370,7 +371,7 @@ async def test_fetch_read_caps_output_even_with_large_char_end(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fetch_read_unknown_url_returns_clear_message():
-    result = await _TM.call_tool("fetch_read", {"url": "http://never-fetched.example.com"})
+    result = await _TM.call_tool("fetch_read", {"url": "http://never-fetched.example.com"}, None)
     assert isinstance(result, str)
     assert "fetch_url" in result
 
@@ -383,7 +384,7 @@ async def test_fetch_read_rejects_invalid_range():
         await _fetch_url({"url": "http://example.com/small"})
 
     result = await _TM.call_tool(
-        "fetch_read", {"url": "http://example.com/small", "char_start": -1}
+        "fetch_read", {"url": "http://example.com/small", "char_start": -1}, None
     )
     assert "char_start" in result
 
@@ -405,7 +406,7 @@ async def test_fetch_list_extracts_headings_and_links():
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         await _fetch_url({"url": "http://example.com/page"})
 
-    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/page"})
+    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/page"}, None)
     assert "# Titre principal" in result
     assert "## Sous-section" in result
     assert "[Lien A](/a)" in result
@@ -420,7 +421,7 @@ async def test_fetch_list_paginates_and_caches_structure(monkeypatch):
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         await _fetch_url({"url": "http://example.com/paged-list"})
 
-    first = await _TM.call_tool("fetch_list", {"url": "http://example.com/paged-list"})
+    first = await _TM.call_tool("fetch_list", {"url": "http://example.com/paged-list"}, None)
     assert "entry_start=2" in first
 
     # Le second appel doit relire la structure déjà mise en cache sans reparser
@@ -431,7 +432,7 @@ async def test_fetch_list_paginates_and_caches_structure(monkeypatch):
 
     with patch.object(mcp_web, "extract_structure") as mock_extract:
         second = await _TM.call_tool(
-            "fetch_list", {"url": "http://example.com/paged-list", "entry_start": 2}
+            "fetch_list", {"url": "http://example.com/paged-list", "entry_start": 2}, None
         )
     mock_extract.assert_not_called()
     assert "Sous-section" in second or "Lien" in second
@@ -450,13 +451,13 @@ async def test_fetch_list_recovers_from_corrupted_structure_cache():
         "{not valid json", encoding="utf-8"
     )
 
-    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/corrupt-structure"})
+    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/corrupt-structure"}, None)
     assert "Titre principal" in result
 
 
 @pytest.mark.asyncio
 async def test_fetch_list_unknown_url_returns_clear_message():
-    result = await _TM.call_tool("fetch_list", {"url": "http://never-fetched.example.com"})
+    result = await _TM.call_tool("fetch_list", {"url": "http://never-fetched.example.com"}, None)
     assert isinstance(result, str)
     assert "fetch_url" in result
 
@@ -469,7 +470,7 @@ async def test_fetch_list_on_non_html_url_returns_distinct_message():
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         await _fetch_url({"url": "http://example.com/plain.txt"})
 
-    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/plain.txt"})
+    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/plain.txt"}, None)
     assert isinstance(result, str)
     assert "n'a pas renvoyé du HTML" in result
 
@@ -483,7 +484,7 @@ async def test_fetch_list_entry_start_beyond_total_returns_clear_message():
         await _fetch_url({"url": "http://example.com/oob-list"})
 
     result = await _TM.call_tool(
-        "fetch_list", {"url": "http://example.com/oob-list", "entry_start": 250}
+        "fetch_list", {"url": "http://example.com/oob-list", "entry_start": 250}, None
     )
     assert "hors bornes" in result
     assert "entre" not in result
@@ -496,7 +497,7 @@ async def test_fetch_list_rejects_invalid_range():
         await _fetch_url({"url": "http://example.com/small-list"})
 
     result = await _TM.call_tool(
-        "fetch_list", {"url": "http://example.com/small-list", "entry_start": -1}
+        "fetch_list", {"url": "http://example.com/small-list", "entry_start": -1}, None
     )
     assert "entry_start" in result
 
@@ -532,7 +533,7 @@ async def test_fetch_read_touches_html_and_structure_mtime(monkeypatch):
     mock_resp = _make_mock_resp(_STRUCTURED_HTML, "text/html; charset=utf-8")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         await _fetch_url({"url": "http://example.com/touch-all"})
-    await _TM.call_tool("fetch_list", {"url": "http://example.com/touch-all"})
+    await _TM.call_tool("fetch_list", {"url": "http://example.com/touch-all"}, None)
 
     old_time = time.time() - 1000
     for path in (
@@ -542,7 +543,7 @@ async def test_fetch_read_touches_html_and_structure_mtime(monkeypatch):
     ):
         os.utime(path, (old_time, old_time))
 
-    await _TM.call_tool("fetch_read", {"url": "http://example.com/touch-all"})
+    await _TM.call_tool("fetch_read", {"url": "http://example.com/touch-all"}, None)
 
     for path in (
         mcp_web_cache.html_path("http://example.com/touch-all"),
@@ -556,7 +557,7 @@ async def test_fetch_resource_binary_returns_two_blocks():
     body = b"%PDF-1.4 fake pdf bytes"
     mock_resp = _make_mock_resp(body, "application/pdf")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("fetch_resource", {"url": "http://example.com/doc.pdf"})
+        result = await _TM.call_tool("fetch_resource", {"url": "http://example.com/doc.pdf"}, None)
     assert isinstance(result, list)
     assert len(result) == 2
     text_block, resource_block = result
@@ -567,7 +568,7 @@ async def test_fetch_resource_binary_returns_two_blocks():
     assert "http://example.com/doc.pdf" in text_block.text
     assert isinstance(resource_block, types.EmbeddedResource)
     assert isinstance(resource_block.resource, types.BlobResourceContents)
-    assert resource_block.resource.mimeType == "application/pdf"
+    assert resource_block.resource.mime_type == "application/pdf"
     assert str(resource_block.resource.uri) == "http://example.com/doc.pdf"
     assert base64.b64decode(resource_block.resource.blob) == body
 
@@ -579,7 +580,7 @@ async def test_fetch_resource_large_json_stays_blob_not_text():
     body = ('{"items": [' + ",".join(str(i) for i in range(2000)) + "]}").encode()
     mock_resp = _make_mock_resp(body, "application/json")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("fetch_resource", {"url": "http://api.example.com/big.json"})
+        result = await _TM.call_tool("fetch_resource", {"url": "http://api.example.com/big.json"}, None)
     assert isinstance(result, list)
     resource_block = result[1]
     assert isinstance(resource_block.resource, types.BlobResourceContents)
@@ -593,7 +594,7 @@ async def test_fetch_resource_truncates_at_max_bytes():
     mock_resp = _make_mock_resp(body, "application/octet-stream")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         result = await _TM.call_tool(
-            "fetch_resource", {"url": "http://example.com/big.bin", "max_bytes": 10}
+            "fetch_resource", {"url": "http://example.com/big.bin", "max_bytes": 10}, None
         )
     text_block, resource_block = result
     decoded = base64.b64decode(resource_block.resource.blob)
@@ -609,15 +610,15 @@ async def test_fetch_resource_descriptor_is_kv_stable():
     body = b"stable content"
     mock_resp = _make_mock_resp(body, "text/csv")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result1 = await _TM.call_tool("fetch_resource", {"url": "http://example.com/data.csv"})
+        result1 = await _TM.call_tool("fetch_resource", {"url": "http://example.com/data.csv"}, None)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result2 = await _TM.call_tool("fetch_resource", {"url": "http://example.com/data.csv"})
+        result2 = await _TM.call_tool("fetch_resource", {"url": "http://example.com/data.csv"}, None)
     assert result1[0].text == result2[0].text
 
 
 @pytest.mark.asyncio
 async def test_fetch_resource_rejects_ftp_scheme():
-    result = await _TM.call_tool("fetch_resource", {"url": "ftp://example.com/file"})
+    result = await _TM.call_tool("fetch_resource", {"url": "ftp://example.com/file"}, None)
     assert isinstance(result, str)
     assert "schéma" in result.lower() or "autorisé" in result.lower()
 
@@ -625,7 +626,7 @@ async def test_fetch_resource_rejects_ftp_scheme():
 @pytest.mark.asyncio
 async def test_fetch_resource_rejects_non_positive_max_bytes():
     result = await _TM.call_tool(
-        "fetch_resource", {"url": "http://example.com/x", "max_bytes": 0}
+        "fetch_resource", {"url": "http://example.com/x", "max_bytes": 0}, None
     )
     assert isinstance(result, str)
     assert "max_bytes" in result
@@ -636,7 +637,7 @@ async def test_fetch_resource_url_error_returns_string():
     err = urllib.error.URLError("Connection refused")
     with patch("urllib.request.OpenerDirector.open", side_effect=err):
         result = await _TM.call_tool(
-            "fetch_resource", {"url": "http://unreachable.local/file"}
+            "fetch_resource", {"url": "http://unreachable.local/file"}, None
         )
     assert isinstance(result, str)
     assert "réseau" in result.lower() or "Connection refused" in result
@@ -657,7 +658,7 @@ async def test_fetch_resource_uses_resource_max_bytes_as_default():
     body = b"petit corps, largement sous le defaut"
     mock_resp = _make_mock_resp(body, "application/octet-stream")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("fetch_resource", {"url": "http://example.com/small.bin"})
+        result = await _TM.call_tool("fetch_resource", {"url": "http://example.com/small.bin"}, None)
     text_block, resource_block = result
     assert "Tronqué" not in text_block.text
     assert base64.b64decode(resource_block.resource.blob) == body
@@ -709,7 +710,7 @@ async def test_fetch_resource_clamps_max_bytes_above_resource_max():
     with patch("mcp_web._fetch_bytes", wraps=mcp_web._fetch_bytes) as spy, \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         await _TM.call_tool(
-            "fetch_resource", {"url": "http://example.com/huge.bin", "max_bytes": 10**12}
+            "fetch_resource", {"url": "http://example.com/huge.bin", "max_bytes": 10**12}, None
         )
     called_max_bytes = spy.call_args[0][1]
     assert called_max_bytes == mcp_web_cache.RESOURCE_MAX_BYTES
@@ -725,7 +726,7 @@ async def test_fetch_read_out_of_bounds_char_start_returns_notice():
         await _fetch_url({"url": "http://example.com/oob"})
 
     result = await _TM.call_tool(
-        "fetch_read", {"url": "http://example.com/oob", "char_start": 1000}
+        "fetch_read", {"url": "http://example.com/oob", "char_start": 1000}, None
     )
     assert result != ""
     assert "hors bornes" in result.lower()
@@ -740,14 +741,14 @@ async def test_fetch_list_reflects_new_html_after_refetch():
     mock_resp_1 = _make_mock_resp(first_html, "text/html; charset=utf-8")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_1):
         await _fetch_url({"url": "http://example.com/refetch"})
-    await _TM.call_tool("fetch_list", {"url": "http://example.com/refetch"})
+    await _TM.call_tool("fetch_list", {"url": "http://example.com/refetch"}, None)
 
     second_html = b"<html><body><h1>Nouveau titre</h1></body></html>"
     mock_resp_2 = _make_mock_resp(second_html, "text/html; charset=utf-8")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_2):
         await _fetch_url({"url": "http://example.com/refetch"})
 
-    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/refetch"})
+    result = await _TM.call_tool("fetch_list", {"url": "http://example.com/refetch"}, None)
     assert "Nouveau titre" in result
     assert "Ancien titre" not in result
 
@@ -761,17 +762,17 @@ async def test_fetch_list_stale_after_html_becomes_text(monkeypatch):
     mock_resp_html = _make_mock_resp(html, "text/html; charset=utf-8")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_html):
         await _fetch_url({"url": "http://example.com/switch"})
-    await _TM.call_tool("fetch_list", {"url": "http://example.com/switch"})
+    await _TM.call_tool("fetch_list", {"url": "http://example.com/switch"}, None)
 
     text_body = b"maintenant du texte brut"
     mock_resp_text = _make_mock_resp(text_body, "text/plain; charset=utf-8")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_text):
         await _fetch_url({"url": "http://example.com/switch"})
 
-    list_result = await _TM.call_tool("fetch_list", {"url": "http://example.com/switch"})
+    list_result = await _TM.call_tool("fetch_list", {"url": "http://example.com/switch"}, None)
     assert "n'a pas renvoyé du HTML" in list_result
 
-    read_result = await _TM.call_tool("fetch_read", {"url": "http://example.com/switch"})
+    read_result = await _TM.call_tool("fetch_read", {"url": "http://example.com/switch"}, None)
     assert "maintenant du texte brut" in read_result
 
 
@@ -784,18 +785,18 @@ async def test_fetch_read_stale_after_html_becomes_binary():
     mock_resp_html = _make_mock_resp(html, "text/html; charset=utf-8")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_html):
         await _fetch_url({"url": "http://example.com/to-binary"})
-    await _TM.call_tool("fetch_list", {"url": "http://example.com/to-binary"})
+    await _TM.call_tool("fetch_list", {"url": "http://example.com/to-binary"}, None)
 
     binary_body = bytes(range(256))
     mock_resp_bin = _make_mock_resp(binary_body, "image/png")
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp_bin):
         await _fetch_url({"url": "http://example.com/to-binary"})
 
-    read_result = await _TM.call_tool("fetch_read", {"url": "http://example.com/to-binary"})
+    read_result = await _TM.call_tool("fetch_read", {"url": "http://example.com/to-binary"}, None)
     assert isinstance(read_result, str)
     assert "fetch_url" in read_result  # message de cache absent/expiré
 
-    list_result = await _TM.call_tool("fetch_list", {"url": "http://example.com/to-binary"})
+    list_result = await _TM.call_tool("fetch_list", {"url": "http://example.com/to-binary"}, None)
     assert "fetch_url" in list_result
 
 
@@ -840,5 +841,5 @@ async def test_fetch_url_renders_html_off_the_event_loop():
 
     result = await call_task
     assert isinstance(result, types.EmbeddedResource)
-    assert result.resource.mimeType == "text/plain"
+    assert result.resource.mime_type == "text/plain"
     assert "Hello world" in result.resource.text

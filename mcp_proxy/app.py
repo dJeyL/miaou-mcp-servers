@@ -44,10 +44,20 @@ def build_app(
     """
     from contextlib import asynccontextmanager
 
+    # Plafond de corps et expiration des sessions : mêmes valeurs que les
+    # serveurs autonomes (mcp_base), et pour les mêmes raisons — le SDK 2.x
+    # refuserait sinon en 413 tout document de plus de 3 Mo environ envoyé en
+    # `content_b64`, et tuerait une session restée 30 min sans requête.
+    # `security_settings` reste absent : None vaut, dans le manager, protection
+    # DNS-rebinding DÉSACTIVÉE (l'`Origin: null` de MIAOU en file:// passe).
+    from mcp_base import MAX_REQUEST_BODY_BYTES, SESSION_IDLE_TIMEOUT_S
+
     session_manager = StreamableHTTPSessionManager(
         app=mcp_server,
         event_store=None,
         json_response=False,
+        max_request_body_size=MAX_REQUEST_BODY_BYTES,
+        session_idle_timeout=SESSION_IDLE_TIMEOUT_S,
     )
 
     @asynccontextmanager
@@ -127,7 +137,7 @@ def build_app(
                     continue
                 started.append(upstream)
                 # Le nombre d'outils n'est connu qu'après start() : un upstream
-                # inprocess n'a pas encore son _tool_manager avant, et un stdio
+                # inprocess n'a pas encore son MCPServer avant, et un stdio
                 # n'a pas fait son handshake. Un upstream qui démarre mais dont
                 # list_tools() échoue ne doit pas empêcher le proxy de servir les
                 # autres — on le signale sans propager.
@@ -242,12 +252,19 @@ def build_app(
         # Ces routes restent PUBLIQUES : un client non authentifié doit pouvoir
         # les lire, c'est tout leur objet. Les envelopper dans l'auth ferme la
         # boucle — le client ne peut alors jamais apprendre où s'authentifier.
+        #
+        # Les URL partent en CHAÎNES, telles que la config les donne, et non en
+        # `AnyHttpUrl` construits ici : un `AnyHttpUrl` déjà construit est
+        # normalisé, et une URL sans chemin y gagne un slash final
+        # (`http://as` → `http://as/`). Or un client du SDK 2.x compare l'issuer
+        # de l'AS à `authorization_servers[0]` À L'OCTET PRÈS (RFC 8414 §3.3) :
+        # face à un AS qui se déclare sans slash, le slash ajouté ici fait
+        # échouer tout le parcours. Une chaîne, elle, est validée par le modèle
+        # (`url_preserve_empty_path`) sans être réécrite.
         routes.extend(
             create_protected_resource_routes(
-                resource_url=AnyHttpUrl(auth["resource_url"]),
-                authorization_servers=[
-                    AnyHttpUrl(u) for u in auth["authorization_servers"]
-                ],
+                resource_url=auth["resource_url"],
+                authorization_servers=list(auth["authorization_servers"]),
                 scopes_supported=auth.get("scopes_supported"),
                 resource_name="miaou-proxy",
             )

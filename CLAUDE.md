@@ -46,6 +46,8 @@ miaou-mcp-servers/
 ├── tests/
 │   ├── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
 │   ├── live_auth_probe.py  # ce qu'un upstream répond SANS jeton (non collecté)
+│   ├── live_discovery_probe.py  # ce que la découverte OAuth du SDK 2.x conclurait (non collecté)
+│   ├── proxy_client.py   # harnais : parler au Server du proxy en JSON-RPC legacy (non collecté)
 │   ├── test_base.py
 │   ├── test_bench.py
 │   ├── test_weather.py
@@ -160,7 +162,11 @@ Deux points à ne pas toucher sans bonne raison :
 
 - **`enable_dns_rebinding_protection=False`** : MIAOU peut être servi en `file://`
   (ouverture directe de `dist/miaou.html`), qui envoie `Origin: null`. Le SDK MCP
-  renverrait 403 avant même la couche CORS si la protection est active.
+  renverrait 403 avant même la couche CORS si la protection est active. Depuis le
+  SDK 2.x, le réglage se passe à `streamable_http_app()` (`_make_app`), plus au
+  constructeur — et l'omettre RÉACTIVE la protection, l'hôte par défaut étant
+  `127.0.0.1` (mesuré : 403). Le proxy, lui, laisse `security_settings` à `None`
+  dans son gestionnaire de sessions, ce qui la désactive.
 
 - **`expose_headers=["Mcp-Session-Id"]`** dans le middleware CORS : MIAOU lit ce
   header après `initialize` pour maintenir la session. Sans lui, le navigateur masque
@@ -199,9 +205,10 @@ pytest tests/
 uv ci-dessus s'appuient dessus, la commande canonique n'a juste pas besoin du lock.
 
 Ce que chaque suite mocke (et pourquoi aucun test ne fait d'appel réseau réel), plus
-les deux bancs manuels — `tests/live_call.py`, qui parle le vrai transport
-streamable-http, et `tests/live_auth_probe.py`, qui mesure ce qu'un upstream
-répond sans jeton : `docs/tests.md`.
+les bancs manuels — `tests/live_call.py`, qui parle le vrai transport
+streamable-http, `tests/live_auth_probe.py`, qui mesure ce qu'un upstream
+répond sans jeton, et `tests/live_discovery_probe.py`, qui rejoue la découverte
+OAuth du SDK 2.x : `docs/tests.md`.
 
 ## Posture sécurité
 
@@ -217,8 +224,16 @@ l'octet près. Détail : `docs/auth.md`.
 ## Ajouter un outil
 
 Décorer une fonction avec `@self.mcp.tool()` dans le `__init__` du serveur concerné.
-FastMCP génère le schéma JSON automatiquement depuis la signature Python et la docstring.
-Aucune déclaration manuelle dans un registre.
+`MCPServer` (SDK MCP 2.x, ex-`FastMCP`) génère le schéma JSON automatiquement depuis la
+signature Python et la docstring. Aucune déclaration manuelle dans un registre.
+
+**Un refus adressé au modèle se lève en `ToolError` du SDK**
+(`mcp.server.mcpserver.exceptions`, ou une sous-classe — celle de `mcp_docs` en est
+une). En 2.x, `MCPServer` ne transmet le texte d'une exception d'outil QUE pour celle-là :
+toute autre exception est traitée en plantage et rendue en « Error executing tool <nom> »
+nu, sans un mot du motif — en silence, puisque l'appel reste un `isError` ordinaire. Une
+`MCPError` levée par un outil sort, elle, en erreur JSON-RPC (`data` intact) : c'est le
+canal d'un contrat machine comme REF_UNKNOWN, jamais d'un refus que le modèle doit lire.
 
 La docstring ne documente que l'outil dans son ensemble (clé `description` du schéma
 `tools/list`) — un paramètre nu (`text: str`) n'a jamais de clé `description` dans son
@@ -308,7 +323,13 @@ lots — piège déjà payé côté MIAOU.
   trois chemins d'application, le format de `config.json`, le pattern
   `build(config)` pour plusieurs instances d'un même module, ce que `call_tool`
   relaie d'un upstream stdio/http (`relay_call_result` : `content`, `isError`,
-  `_meta`, pas `structuredContent`), et
+  `_meta`, pas `structuredContent`), ce qu'il rend en erreur depuis le SDK 2.x
+  (`isError` + `str(e)` comme en 1.x, sauf les deux contrats en `MCPError` :
+  AUTHORIZATION_REQUIRED, et une `MCPError` d'upstream INPROCESS), les schémas
+  d'entrée complétés par `_object_schema` (un seul outil sans `type: object`
+  ferait rejeter tout `tools/list`), le gestionnaire de sessions
+  (`MAX_REQUEST_BODY_BYTES`, `SESSION_IDLE_TIMEOUT_S`), le client httpx2 de
+  `HttpUpstream._build_http_client` sur lequel portent les tests `trust_env`, et
   `aggregate_instructions` (consigne de portée serveur : les trois captures par type
   d'upstream, la section titrée par le préfixe d'outil, l'écriture différée après
   `start()`, le préambule non préfixé que le client re-préfixant doit réécrire).
@@ -324,9 +345,15 @@ lots — piège déjà payé côté MIAOU.
   l'attente sur événement de `/authorize/{name}`, `_provoke_refusal` qui déroule
   la séquence jusqu'à `tools/call` (seul refusé sur un déploiement
   d'entreprise), `--debug-auth`, son masquage et la LISTE de loggers qui doit
-  couvrir l'après-boot (`mcp.client.streamable_http`, pas seulement `httpx` ;
-  nommer un logger muet est silencieux), `HttpUpstream` et la contrainte
-  anyio des cancel scopes). Renouvellement (AB-3 : le refresh du SDK est passif et
+  couvrir l'après-boot (`mcp.client.streamable_http`, et `httpx2` depuis le
+  SDK 2.x ; nommer un logger muet est silencieux), le filtre qui écarte du
+  journal du SDK le refus VOLONTAIRE de `_on_redirect` (`_ExpectedRefusalFilter`),
+  `HttpUpstream` et la contrainte anyio des cancel scopes). Durcissements du SDK
+  2.x, éprouvés contre `dev_auth_server.py` seulement : `iss` (RFC 9207) relayé
+  par `/callback` et comparé à l'issuer effectif — d'où `auth.issuer` à déclarer
+  sur un realm —, issuer d'AS comparé à l'octet près (et la PRM construite depuis
+  les chaînes de la config, sans le slash qu'ajoutait `AnyHttpUrl`),
+  `offline_access` + `prompt=consent`, PRM en 5xx fatale. Renouvellement (AB-3 : le refresh du SDK est passif et
   vise `<hôte-du-serveur-MCP>/token` quand la découverte échoue — d'où
   `build_oauth_metadata_override` et les endpoints déclarés ENSEMBLE en config —,
   `refresh_if_due` et la boucle du lifespan qui couvre l'INACTIVITÉ, tentative au
@@ -344,23 +371,30 @@ lots — piège déjà payé côté MIAOU.
   connaître son slug), le `_meta` d'un résultat `tools/call` adressé au client
   (`miaou/web`, premier usage), et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
   `ref`+`content_b64`, `session_id`, idempotence de la matérialisation, REF_UNKNOWN
-  et son rejeu qui ne marche que derrière le proxy, formats de `ref` acceptés).
+  levée en `MCPError` par l'outil et donc rejouable en autonome comme derrière le
+  proxy, taille d'un `content_b64` et `MAX_REQUEST_BODY_BYTES` couplé au plafond
+  de MIAOU, sessions jamais expirées d'inactivité, formats de `ref` acceptés).
 - **`docs/tls.md`** — `enable_system_trust_store()` : pourquoi une AC d'entreprise
   interne échoue en `CERTIFICATE_VERIFY_FAILED` alors que le navigateur l'accepte,
   l'injection `truststore` qui remplace la classe `ssl.SSLContext`, les trois points
   d'appel (l'ordre contractuel dans `mcp_proxy.main()`, la copie assumée dans
-  `tests/live_call.py`), le best-effort assumé.
+  `tests/live_call.py`), le best-effort assumé, et httpx2 (SDK 2.x) qui consulte le
+  magasin système de lui-même — l'injection ne sert plus qu'à urllib.
 - **`docs/tests.md`** — ce que chaque suite mocke (aucun appel réseau réel, aucune
-  clef requise), l'isolation filesystem par `tmp_path`, les deux pièges de fixture
+  clef requise), le harnais `tests/proxy_client.py` (`Client(mode="legacy")`, le
+  chemin JSON-RPC de MIAOU, jamais le mode par défaut), les patchs qui visent
+  `httpx2` et non plus `httpx`, l'isolation filesystem par `tmp_path`, les deux pièges de fixture
   du mock de réponse de `test_web.py` (queue de remplissage compressible, garde
   verte des deux côtés), l'opener qui route par URL de `test_web_pagemeta.py`
   (favicon, sonde unique par origine) et le cache de favicons vidé en fixture,
-  et les deux bancs manuels
+  et les bancs manuels
   non collectés : `tests/live_call.py`, qui parle le vrai transport
   streamable-http comme MIAOU (`-H/--header`, truststore, affiche le `_meta`), et
   `tests/live_auth_probe.py`, qui mesure ce qu'un upstream répond SANS jeton
   (séquence complète avec `Mcp-Session-Id`, `--tool`/`--args`, et le filtre
-  `_looks_mutating` qui interdit d'appeler un outil d'écriture pour sonder).
+  `_looks_mutating` qui interdit d'appeler un outil d'écriture pour sonder), et
+  `tests/live_discovery_probe.py`, qui rejoue la découverte OAuth du SDK 2.x avec
+  ses propres fonctions (version épinglée) et rend un verdict par durcissement.
 
 ## Règle d'or
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "html2text", "truststore"]
+# dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "html2text", "truststore"]
 # ///
 """
 Serveur MCP fetch pour MIAOU.
@@ -35,7 +35,7 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
 Module éclaté en package (servers/mcp_web/) : cache.py (cache disque par checksum
 d'URL), structure.py (extraction stdlib html.parser des headings/liens), pagemeta.py
 (métadonnées de page et favicon du `_meta` de fetch_url). Ce fichier
-ne porte que le serveur FastMCP et ses outils.
+ne porte que le serveur MCP et ses outils.
 
 Lancement (package, pas un script plat — `uv run servers/mcp_web.py` ne s'applique
 pas ici, cd dans servers/ ou utiliser --directory) :
@@ -318,7 +318,7 @@ class WebServer(MiaouMCPBase):
                 ),
             ] = _DEFAULT_MAX_BYTES,
         ) -> types.CallToolResult:
-            # Retour CallToolResult, seule forme par laquelle FastMCP laisse un
+            # Retour CallToolResult, seule forme par laquelle MCPServer laisse un
             # outil poser le `_meta` de son résultat. Effet de bord assumé :
             # plus d'outputSchema ni de structuredContent, qui recopiait le
             # contenu entier sur le fil (et que le proxy ne publie pas).

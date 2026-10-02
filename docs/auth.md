@@ -149,7 +149,7 @@ détient **à la place de MIAOU** (qui tourne en `file://` et ne peut pas être 
 client OAuth : pas de redirect URI, refresh tokens en `localStorage`, refresh
 concurrents multi-onglets). Les deux cohabitent sans se connaître.
 
-Le parcours lui-même vient du SDK (`OAuthClientProvider`, un `httpx.Auth` :
+Le parcours lui-même vient du SDK (`OAuthClientProvider`, un `httpx2.Auth` :
 découverte, DCR, PKCE S256, échange de code, refresh). Ce qui est à nous est le
 **stockage**, parce qu'il touche au disque et aux secrets — `UpstreamTokenStorage`
 implémente le protocol `mcp.client.auth.TokenStorage`.
@@ -211,7 +211,7 @@ fait. On annonçait alors « autorisation accordée » alors qu'aucun jeton n'é
 ni fichier de jetons, ni trace réseau, pour une page qui disait le contraire).
 
 `authorize()` émet donc une requête à elle sur l'URL de l'upstream, à travers un
-client httpx portant le provider en `auth`. Le 401 fait dérouler au SDK son
+client httpx2 portant le provider en `auth`. Le 401 fait dérouler au SDK son
 chemin **nominal** — découverte des métadonnées, enregistrement si besoin,
 redirection, échange du code, écriture du jeton. Rien n'est réimplémenté :
 mener le flow à la main dupliquerait la moitié du SDK, et deux chemins
@@ -293,7 +293,7 @@ Trois issues, par coût croissant, et **aucune n'est du code** :
 ## Le renouvellement du jeton (lot AB-3)
 
 Le refresh est **entièrement passif, et c'est le SDK qui le fait**.
-`OAuthClientProvider` étant un `httpx.Auth`, httpx l'invoque sur chaque requête
+`OAuthClientProvider` étant un `httpx2.Auth`, httpx2 l'invoque sur chaque requête
 sortante du transport ; en tête d'`async_auth_flow`, s'il voit un jeton expiré et
 un refresh possible, il intercale lui-même un POST au token endpoint, met à jour
 le jeton, l'écrit par `set_tokens()`, et laisse partir l'appel avec le nouveau
@@ -326,11 +326,41 @@ D'où `auth.authorization_endpoint` + `auth.token_endpoint` en config
 à la construction. **Les deux ou rien** : un token endpoint seul laisserait le
 parcours initial rediriger vers un AS découvert et rafraîchir auprès d'un autre —
 deux AS pour une même identité est un mode de panne pire que l'absence de
-configuration. `issuer` est dérivé de l'authorization endpoint s'il n'est pas
-donné : le modèle l'exige, le SDK ne s'en sert pas ici.
+configuration. `issuer` est dérivé de l'authorization endpoint (son origine) s'il
+n'est pas donné — et **en 2.x il sert** : voir ci-dessous.
 
 Une découverte qui aboutit écrase ces valeurs, et c'est voulu : des métadonnées
 fraîches valent mieux que des déclarées. Un échec, lui, ne les efface pas.
+
+### Ce que le SDK 2.x durcit, et qu'aucun AS réel n'a encore éprouvé
+
+Le parcours reste celui du SDK, mais la 2.x le resserre sur des points qui
+dépendent de ce que publie l'autre bout. Éprouvé de bout en bout contre
+`dev_auth_server.py` (deux proxys, `--auto-approve`), jamais contre un AS
+d'entreprise :
+
+- **`iss` de la redirection (RFC 9207).** Le SDK le compare à l'`issuer` des
+  métadonnées effectives — découvertes, ou à défaut celles de l'override. La
+  route `/callback` le relaie (`PendingAuthorization.resolve(..., iss)`), sans
+  quoi un AS qui annonce le paramètre ferait échouer le parcours. Conséquence
+  pour l'override : un `issuer` DÉRIVÉ (`https://hôte`) diffère du vrai issuer
+  d'un realm (`https://hôte/realms/r`), et un AS qui renvoie `iss` fait alors
+  échouer l'autorisation. Remède : déclarer `auth.issuer`.
+- **`issuer` des métadonnées d'AS**, comparé à l'octet près (slash final
+  compris) à `authorization_servers[0]` de la PRM ; aucun contournement côté
+  client. Le proxy lui-même publiait un slash ajouté par la normalisation
+  d'`AnyHttpUrl`, refusé par un client 2.x face à un AS déclaré sans : la PRM
+  est désormais construite depuis les chaînes de la config (`build_app`).
+- **`offline_access` + `prompt=consent`**, ajoutés d'office si l'AS découvert
+  annonce `offline_access` et que `grant_types` contient `refresh_token` (notre
+  cas). Effet possible : écran de consentement à chaque autorisation, ou
+  `invalid_scope`. Aucun réglage intermédiaire dans le SDK.
+- **PRM en 5xx ou 429** : `OAuthFlowError`, là où la 1.x passait au candidat
+  suivant.
+
+`tests/live_discovery_probe.py` rejoue cette découverte contre un upstream réel,
+sans jeton, avec les fonctions du SDK épinglé, et rend un verdict par point
+(`docs/tests.md`).
 
 ### Passif ne suffit pas : l'inactivité
 
@@ -480,21 +510,33 @@ version : `("mcp.client.auth", "httpx")` — on voyait les URL d'AS essayées au
 démarrage puis plus rien, alors que le mode reste actif (relevé le 2026-09-08).
 Deux causes, mesurées :
 
-- **`mcp.client.auth` n'émet rien** dans le SDK installé : ni `getLogger`, ni
+- **`mcp.client.auth` n'émettait rien** dans le SDK 1.x : ni `getLogger`, ni
   appel `logger.*` dans le module. Tout ce qu'on voyait venait de `httpx`.
   Nommer un logger inexistant est **silencieux**, d'où une liste qui paraissait
-  correcte.
+  correcte. (En 2.x, `mcp.client.auth.oauth2` journalise, et le nom du parent le
+  couvre.)
 - Le trafic d'**après** le boot passe par `mcp.client.streamable_http` — le
   transport des upstreams HTTP : connexion, session, envoi de messages,
   reconnexions SSE — qui journalise sous **son** nom et n'était pas couvert.
 
-Deux pièges de nommage, vérifiés à la source plutôt que devinés :
-`mcp.client.session` journalise sous `"client"` (pas sous son nom de module), et
-`mcp.shared.session` appelle `logging.*` au niveau module — donc le **root
-logger**, hors de portée d'une liste nommée. `httpx`, enfin, journalise ses
+Liste actuelle, revérifiée à la source du SDK 2.2.0 : `mcp.client.auth`,
+`mcp.client.streamable_http`, `"client"` (`mcp.client.session` journalise sous ce
+nom, pas sous son nom de module) et `httpx2`. Le client HTTP du SDK est `httpx2`
+depuis la 2.x : l'ancien nom `httpx` ne lèverait rien et ne montrerait plus
+aucune requête — exactement le piège du logger muet. `httpx2` journalise ses
 requêtes en **INFO**, pas en DEBUG : d'où un niveau posé sur chaque logger plutôt
-qu'un filtrage par sévérité. `httpcore` reste volontairement **absent** — ses
+qu'un filtrage par sévérité. `httpcore2` reste volontairement **absent** — ses
 lignes ne portent ni URL ni en-tête, elles noient le journal sans rien apprendre.
+
+**Le refus volontaire n'est pas une panne.** Le SDK 2.x journalise en ERROR, avec
+traceback complet (« OAuth flow error »), toute exception de son parcours — y
+compris l'`AuthorizationRequired` que `_on_redirect` lève à dessein pour refuser
+un parcours que personne n'a demandé (démarrage, appel d'outil, renouvellement de
+fond). La 1.x se taisait. Sans parade, chaque démarrage d'un upstream non autorisé
+imprimait une pile d'appel qui ressemble à une panne, pour un état normal que le
+proxy annonce déjà en une ligne. `_ExpectedRefusalFilter`, posé une fois sur
+`mcp.client.auth.oauth2` par `build_upstream_authorizers`, écarte CETTE exception
+et elle seule ; sous `--debug-auth`, il n'écarte rien.
 
 Les tests vérifient les noms **contre la source des modules du SDK**, jamais
 contre une liste recopiée : recopier reproduirait exactement l'erreur à attraper.
@@ -679,15 +721,12 @@ URL absolue : cf. « Où l'on autorise » ci-dessous. Le nom du champ est conser
 malgré le changement de forme — c'est le contrat publié, le renommer casserait
 davantage.
 
-Détail d'implémentation non négociable, trouvé à l'exécution : le refus est levé
-comme exception par le handler d'outil, mais le SDK pose un `except Exception`
-**à l'intérieur** du handler qu'on enveloppe. Aucun wrapper externe ne peut donc
-l'intercepter. Le refus voyage par un **sentinel interne** dans le texte du
-résultat (`_AUTHORIZATION_SENTINEL`, retiré avant que le message n'atteigne le
-client), que `_wrap_authorization_required` reconnaît — même mécanique que
-`_wrap_ref_unknown_sentinel`. Les deux wrappers restent **séparés** : l'un
-inspecte un résultat après exécution, l'autre un refus posé avant tout appel ;
-les fondre imposerait un mécanisme qui fait les deux mal.
+Mécanique : `UpstreamNotAuthorized` est une `MCPError`, levée telle quelle par
+`handle_call_tool` ; le `Server` bas niveau du SDK 2.x la rend en erreur
+JSON-RPC, `code`/`message`/`data` intacts. (En 1.x, le SDK avalait toute
+exception d'outil en `isError` : le refus voyageait par un sentinel dans le
+texte du résultat, repêché par un wrapper qui remplaçait le handler enregistré.
+Sentinel et wrapper ont disparu avec la migration, cf. `docs/proxy.md`.)
 
 ## Où l'on autorise, et à qui on le dit (lot AB-4)
 
@@ -762,7 +801,7 @@ Il n'est exposé que si l'auth sortante est configurée.
 ## `HttpUpstream` : le transport vit dans sa propre tâche
 
 Contrainte anyio, payée trois fois avant d'être comprise. Les contextes
-asynchrones du SDK (`streamablehttp_client`, `ClientSession`) portent des cancel
+asynchrones du SDK (`streamable_http_client`, `ClientSession`) portent des cancel
 scopes qu'anyio **interdit** d'ouvrir dans une tâche et de refermer dans une
 autre. Une `AsyncExitStack` ouverte par `start()` et refermée par `stop()` fait
 exactement ce croisement dès que les deux ne tournent pas dans la même tâche —

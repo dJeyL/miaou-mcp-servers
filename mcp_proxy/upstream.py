@@ -57,7 +57,7 @@ def relay_call_result(call_result: types.CallToolResult) -> types.CallToolResult
     été peuplé par l'alias (même remarque que pour `tools/list`)."""
     fields: dict[str, Any] = {
         "content": list(call_result.content),
-        "isError": bool(call_result.isError),
+        "is_error": bool(call_result.is_error),
     }
     if call_result.meta:
         fields["_meta"] = dict(call_result.meta)
@@ -65,7 +65,7 @@ def relay_call_result(call_result: types.CallToolResult) -> types.CallToolResult
 
 
 class InProcessUpstream(Upstream):
-    """Appelle un FastMCP dans le même processus Python, sans subprocess."""
+    """Appelle un MCPServer dans le même processus Python, sans subprocess."""
 
     def __init__(
         self,
@@ -76,12 +76,7 @@ class InProcessUpstream(Upstream):
         self._module_name = module_name
         self._env = env
         self._config = config
-        self._tool_manager: Any = None
-        # Renseigné au start() si le module upstream expose le contrat
-        # REF_UNKNOWN (cf. _ref_unknown_contract / _wrap_ref_unknown_sentinel).
-        # Aucun import de mcp_docs ici : c'est le module réellement chargé, quel
-        # qu'il soit, qui déclare son sentinel — le proxy n'en connaît aucun.
-        self.ref_unknown_contract: tuple[str, Any] | None = None
+        self._server: Any = None
 
     async def start(self) -> None:
         if self._env:
@@ -90,65 +85,59 @@ class InProcessUpstream(Upstream):
                 os.environ.setdefault(key, value)
         already_imported = self._module_name in sys.modules
         module = importlib.import_module(self._module_name)
-        # Un module qui expose build(config) -> FastMCP supporte le multi-instance
-        # (plusieurs entrées config.json du même module, chacune avec sa propre
-        # config) : importlib.import_module ne recharge un module qu'une fois par
-        # process, donc tout état lu au niveau module (ou via env) serait figé à
-        # la première instanciation. Fallback sur le singleton module.mcp pour les
-        # serveurs existants, qui n'ont pas besoin de multi-instance.
+        # Un module qui expose build(config) -> MCPServer supporte le
+        # multi-instance (plusieurs entrées config.json du même module, chacune
+        # avec sa propre config) : importlib.import_module ne recharge un module
+        # qu'une fois par process, donc tout état lu au niveau module (ou via
+        # env) serait figé à la première instanciation. Fallback sur le
+        # singleton module.mcp pour les serveurs qui n'ont pas besoin de
+        # multi-instance.
         build_fn = getattr(module, "build", None)
         if build_fn is not None:
-            fastmcp = build_fn(self._config)
+            server = build_fn(self._config)
         else:
             if already_imported:
                 print(
                     f"Attention : module '{self._module_name}' réutilisé par plusieurs "
-                    f"entrées inprocess sans build(config) — même instance FastMCP "
+                    f"entrées inprocess sans build(config) — même instance MCPServer "
                     f"partagée (env figé au premier import).",
                     file=sys.stderr,
                 )
-            fastmcp = getattr(module, "mcp", None)
-        if fastmcp is None:
+            server = getattr(module, "mcp", None)
+        if server is None:
             raise RuntimeError(
-                f"Le module '{self._module_name}' n'expose ni 'build(config)' ni 'mcp' (FastMCP)."
+                f"Le module '{self._module_name}' n'expose ni 'build(config)' ni 'mcp' (MCPServer)."
             )
-        self._tool_manager = fastmcp._tool_manager
-        # Pas d'`initialize` sur ce chemin (on parle au FastMCP en direct, sans
-        # transport) : les instructions se lisent sur l'objet, là où les deux
-        # autres upstreams les reçoivent dans leur InitializeResult.
-        self.instructions = fastmcp.instructions
-
-        # PRX2 : lecture opportuniste du contrat REF_UNKNOWN sur le module qui
-        # vient d'être importé, au lieu d'un `from mcp_docs import ...` au niveau
-        # du wrapper — celui-ci forçait l'import de mcp_docs (et de pymupdf,
-        # python-docx, openpyxl, python-pptx, plus l'instanciation de
-        # DocsServer()) même sur un proxy configuré sans l'entrée docs.
-        sentinel = getattr(module, "REF_UNKNOWN_SENTINEL", None)
-        error_code = getattr(module, "REF_UNKNOWN_ERROR_CODE", None)
-        if sentinel is not None and error_code is not None:
-            self.ref_unknown_contract = (sentinel, error_code)
+        self._server = server
+        # Pas d'`initialize` sur ce chemin (on parle au MCPServer en direct,
+        # sans transport) : les instructions se lisent sur l'objet, là où les
+        # deux autres upstreams les reçoivent dans leur InitializeResult.
+        self.instructions = server.instructions
 
     async def stop(self) -> None:
         pass
 
     async def list_tools(self) -> list[types.Tool]:
-        tools = self._tool_manager.list_tools()
+        # Les trois champs que le proxy republie, et eux seuls : c'est la forme
+        # que les upstreams ont toujours eue ici.
         return [
             types.Tool(
                 name=t.name,
                 description=t.description,
-                inputSchema=t.parameters,
+                input_schema=t.input_schema,
             )
-            for t in tools
+            for t in await self._server.list_tools()
         ]
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any]
-    ) -> list[Any] | types.CallToolResult:
-        # Un outil qui rend lui-même un CallToolResult (fetch_url de mcp_web,
-        # pour poser son `_meta`) le voit rendu tel quel par convert_result, et
-        # le SDK du proxy le laisse traverser : rien à relayer à la main ici.
-        return await self._tool_manager.call_tool(name, arguments, convert_result=True)
+    ) -> types.CallToolResult:
+        # API publique : rend un CallToolResult (contenu converti, `_meta` d'un
+        # outil qui le pose — fetch_url de mcp_web —, données structurées),
+        # que le proxy laisse traverser tel quel. Une ToolError de l'outil
+        # remonte en exception, que handle_call_tool rend en isError ; une
+        # MCPError (REF_UNKNOWN) remonte telle quelle, et traverse.
+        return await self._server.call_tool(name, arguments)
 
 
 _STDIO_HANDSHAKE_TIMEOUT_S = 15
@@ -239,18 +228,18 @@ def _unwrap_exception_group(exc: BaseException) -> BaseException:
 class HttpUpstream(Upstream):
     """Serveur MCP distant, transport streamable-http.
 
-    `auth` est un httpx.Auth (None = aucune authentification) : c'est par ce
+    `auth` est un httpx2.Auth (None = aucune authentification) : c'est par ce
     seul paramètre que le client OAuth se branche, sans que cette classe ait à
     connaître OAuth.
 
     Le proxy réseau (--proxy/--noproxy) est honoré sans code ici : le client
-    httpx du SDK est construit avec le défaut trust_env=True, donc il lit les
+    httpx2 est construit avec le défaut trust_env=True, donc il lit les
     variables d'environnement du process, que main() a déjà posées avant
-    build_upstreams(). Attention, httpx lit AUSSI ALL_PROXY et NO_PROXY, que
+    build_upstreams(). Attention, httpx2 lit AUSSI ALL_PROXY et NO_PROXY, que
     _PROXY_ENV_KEYS ne gère pas — limite documentée dans docs/proxy.md.
 
     **Le transport vit dans SA propre tâche, du début à la fin.** Les contextes
-    asynchrones du SDK (streamablehttp_client, ClientSession) portent des cancel
+    asynchrones du SDK (streamable_http_client, ClientSession) portent des cancel
     scopes anyio, qu'anyio interdit d'ouvrir dans une tâche et de refermer dans
     une autre. Une AsyncExitStack ouverte par start() et refermée par stop()
     fait exactement ce croisement dès que les deux ne tournent pas dans la même
@@ -281,23 +270,40 @@ class HttpUpstream(Upstream):
         self._serving = False
         self._failure: BaseException | None = None
 
+    def _build_http_client(self) -> Any:
+        """Le client HTTP de la session amont — le SEUL que l'upstream emploie.
+
+        En-têtes, délais et auth se posent ici, sur le client, que le transport
+        du SDK 2.x ne construit plus lui-même dès qu'on lui en passe un. Le délai
+        de LECTURE est explicite : sans lui httpx2 retombe sur 5 s à plat, trop
+        court pour le flux GET long du transport — 300 s est la valeur que
+        l'ancien transport appliquait d'office.
+
+        `trust_env` reste au défaut (vrai) : c'est ce qui fait honorer
+        --proxy/--noproxy, posés dans os.environ par main(). Les tests portent
+        sur CE client, pas sur celui que le SDK construirait à notre place.
+        """
+        import httpx2
+
+        return httpx2.AsyncClient(
+            headers=self._headers,
+            timeout=httpx2.Timeout(self._timeout, read=300),
+            auth=self._auth,
+        )
+
     async def _serve(self) -> None:
         """Tourne pour toute la vie de l'upstream, dans une tâche à elle."""
         import anyio
 
         from mcp.client.session import ClientSession
-        from mcp.client.streamable_http import streamablehttp_client
+        from mcp.client.streamable_http import streamable_http_client
 
         try:
-            async with streamablehttp_client(
-                self._url,
-                headers=self._headers,
-                timeout=self._timeout,
-                auth=self._auth,
-            ) as streams:
-                # Triplet (read, write, get_session_id) ; le troisième ne sert
-                # pas ici, le proxy ne gère pas la session HTTP amont.
-                async with ClientSession(streams[0], streams[1]) as session:
+            http_client = self._build_http_client()
+            async with http_client, streamable_http_client(
+                self._url, http_client=http_client
+            ) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
                     result = await session.initialize()
                     self.instructions = result.instructions
                     self._session = session

@@ -32,6 +32,12 @@ Les noms exposés côté proxy dépendent des clés dans `config.json` (`mcpServ
 Blocs de résultat : `text` (D9), `image`/`resource` binaire (D8.1), `resource` texte (D8.2).
 Si `isError: true`, MIAOU marque l'ack en rouge dans le thread.
 
+La session ouverte par `initialize` ne s'expire pas d'inactivité :
+`SESSION_IDLE_TIMEOUT_S = None` (`servers/mcp_base.py`, repris par le proxy) neutralise
+les 30 min par défaut du SDK 2.x. MIAOU sait ré-initialiser une session tuée (un 404 sur
+un `Mcp-Session-Id` connu), mais ces serveurs tournent en local : on évite l'aller-retour
+de reconnexion après chaque pause.
+
 ### `_meta` d'un résultat `tools/call` (lot AI)
 
 Un résultat peut porter, à côté de `content`, un `_meta` adressé au **client** et jamais
@@ -87,24 +93,24 @@ mirror de `docs/mcp.md` §12 côté MIAOU, à tenir synchronisé si l'un des deu
 - **REF_UNKNOWN** : un `ref` inconnu sans `content_b64` doit produire une vraie **erreur
   JSON-RPC** avec `err.data.code === 'REF_UNKNOWN'` — le dispatcher la détecte et rejoue
   l'appel une fois avec le contenu inliné. Un `isError` textuel ne déclenche PAS le rejeu.
-  Mécanisme : l'outil lève `ToolError(f"{REF_UNKNOWN_SENTINEL}: ...")` (constante
-  `mcp_docs.REF_UNKNOWN_SENTINEL`) ; le proxy (`mcp_proxy._wrap_ref_unknown_sentinel`)
-  détecte ce sentinel dans le résultat `isError` (le SDK MCP avale toute exception de
-  l'outil en `CallToolResult(isError=True)`, y compris `McpError` — voir le commentaire
-  du post-wrapper dans `mcp_proxy/server.py`) et lève `McpError(data={'code': 'REF_UNKNOWN'})`,
-  que `_handle_request` du SDK convertit en erreur JSON-RPC. **Ce rejeu ne fonctionne que
-  derrière le proxy** : en standalone (FastMCP pur, port 8771 direct), l'appel échoue en
-  isError textuel sans déclencher le rejeu — documenté ici, pas une régression à corriger.
-  **Déclaration du contrat, côté serveur** : le proxy ne connaît aucun sentinel en propre
-  et n'importe pas `mcp_docs` — un upstream inprocess *déclare* le contrat en exposant
-  `REF_UNKNOWN_SENTINEL` (str) et `REF_UNKNOWN_ERROR_CODE` (int) au niveau module ;
-  `InProcessUpstream.start()` les lit par `getattr`, et le wrapper ne convertit le sentinel
-  que pour les outils routés vers un upstream qui les déclare. Conséquences : un proxy
-  configuré sans `docs` n'importe ni `mcp_docs` ni ses libs de parsing, et un message
-  d'erreur d'un autre serveur qui contiendrait « REF_UNKNOWN » n'est pas converti (le match
-  reste par sous-chaîne : FastMCP préfixe le message, il ne peut pas être ancré en tête).
-  Les upstreams **stdio** sont hors périmètre : le proxy ne peut pas lire de constante dans
-  un subprocess, un serveur stdio devrait lever l'erreur JSON-RPC lui-même.
+  Mécanisme : l'outil lève lui-même
+  `MCPError(REF_UNKNOWN_ERROR_CODE, "REF_UNKNOWN: …", data={"code": "REF_UNKNOWN"})`
+  (`mcp_docs/session.py`). Depuis le SDK MCP 2.x, une `MCPError` levée par un outil
+  traverse `MCPServer` en erreur JSON-RPC, `code`/`message`/`data` intacts — le rejeu
+  fonctionne donc **en autonome (port 8771 direct) comme derrière le proxy**. (En 1.x, le
+  SDK avalait toute exception d'outil en `isError` : il fallait un sentinel dans le texte
+  et un wrapper du proxy qui le repêchait, d'où un rejeu réservé au proxy. Les deux ont
+  disparu avec la migration.)
+  **Côté proxy** : `handle_call_tool` laisse traverser une `MCPError` venue d'un upstream
+  **inprocess** — c'est un refus voulu par l'outil. Celle d'un upstream **distant**
+  (stdio, http) est la réponse d'erreur de ce serveur-là, que le proxy aplatit en
+  `isError` textuel, comme il l'a toujours fait. Le proxy n'importe toujours pas
+  `mcp_docs` : un proxy configuré sans `docs` ne charge ni lui ni ses libs de parsing.
+- **Taille d'un `content_b64`** : le fichier ENTIER voyage en base64 dans les arguments,
+  jusqu'au plafond `MAX_INLINE_BYTES` de MIAOU (64 Mo, environ 85,4 Mo une fois encodé).
+  Le SDK 2.x refuse par défaut tout corps de requête au-delà de 4 Mio (413 avant tout
+  parsing) : serveurs autonomes et proxy le relèvent à `MAX_REQUEST_BODY_BYTES` (96 Mio,
+  `servers/mcp_base.py`). **Couplé à MIAOU** : si son plafond monte, celui-ci suit.
 - **Adressage de membres d'archive** : paramètre `path` séparé (pas de suffixe `ref#path`)
   — `ref` reste `att-N`, `path` adresse un membre déjà listé par `list`. Écart assumé par
   rapport au brief original : la syntaxe `ref#path` ne matche pas la regex ancrée

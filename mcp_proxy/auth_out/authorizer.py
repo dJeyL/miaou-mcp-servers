@@ -71,9 +71,13 @@ def build_oauth_metadata_override(auth: dict[str, Any] | None) -> Any:
     sans un mot, un `logger.warning` en DEBUG étant la seule trace.
 
     Déclarer les endpoints rend donc le rafraîchissement possible là où la
-    découverte ne peut pas aboutir. `issuer` n'a pas d'usage propre ici — le
-    SDK ne le vérifie pas — mais le modèle l'exige : on le dérive de
-    l'authorization endpoint quand il n'est pas donné.
+    découverte ne peut pas aboutir. `issuer` est dérivé de l'authorization
+    endpoint (son origine) quand il n'est pas donné — et depuis le SDK 2.x il
+    SERT : le paramètre `iss` de la redirection (RFC 9207) lui est comparé à
+    l'octet près. Sur un realm (`https://hôte/realms/r`), l'origine dérivée
+    diffère du vrai issuer : un AS qui renvoie `iss` fait alors échouer le
+    parcours, et c'est `auth.issuer` qu'il faut déclarer (cf. docs/auth.md et
+    tests/live_discovery_probe.py, qui recopie cette dérivation).
     """
     if not auth:
         return None
@@ -107,10 +111,11 @@ def build_oauth_metadata_override(auth: dict[str, Any] | None) -> Any:
 class PendingAuthorization:
     """Rendez-vous entre le navigateur (route /callback) et le parcours OAuth.
 
-    Le SDK attend un `callback_handler` qui BLOQUE puis rend `(code, state)`.
+    Le SDK attend un `callback_handler` qui BLOQUE puis rend un
+    `AuthorizationCodeResult` (code, state, et `iss` de la redirection).
     L'attente est bornée : sans borne, un upstream jamais autorisé retiendrait
-    indéfiniment la tâche qui l'attend. Le `timeout` d'OAuthContext ne couvre
-    pas ce handler — il est passé au client httpx, pas à notre attente — donc
+    indéfiniment la tâche qui l'attend. Le SDK ne borne rien de ce côté (son
+    ancien paramètre `timeout` n'a jamais rien borné, et la 2.x l'a retiré) :
     la borne est ici, explicitement.
 
     Le `state` n'est pas vérifié ici : le SDK le compare lui-même en
@@ -130,17 +135,29 @@ class PendingAuthorization:
         self._event = anyio.Event()
         self._code: str | None = None
         self._state: str | None = None
+        self._iss: str | None = None
         self._error: str | None = None
 
-    def resolve(self, code: str | None, state: str | None, error: str | None = None) -> None:
+    def resolve(
+        self,
+        code: str | None,
+        state: str | None,
+        error: str | None = None,
+        iss: str | None = None,
+    ) -> None:
         """Appelée depuis la route /callback. Idempotente : un rechargement de
-        l'onglet ne doit pas écraser un résultat déjà reçu."""
+        l'onglet ne doit pas écraser un résultat déjà reçu.
+
+        `iss` (RFC 9207) est relayé tel que l'AS l'a mis dans la redirection,
+        sans contrôle ici : le SDK le compare lui-même à l'issuer attendu. Ne
+        pas le relayer ferait échouer le parcours contre un AS qui annonce le
+        paramètre, et sauterait le contrôle en silence contre les autres."""
         if self._event.is_set():
             return
-        self._code, self._state, self._error = code, state, error
+        self._code, self._state, self._error, self._iss = code, state, error, iss
         self._event.set()
 
-    async def wait(self) -> tuple[str, str | None]:
+    async def wait(self) -> Any:
         import anyio
 
         with anyio.move_on_after(self.timeout) as scope:
@@ -158,7 +175,9 @@ class PendingAuthorization:
             raise RuntimeError(
                 f"Callback sans code d'autorisation pour '{self.upstream_name}'."
             )
-        return self._code, self._state
+        from mcp.shared.auth import AuthorizationCodeResult
+
+        return AuthorizationCodeResult(code=self._code, state=self._state, iss=self._iss)
 
 
 _AUTHORIZATION_WAIT_S = 300.0
@@ -223,7 +242,7 @@ def format_authorization_notice(upstream_name: str, url: str) -> list[str]:
 
 
 class UpstreamAuthorizer:
-    """Porte l'état d'autorisation d'UN upstream, et fabrique son httpx.Auth.
+    """Porte l'état d'autorisation d'UN upstream, et fabrique son httpx2.Auth.
 
     Un seul OAuthClientProvider par upstream, construit une fois et réutilisé :
     c'est ce qui rend effectif le verrou d'OAuthContext (un anyio.Lock pris pour
@@ -354,7 +373,7 @@ class UpstreamAuthorizer:
             except Exception as e:  # pragma: no cover
                 _log(f"Ouverture du navigateur impossible ({e}) — utiliser le lien.")
 
-    async def _on_callback(self) -> tuple[str, str | None]:
+    async def _on_callback(self) -> Any:
         if self.pending is None:  # pragma: no cover
             raise RuntimeError("Callback attendu sans autorisation en cours.")
         try:
@@ -374,7 +393,7 @@ class UpstreamAuthorizer:
 
         Or `tools/call` ne s'envoie pas nu : le transport streamable-http exige
         un `Mcp-Session-Id` obtenu à `initialize` et rejoué ensuite. On déroule
-        donc la vraie séquence. Les réponses ne sont pas lues — httpx exécute le
+        donc la vraie séquence. Les réponses ne sont pas lues — httpx2 exécute le
         flow d'authentification AVANT de nous rendre la main, et c'est ce
         passage, pas le résultat, qui nous intéresse.
 
@@ -540,7 +559,7 @@ class UpstreamAuthorizer:
         moindre appel à l'AS, pour une page qui disait le contraire.
 
         On émet donc une requête à nous sur l'URL de l'upstream, à travers un
-        client httpx portant le provider en `auth`. Le 401 attendu fait dérouler
+        client httpx2 portant le provider en `auth`. Le 401 attendu fait dérouler
         au SDK son chemin NOMINAL — découverte des métadonnées, enregistrement
         si besoin, redirection, échange du code, écriture du jeton. Rien n'est
         réimplémenté ici : mener le flow à la main dupliquerait la moitié du
@@ -551,11 +570,11 @@ class UpstreamAuthorizer:
         `has_usable_token` qui tranche ensuite, jamais le seul fait d'être
         arrivé ici sans exception.
         """
-        import httpx
+        import httpx2
 
         self.interactive = True
         try:
-            async with httpx.AsyncClient(
+            async with httpx2.AsyncClient(
                 auth=self.provider(), timeout=self.wait_timeout, follow_redirects=False
             ) as client:
                 await self._provoke_refusal(client)
@@ -623,7 +642,7 @@ class UpstreamAuthorizer:
         # dira si un renouvellement a réellement eu lieu (cf. plus bas).
         deadline_before = time.time() + token.expires_in
 
-        import httpx
+        import httpx2
 
         # Une requête quelconque suffit : c'est son PASSAGE par le provider qui
         # déclenche le refresh, pas ce qu'elle demande. On vise donc l'upstream
@@ -637,7 +656,7 @@ class UpstreamAuthorizer:
         # parcours interactif que personne n'a demandé ; elle marque
         # l'autorisation comme due et s'arrête là.
         try:
-            async with httpx.AsyncClient(
+            async with httpx2.AsyncClient(
                 auth=self.provider(), timeout=self.wait_timeout,
                 follow_redirects=False,
             ) as client:
@@ -900,6 +919,7 @@ def build_callback_route(authorizers: dict[str, UpstreamAuthorizer]) -> Any:
         code = params.get("code")
         state = params.get("state")
         error = params.get("error")
+        iss = params.get("iss")
 
         # Le state ne sert PAS à valider ici (le SDK le compare lui-même en
         # compare_digest) : il sert à savoir QUEL upstream attend, quand
@@ -925,7 +945,7 @@ def build_callback_route(authorizers: dict[str, UpstreamAuthorizer]) -> Any:
                 status_code=400,
             )
 
-        target.pending.resolve(code, state, error)
+        target.pending.resolve(code, state, error, iss)
         return HTMLResponse(
             render_callback_page(target.name, error),
             status_code=400 if error else 200,
@@ -1088,6 +1108,42 @@ def build_authorize_route(
     return Route("/authorize/{name}", handle_authorize, methods=["GET"])
 
 
+class _ExpectedRefusalFilter:
+    """Écarte du journal du SDK le refus volontaire d'un parcours non interactif.
+
+    `_on_redirect` lève `AuthorizationRequired` quand personne n'a demandé
+    d'autorisation (démarrage, appel d'outil, renouvellement de fond) : c'est
+    un état NORMAL, que le proxy annonce lui-même en une ligne (« unauthorized
+    — autoriser : /authorize/<nom> »). Le SDK 2.x journalise pourtant toute
+    exception de son parcours en ERROR avec traceback complet (« OAuth flow
+    error »), là où la 1.x se taisait : sans ce filtre, chaque démarrage d'un
+    upstream non autorisé imprime une pile d'appel qui ressemble à une panne.
+
+    Ne vise QUE cette exception-là : toute autre erreur du parcours reste
+    journalisée. Et sous `--debug-auth`, rien n'est écarté — on veut tout voir.
+    """
+
+    def filter(self, record: Any) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, AuthorizationRequired) and not _auth_debug_enabled():
+            return False
+        return True
+
+
+_SDK_OAUTH_LOGGER = "mcp.client.auth.oauth2"
+
+
+def _silence_expected_refusals() -> None:
+    """Pose le filtre une seule fois, sur le logger qui émet l'enregistrement
+    (un filtre de logger s'applique à la création, avant tout handler — donc
+    aussi sous `--debug-auth`, qui pose ses handlers sur le parent)."""
+    import logging
+
+    logger = logging.getLogger(_SDK_OAUTH_LOGGER)
+    if not any(isinstance(f, _ExpectedRefusalFilter) for f in logger.filters):
+        logger.addFilter(_ExpectedRefusalFilter())
+
+
 def build_upstream_authorizers(
     cfg: dict[str, Any],
     upstreams: dict[str, Upstream],
@@ -1098,8 +1154,9 @@ def build_upstream_authorizers(
     """Un UpstreamAuthorizer par upstream http portant une clé `auth`.
 
     Câble aussi le provider dans l'HttpUpstream correspondant : c'est le seul
-    endroit où l'auth entre dans le transport, par le paramètre httpx.Auth.
+    endroit où l'auth entre dans le transport, par le paramètre httpx2.Auth.
     """
+    _silence_expected_refusals()
     authorizers: dict[str, UpstreamAuthorizer] = {}
     for name, srv in cfg.get("mcpServers", {}).items():
         # Pas de test de désactivation ici : build_upstreams() a déjà retiré

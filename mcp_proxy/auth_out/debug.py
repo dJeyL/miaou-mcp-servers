@@ -74,7 +74,7 @@ def enable_auth_debug() -> None:
     causes, un seul symptôme, et le diagnostic se fait au jugé. Ce mode expose
     les requêtes réellement émises, seule information qui les sépare.
 
-    Branché sur les loggers du SDK MCP et de httpx plutôt que sur un traçage
+    Branché sur les loggers du SDK MCP et de httpx2 plutôt que sur un traçage
     maison : ce sont eux qui voient les requêtes, y compris celles que le proxy
     n'émet pas lui-même (découverte, enregistrement, échange de jeton).
     """
@@ -106,38 +106,37 @@ def enable_auth_debug() -> None:
     handler.addFilter(_RedactingFilter())
     handler.setLevel(logging.DEBUG)
 
-    # `httpcore` est volontairement ABSENT : ses lignes ne portent ni URL ni
+    # `httpcore2` est volontairement ABSENT : ses lignes ne portent ni URL ni
     # en-tête (`send_request_headers.started request=<Request [b'POST']>`), donc
-    # elles noient le journal sans rien apprendre — mesuré, pas supposé.
+    # elles noient le journal sans rien apprendre — mesuré, pas supposé (sur
+    # `httpcore`, dont httpcore2 est la reprise pour le SDK 2.x).
     #
     # LA LISTE COUVRE TOUT LE CYCLE DE VIE, PAS SEULEMENT LE BOOT. Première
     # version : `("mcp.client.auth", "httpx")`. On voyait alors les URL d'AS
     # essayées au démarrage puis plus rien, alors que le mode est censé rester
-    # actif — incohérence relevée le 2026-09-08. Deux causes, mesurées :
+    # actif — incohérence relevée le 2026-09-08 : le trafic d'APRÈS le boot
+    # passe par `mcp.client.streamable_http` (le transport des upstreams HTTP :
+    # connexion, session, envoi de messages, reconnexions SSE), qui journalise
+    # sous SON nom et n'était pas couvert.
     #
-    # - `mcp.client.auth` N'ÉMET RIEN dans le SDK installé (aucun `getLogger`,
-    #   aucun appel `logger.*` dans le module). Le nommer ne coûte rien mais
-    #   n'apportait rien non plus : tout ce qu'on voyait venait de `httpx`.
-    # - Le trafic d'APRÈS le boot passe par `mcp.client.streamable_http` (le
-    #   transport des upstreams HTTP : connexion, session, envoi de messages,
-    #   reconnexions SSE), qui journalise sous SON nom et n'était pas couvert.
-    #
-    # `httpx` journalise ses requêtes en INFO, pas en DEBUG — d'où un niveau
+    # `httpx2` journalise ses requêtes en INFO, pas en DEBUG — d'où un niveau
     # posé sur chaque logger plutôt qu'un filtrage par sévérité : on veut la
     # ligne `HTTP Request: POST … "200 OK"` de chaque requête, quel que soit
     # son niveau d'origine.
     #
-    # Les NOMS sont ceux que les modules posent réellement, vérifiés à la
-    # source : `mcp.client.session` journalise sous `"client"` (et non sous son
-    # nom de module), et `mcp.shared.session` appelle `logging.*` au niveau
-    # module — donc le root logger, hors de portée d'une liste nommée. Nommer
-    # un logger qui n'existe pas est silencieux : c'est ainsi que la première
-    # version a pu paraître correcte.
+    # Les NOMS sont ceux que les modules posent réellement, revérifiés à la
+    # source du SDK 2.2.0 : `mcp.client.auth` couvre `mcp.client.auth.oauth2`,
+    # qui journalise désormais (il était muet en 1.x) ; `mcp.client.session`
+    # journalise sous `"client"`, et non sous son nom de module ; le client HTTP
+    # du SDK est `httpx2`, plus `httpx` — garder l'ancien nom ne lèverait rien
+    # et ne montrerait plus aucune requête. Nommer un logger qui n'existe pas
+    # est silencieux : c'est ainsi que la première version a pu paraître
+    # correcte.
     for name in (
         "mcp.client.auth",
         "mcp.client.streamable_http",
         "client",
-        "httpx",
+        "httpx2",
     ):
         logger = logging.getLogger(name)
         logger.setLevel(logging.DEBUG)

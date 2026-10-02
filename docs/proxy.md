@@ -52,14 +52,16 @@ Trois chemins d'application distincts selon le type d'upstream :
   chaque `StdioUpstream` via `merge_proxy_env_overrides` (CLI par-dessus `env` de
   config.json, `--noproxy` retire même une entrée explicite).
 - **http** : rien à faire non plus, mais pour une raison différente des inprocess — le
-  client httpx construit par le SDK (`create_mcp_http_client`) garde le défaut
+  client httpx2 de l'upstream (`HttpUpstream._build_http_client`, seul client qu'il
+  emploie depuis le SDK 2.x, qui ne le construit plus à notre place) garde le défaut
   `trust_env=True`, donc il relit `os.environ` du process, déjà modifié par `main()`.
-  C'est une propriété d'une **bibliothèque tierce**, pas de notre code : un test
-  (`test_mcp_sdk_http_client_still_trusts_env`) l'épingle, faute de quoi un SDK qui
-  passerait un jour `trust_env=False` rendrait `--noproxy` silencieusement inopérant sur
-  ce seul type d'upstream.
+  Deux tests l'épinglent sur CE client : `test_http_upstream_client_trusts_env`, et
+  `test_noproxy_overrides_reach_http_upstream_via_process_env`, qui vérifie l'effet (un
+  transport de proxy monté avec l'environnement d'origine, aucun après `--noproxy`).
+  Ils visaient avant la migration le client que construisait le SDK
+  (`create_mcp_http_client`) : restés verts, ils n'auraient plus rien prouvé.
 
-  **Limite connue** : httpx lit aussi `ALL_PROXY` et `NO_PROXY`, que `_PROXY_ENV_KEYS`
+  **Limite connue** : httpx2 lit aussi `ALL_PROXY` et `NO_PROXY`, que `_PROXY_ENV_KEYS`
   (les quatre variantes de casse de `http_proxy`/`https_proxy`) ne gère pas. Un
   environnement portant `ALL_PROXY` verrait donc `--noproxy` partiellement inopérant
   pour un upstream http. Non corrigé délibérément : étendre `_PROXY_ENV_KEYS` changerait
@@ -77,12 +79,14 @@ mcp_proxy/ (paquet, à la racine du projet)
 │                  — ce que server et auth_out nomment tous deux ; posé ici, leur
 │                    dépendance reste à sens unique (pas de cycle entre eux)
 ├── upstream.py    les trois types, même surface `Upstream` :
-│   ├── InProcessUpstream  : importlib.import_module(module) → module.mcp._tool_manager
+│   ├── InProcessUpstream  : importlib.import_module(module) → module.mcp (MCPServer,
+│   │                        API publique list_tools / call_tool)
 │   ├── StdioUpstream      : stdio_client + ClientSession (subprocess MCP)
-│   └── HttpUpstream       : streamablehttp_client + ClientSession (serveur distant)
+│   └── HttpUpstream       : client httpx2 + streamable_http_client + ClientSession
+│                            (serveur distant)
 ├── netproxy.py    override --proxy / --noproxy (calcul pur, n'applique rien)
 ├── config.py      lit config.json → build_upstreams()
-├── server.py      build_proxy_server() : mcp.server.Server, list_tools / call_tool
+├── server.py      build_proxy_server() : mcp.server.Server, on_list_tools / on_call_tool
 │   ├── list_tools → agrège tous les upstreams, préfixe les noms avec "{name}__"
 │   ├── call_tool  → dépréfixe, route vers l'upstream concerné
 │   └── aggregate_instructions() : compose `instructions` de l'InitializeResult
@@ -103,10 +107,37 @@ mcp_proxy/ (paquet, à la racine du projet)
 upstreams. Jusqu'au lot AI, seul `content` passait : le SDK ré-enveloppait la liste en
 `isError=False`, si bien qu'un échec signalé par l'upstream arrivait au client comme un
 succès, et le `_meta` d'un résultat (`miaou/web` de `mcp_web`) disparaissait. Un upstream
-inprocess dont l'outil rend lui-même un `CallToolResult` le voit traverser tel quel
-(`convert_result` le rend sans le toucher, et le SDK ne valide pas un `CallToolResult` rendu
-par le handler) ; les autres outils inprocess sont inchangés. Les wrappers REF_UNKNOWN et
-AUTHORIZATION_REQUIRED lisent le résultat sans le reconstruire : le `_meta` leur survit.
+inprocess passe par l'API publique `MCPServer.call_tool`, qui rend un `CallToolResult`
+complet (`_meta` d'un outil qui le pose compris), et le proxy le laisse traverser tel quel.
+
+**Ce que `call_tool` rend en erreur.** Le `Server` bas niveau du SDK 2.x n'enveloppe plus
+rien : une exception qui sort du handler devient une erreur JSON-RPC (code 0 si ce n'est
+pas une `MCPError`), là où la 1.x rendait TOUTE exception en `isError` portant `str(e)` —
+ce que le modèle lisait. `handle_call_tool` reproduit donc ce comportement lui-même, avec
+deux exceptions voulues, qui sortent en erreur JSON-RPC `data` intact :
+
+- `UpstreamNotAuthorized` (une `MCPError`), le contrat AUTHORIZATION_REQUIRED ;
+- une `MCPError` levée par un outil **inprocess** — REF_UNKNOWN de `mcp_docs`. Celle d'un
+  upstream **distant** est la réponse d'erreur de ce serveur, aplatie en `isError` comme
+  en 1.x.
+
+« Outil inconnu » reste un `isError` textuel. En 1.x, les deux contrats passaient par un
+sentinel dans le texte de l'`isError`, repêché par deux wrappers qui remplaçaient le
+handler enregistré : ni l'un ni l'autre n'existe plus.
+
+**Schémas d'entrée complétés.** Le SDK 2.x valide un résultat contre le schéma du
+protocole AVANT de l'émettre : un seul outil dont l'`inputSchema` n'a pas
+`"type": "object"` ferait rejeter le `tools/list` ENTIER en INTERNAL_ERROR, les autres
+upstreams avec. `_object_schema` complète le schéma (catalogue en cache sans schéma,
+upstream tiers peu rigoureux) plutôt que de laisser un outil éteindre les autres.
+
+**Gestionnaire de sessions.** `build_app` passe à `StreamableHTTPSessionManager` les deux
+réglages que partagent les serveurs autonomes (`servers/mcp_base.py`) :
+`MAX_REQUEST_BODY_BYTES` (96 Mio, contre 4 Mio par défaut en 2.x, cf.
+`docs/miaou-contract.md` sur `content_b64`) et `SESSION_IDLE_TIMEOUT_S = None` (le SDK
+expirerait sinon une session inactive au bout de 30 min). `security_settings` reste
+absent : dans le gestionnaire, `None` vaut protection DNS-rebinding désactivée, ce que
+l'`Origin: null` de MIAOU en `file://` exige.
 
 `build_app()` ne retourne pas directement le `Starlette` mais une fonction ASGI qui l'enveloppe :
 `Mount("/mcp", ...)` redirige `/mcp` → `/mcp/` en 307 par défaut (strict-slash Starlette), et
@@ -126,11 +157,12 @@ distingue CET outil.
 
 Le protocole prévoit `instructions` sur l'`InitializeResult`, destiné au system
 prompt du modèle. Côté serveur, `MiaouMCPBase(..., instructions=...)` le passe à
-`FastMCP`. Côté proxy, trois captures, une par type d'upstream :
+`MCPServer` — par mot-clef : en 2.x, son deuxième paramètre positionnel est `title`, où
+une consigne passée en position partirait sans erreur. Côté proxy, trois captures, une par type d'upstream :
 
 | Upstream | Capture |
 |---|---|
-| `InProcessUpstream` | `fastmcp.instructions` — pas d'`initialize` sur ce chemin |
+| `InProcessUpstream` | `server.instructions` (le `MCPServer` importé) — pas d'`initialize` sur ce chemin |
 | `StdioUpstream` | retour d'`await session.initialize()` |
 | `HttpUpstream` | retour d'`await session.initialize()` |
 
@@ -228,13 +260,13 @@ serveur) en plus de `"env"` :
 ```
 
 Un module qui veut supporter ça expose une factory `build(config: dict | None)
--> FastMCP` en plus du singleton `mcp` — `InProcessUpstream.start()` (dans
+-> MCPServer` en plus du singleton `mcp` — `InProcessUpstream.start()` (dans
 `mcp_proxy/upstream.py`) appelle `module.build(config)` si elle existe, sinon retombe
 sur `module.mcp` (comportement actuel, inchangé pour tous les serveurs qui
 n'ont pas de `build()`) :
 
 ```python
-def build(config: dict | None = None) -> FastMCP:
+def build(config: dict | None = None) -> MCPServer:
     return MyServer(config or {}).mcp
 
 server = MyServer()

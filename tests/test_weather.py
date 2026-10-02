@@ -43,9 +43,9 @@ async def test_get_weather_returns_embedded_resource():
     mock_resp = _make_mock_resp(_WTTR_SAMPLE)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris"})
+        result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     assert isinstance(result, types.EmbeddedResource)
-    assert result.resource.mimeType == "application/json"
+    assert result.resource.mime_type == "application/json"
 
 
 @pytest.mark.asyncio
@@ -53,7 +53,7 @@ async def test_get_weather_strips_astronomy_and_hourly():
     mock_resp = _make_mock_resp(_WTTR_SAMPLE)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris"})
+        result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     data = json.loads(result.resource.text)
     for day in data.get("weather", []):
         assert "astronomy" not in day
@@ -66,7 +66,7 @@ async def test_get_weather_uri_contains_location():
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         tm = weather_server.mcp._tool_manager
         result = await tm.call_tool(
-            "get_weather", {"city": "Lyon", "country": "France"}
+            "get_weather", {"city": "Lyon", "country": "France"}, None
         )
     assert "Lyon" in str(result.resource.uri)
     assert "France" in str(result.resource.uri)
@@ -85,7 +85,7 @@ async def test_get_weather_optional_params_omitted():
 
     with patch("urllib.request.OpenerDirector.open", mock_open):
         tm = weather_server.mcp._tool_manager
-        await tm.call_tool("get_weather", {"city": "Bordeaux"})
+        await tm.call_tool("get_weather", {"city": "Bordeaux"}, None)
 
     assert len(captured_url) == 1
     assert "Bordeaux" in captured_url[0]
@@ -100,7 +100,7 @@ async def test_get_weather_http_error_returns_clear_string():
     err = urllib.error.HTTPError("http://wttr.in/x", 503, "Service Unavailable", {}, None)
     with patch("urllib.request.OpenerDirector.open", side_effect=err):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris"})
+        result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     assert err.fp.closed   # fermée par le serveur, pas par le test
     assert isinstance(result, str)
     assert "503" in result
@@ -111,7 +111,7 @@ async def test_get_weather_url_error_returns_clear_string():
     err = urllib.error.URLError("Connection refused")
     with patch("urllib.request.OpenerDirector.open", side_effect=err):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris"})
+        result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     assert isinstance(result, str)
     assert "réseau" in result.lower() or "Connection refused" in result
 
@@ -125,7 +125,7 @@ async def test_get_weather_invalid_json_returns_clear_string():
     mock.read.return_value = b"<html>error</html>"
     with patch("urllib.request.OpenerDirector.open", return_value=mock):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris"})
+        result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     assert isinstance(result, str)
     assert "invalide" in result.lower()
 
@@ -141,7 +141,7 @@ async def test_get_weather_truncated_utf8_does_not_raise():
     mock.read.return_value = body[:-1] + "é".encode("utf-8")[:1]  # coupe un multi-octet
     with patch("urllib.request.OpenerDirector.open", return_value=mock):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris"})
+        result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     assert isinstance(result, str)
     assert "invalide" in result.lower()
 
@@ -152,7 +152,7 @@ async def test_get_weather_degenerate_weather_field_returns_clear_string():
     mock_resp = _make_mock_resp({"weather": "not-a-list", "current_condition": []})
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris"})
+        result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     assert isinstance(result, str)
     assert "invalide" in result.lower()
 
@@ -163,7 +163,7 @@ async def test_get_weather_weather_entry_not_dict_skipped():
     mock_resp = _make_mock_resp({"weather": ["not-a-dict", {"date": "x"}], "current_condition": []})
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris"})
+        result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     assert isinstance(result, types.EmbeddedResource)
 
 
@@ -184,7 +184,7 @@ async def test_get_weather_astronomy_and_hourly_are_independent(
     mock_resp = _make_mock_resp(_WTTR_SAMPLE)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris", **args})
+        result = await tm.call_tool("get_weather", {"city": "Paris", **args}, None)
     day = json.loads(result.resource.text)["weather"][0]
     assert ("astronomy" in day) is expect_astronomy
     assert ("hourly" in day) is expect_hourly
@@ -202,7 +202,7 @@ async def test_get_weather_extract_returns_blob_and_descriptor():
     mock_resp = _make_mock_resp(_WTTR_SAMPLE)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris", "extract": True})
+        result = await tm.call_tool("get_weather", {"city": "Paris", "extract": True}, None)
 
     assert isinstance(result, list) and len(result) == 2
     descripteur, resource = result
@@ -210,7 +210,7 @@ async def test_get_weather_extract_returns_blob_and_descriptor():
     assert "weather-paris-20260628.json" in descripteur.text
     assert isinstance(resource, types.EmbeddedResource)
     assert isinstance(resource.resource, types.BlobResourceContents)
-    assert resource.resource.mimeType == "application/json"
+    assert resource.resource.mime_type == "application/json"
     data = json.loads(base64.b64decode(resource.resource.blob).decode())
     assert "astronomy" not in data["weather"][0]
     assert str(resource.resource.uri).endswith("weather-paris-20260628.json")
@@ -225,6 +225,7 @@ async def test_get_weather_extract_name_slugifies_location():
         result = await tm.call_tool(
             "get_weather",
             {"city": "Saint-Étienne", "country": "France", "extract": True},
+            None,
         )
     uri = str(result[1].resource.uri)
     assert "weather-saint-etienne-france-20260628.json" in uri
@@ -238,7 +239,7 @@ async def test_get_weather_extract_falls_back_to_today_without_date():
     mock_resp = _make_mock_resp({"weather": [{"maxtempC": "15"}], "current_condition": []})
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris", "extract": True})
+        result = await tm.call_tool("get_weather", {"city": "Paris", "extract": True}, None)
     today = datetime.date.today().strftime("%Y%m%d")
     assert f"weather-paris-{today}.json" in str(result[1].resource.uri)
 
@@ -254,6 +255,7 @@ async def test_get_weather_blocks_and_extract_combine():
         result = await tm.call_tool(
             "get_weather",
             {"city": "Paris", "astronomy": True, "hourly": True, "extract": True},
+            None,
         )
     data = json.loads(base64.b64decode(result[1].resource.blob).decode())
     assert "hourly" in data["weather"][0]
@@ -277,7 +279,7 @@ async def test_get_weather_extract_descriptor_states_content(args, expected):
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         tm = weather_server.mcp._tool_manager
         result = await tm.call_tool(
-            "get_weather", {"city": "Paris", "extract": True, **args}
+            "get_weather", {"city": "Paris", "extract": True, **args}, None
         )
     assert expected in result[0].text
 
@@ -289,7 +291,7 @@ async def test_get_weather_defaults_unchanged():
     mock_resp = _make_mock_resp(_WTTR_SAMPLE)
     with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris"})
+        result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     assert isinstance(result, types.EmbeddedResource)
     assert isinstance(result.resource, types.TextResourceContents)
     assert str(result.resource.uri) == "miaou://weather/Paris"
@@ -304,6 +306,6 @@ async def test_get_weather_non_dict_json_returns_clear_string():
     mock.read.return_value = b"[1, 2, 3]"
     with patch("urllib.request.OpenerDirector.open", return_value=mock):
         tm = weather_server.mcp._tool_manager
-        result = await tm.call_tool("get_weather", {"city": "Paris"})
+        result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     assert isinstance(result, str)
     assert "invalide" in result.lower()

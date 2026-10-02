@@ -21,13 +21,16 @@ import shutil
 import time
 from pathlib import Path
 
+from mcp.server.mcpserver.exceptions import ToolError as _SDKToolError
+from mcp.shared.exceptions import MCPError
+
 # ---------------------------------------------------------------------------
 # Contrat REF_UNKNOWN partagé (proxy + tests)
 # ---------------------------------------------------------------------------
 
-# Marqueur stable en tête du message d'erreur. Le proxy (paquet mcp_proxy) détecte
-# ce préfixe dans le résultat isError du SDK MCP (qui avale toute exception
-# levée par l'outil) et le convertit en erreur JSON-RPC data.code=REF_UNKNOWN.
+# Valeur de `error.data.code` — c'est sur elle, par égalité, que le client MIAOU
+# décide du rejeu avec contenu inliné. Elle ouvre aussi le message d'erreur, pour
+# un lecteur humain.
 REF_UNKNOWN_SENTINEL = "REF_UNKNOWN"
 
 # Hors de la plage réservée JSON-RPC (-32768..-32000 inclus). Le client MIAOU
@@ -45,8 +48,16 @@ _SESSION_ID_FORBIDDEN = re.compile(r"[\\/\x00]|\.\.")
 _SESSION_ID_ALL_DOTS = re.compile(r"^\.+$")
 
 
-class ToolError(Exception):
-    """Erreur applicative renvoyée en isError par FastMCP (str(e) devient le texte)."""
+class ToolError(_SDKToolError):
+    """Erreur applicative, rendue au modèle en isError avec son texte.
+
+    Hérite de la `ToolError` du SDK, et c'est contractuel : en 2.x, MCPServer ne
+    transmet le texte d'une exception d'outil QUE si c'est une `ToolError` du
+    SDK. Toute autre exception est traitée en plantage et rendue en « Error
+    executing tool <nom> » NU — sans un mot de ce qui a été refusé. Une classe
+    maison dérivée d'`Exception`, comme avant la 2.x, ferait taire en silence
+    tous les refus adressés au modèle par ce serveur.
+    """
 
 
 def _env_int(name: str, default: int) -> int:
@@ -177,7 +188,15 @@ def resolve_ref(session_id: str, ref: str, content_b64: str | None) -> Path:
         return materialize(session_id, ref, content_b64)
 
     if not path.exists():
-        raise ToolError(f"{REF_UNKNOWN_SENTINEL}: ref '{ref}' inconnu pour la session '{session_id}'")
+        # Erreur JSON-RPC, et non isError : le client décide d'un rejeu sur
+        # `error.data.code`, champ machine qu'un résultat isError n'a pas. En
+        # 2.x, une MCPError levée par un outil traverse MCPServer telle quelle
+        # — en autonome comme derrière le proxy.
+        raise MCPError(
+            REF_UNKNOWN_ERROR_CODE,
+            f"{REF_UNKNOWN_SENTINEL}: ref '{ref}' inconnu pour la session '{session_id}'",
+            data={"code": REF_UNKNOWN_SENTINEL},
+        )
 
     touch_session(session_id)
     return path

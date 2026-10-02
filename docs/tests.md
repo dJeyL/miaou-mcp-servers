@@ -7,6 +7,20 @@ Les tests de bench mockent `asyncio.sleep` pour éviter les délais de 2 s.
 Les tests de weather, fetch, ddg et brave mockent `urllib.request.OpenerDirector.open`.
 Les tests de brave mockent aussi `os.environ` — aucun appel réseau réel, aucune clef requise.
 Les tests du proxy mockent les upstreams ou utilisent InProcessUpstream sur mcp_bench réel.
+Ils parlent au `Server` du proxy par `tests/proxy_client.py` (`list_tools`, `call_tool`) :
+un `Client(server, mode="legacy")` du SDK, donc le vrai chemin JSON-RPC de la poignée de
+main `initialize` — celui de MIAOU. **Jamais le mode par défaut** : `auto` négocie la
+révision 2026-07-28 et dispatche EN DIRECT, sans sérialisation, si bien qu'un test vert y
+prouverait le mauvais chemin. Ce passage par le fil rend aussi les tests plus forts qu'un
+appel au handler : un `_meta` mal aliasé est jeté à la relecture côté client (le SDK 2.x
+ignore les champs inconnus), une erreur protocolaire arrive en `MCPError` avec son `data`.
+Le harnais déballe l'`ExceptionGroup` d'anyio dont le transport en mémoire enveloppe
+l'erreur (`_single_cause`). Les tests des serveurs, eux, appellent l'outil par
+`_tool_manager.call_tool(nom, args, None)` : le contexte est obligatoire en 2.x, `None`
+suffit à un outil qui n'en déclare pas.
+Les tests qui interceptent le client HTTP du SDK patchent **`httpx2`** (`AsyncClient`,
+`MockTransport`, `Response`) : le SDK 2.x n'emploie plus `httpx`, et un patch resté sur
+l'ancien nom ne lève rien — il ne patche plus rien, et le test part sur le réseau.
 Les tests de docs monkeypatchent `mcp_docs.session.WORKDIR` (fixture `tmp_path`) pour
 isoler le filesystem par test, exercent chaque format (fixtures PDF/xlsx/docx/pptx/zip
 générées à la volée par les libs elles-mêmes) via `formats.py` directement, et vérifient
@@ -39,7 +53,7 @@ sont posés, parce qu'aucun des deux ne fait échouer un test naïf :
 
 ### `tests/live_call.py` — appel réel d'un outil
 
-Script PEP 723 (dépendances : `mcp`, `truststore`), **pas un test pytest** : son nom ne commence
+Script PEP 723 (dépendances : `mcp` 2.x, `truststore`), **pas un test pytest** : son nom ne commence
 pas par `test_`, il n'est donc jamais collecté malgré sa place dans `tests/`. Il parle le
 vrai transport streamable-http, comme MIAOU (`initialize`, `notifications/initialized`,
 `tools/call`) — c'est le chemin que le stack in-process des tests unitaires ne couvre pas
@@ -64,7 +78,7 @@ sont aplatis avant affichage (`_flatten`) — sans ça, un serveur injoignable n
 « unhandled errors in a TaskGroup », sans la cause.
 
 `-H/--header` (répétable, forme `'Nom: valeur'`) passe des headers HTTP libres à
-`streamablehttp_client` : `Authorization` pour viser un proxy en auth entrante sans dérouler
+client `httpx2` passé à `streamable_http_client` : `Authorization` pour viser un proxy en auth entrante sans dérouler
 le parcours OAuth, mais aussi n'importe quel header applicatif d'un reverse proxy en amont.
 La valeur n'est strippée qu'à gauche, un header sans `:` sort en code 2 avant toute connexion.
 
@@ -73,7 +87,7 @@ Le script appelle `enable_system_trust_store()` avant `asyncio.run`, comme
 AC d'entreprise interne échoue en `CERTIFICATE_VERIFY_FAILED` côté client alors même que les
 serveurs, eux, joignent leurs upstreams : le banc d'essai diagnostiquerait un faux négatif.
 Le helper y est **recopié** plutôt qu'importé de `servers/mcp_base.py` — c'est un client
-autonome, et l'import tirerait FastMCP et starlette pour quatre lignes ; le prix est une
+autonome, et l'import tirerait le SDK serveur et starlette pour quatre lignes ; le prix est une
 duplication à répercuter (cf. `docs/tls.md`).
 
 ### `tests/live_auth_probe.py` — ce qu'un upstream répond SANS jeton
@@ -108,4 +122,33 @@ après **trois** correctifs posés sur des suppositions successives, tous publi�
 efficace — chacun corrigeait un défaut réel sans toucher la cause. La leçon tient en une
 ligne : sur un comportement distant qu'on ne peut pas reproduire, écrire le banc AVANT le
 correctif.
+
+### `tests/live_discovery_probe.py` — ce que la découverte OAuth du SDK 2.x conclurait
+
+Même statut (PEP 723, non collecté, aucun jeton, aucune écriture), et une question tournée
+vers la migration au SDK MCP 2.x : **ce que publie cet upstream fait-il échouer la découverte
+OAuth durcie de la 2.x ?** Quatre durcissements dépendent de l'autre bout et ne se tranchent
+pas en lisant du code : une PRM en 5xx/429 devient fatale, l'`issuer` des métadonnées d'AS
+se compare à l'octet près, `offline_access` découvert entraîne `prompt=consent`, et le
+paramètre `iss` de la redirection (RFC 9207) se compare à l'`issuer` des métadonnées
+EFFECTIVES — y compris celui que l'override de config dérive de l'authorization endpoint.
+
+```bash
+uv run tests/live_discovery_probe.py https://jira.exemple/mcp
+uv run tests/live_discovery_probe.py https://jira.exemple/mcp \
+    --authorization-endpoint https://sso.exemple/realms/r/protocol/openid-connect/auth
+uv run tests/live_discovery_probe.py https://jira.exemple/mcp --oidc https://sso.exemple/realms/r
+```
+
+La découverte est rejouée avec les fonctions du SDK lui-même (URL candidates, lecture des
+réponses, `validate_metadata_issuer`), jamais recopiées, d'où une version **épinglée**
+(`mcp==2.2.0`) : le script mesure la version visée. La seule recopie est la dérivation
+d'`issuer` de `build_oauth_metadata_override`, une ligne, à répercuter si elle change.
+Codes de sortie : 0 rien de bloquant, 1 au moins un risque, 2 upstream injoignable ou
+erreur d'usage — un hôte injoignable ne conclut à aucun risque.
+
+Éprouvé le 2026-10-02 contre le proxy (auth entrante) et `dev_auth_server.py` : il a relevé
+que la PRM servie par le proxy en 1.x annonce `http://127.0.0.1:8787/` (slash final ajouté
+par la normalisation pydantic de la 1.x) quand l'AS se déclare `http://127.0.0.1:8787` — un
+couple qu'un client 2.x refuse.
 

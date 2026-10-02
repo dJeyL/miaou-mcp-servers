@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.28.1,<2", "uvicorn", "starlette", "pyjwt[crypto]"]
+# dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "pyjwt[crypto]"]
 # ///
 """Serveur d'autorisation OAuth 2.1 de DÉVELOPPEMENT — pour éprouver l'auth
 entrante de mcp_proxy (lot AB-1).

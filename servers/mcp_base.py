@@ -10,18 +10,34 @@ import inspect
 import sys
 import urllib.request
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.cors import CORSMiddleware
 
-# Par défaut, ArgModelBase (mcp>=1.28.1) laisse Pydantic ignorer silencieusement
+# Par défaut, ArgModelBase laisse Pydantic ignorer silencieusement
 # tout argument d'outil non déclaré dans la signature de la fonction (extra="ignore"
 # implicite) : un appelant qui hallucine un nom de paramètre (ex. `page` au lieu de
 # `selector`) voit son argument avalé sans erreur, et l'outil retombe sur son défaut
 # sans jamais signaler l'anomalie. Passage en extra="forbid" pour transformer ça en
 # erreur de validation explicite, avant même l'exécution de l'outil.
 ArgModelBase.model_config["extra"] = "forbid"
+
+# Plafond du corps d'une requête HTTP entrante, en octets. Le SDK 2.x en pose un
+# de 4 Mio par défaut (réponse 413 avant tout parsing), là où la 1.x n'en avait
+# aucun. Or MIAOU envoie un fichier ENTIER, en base64, dans les arguments d'un
+# outil qui déclare `ref` + `content_b64` (mcp_docs) — jusqu'à son propre
+# plafond `MAX_INLINE_BYTES` de 64 Mo, soit environ 85,4 Mo une fois encodé,
+# plus l'enveloppe JSON-RPC. Le défaut du SDK refuserait tout document de plus
+# de 3 Mo environ. Couplé à MIAOU : si son plafond monte, celui-ci suit (cf.
+# docs/miaou-contract.md). Partagé par les serveurs autonomes et le proxy.
+MAX_REQUEST_BODY_BYTES = 96 * 1024 * 1024
+
+# Le SDK 2.x expire par défaut une session restée 30 min sans requête (la 1.x
+# ne l'expirait jamais). MIAOU sait ré-initialiser une session tuée, mais ces
+# serveurs tournent en local : on garde le comportement d'avant plutôt que
+# d'introduire un aller-retour de reconnexion après chaque pause.
+SESSION_IDLE_TIMEOUT_S: float | None = None
 
 
 def enable_system_trust_store() -> bool:
@@ -150,10 +166,10 @@ class MiaouMCPBase:
     ) -> None:
         self.default_port = default_port
         self.config = config or {}
-        _security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        self.mcp = FastMCP(
-            name, transport_security=_security, instructions=instructions
-        )
+        # `instructions` PAR MOT-CLEF : en 2.x, le deuxième paramètre
+        # positionnel de MCPServer est `title`, et une consigne passée là
+        # partirait en `serverInfo.title` sans erreur.
+        self.mcp = MCPServer(name, instructions=instructions)
 
     def finalize_tools(self) -> None:
         """Normalise ce que tools/list expose, pour réduire le payload envoyé au
@@ -173,7 +189,17 @@ class MiaouMCPBase:
 
     def _make_app(self):
         """Build the Starlette ASGI app with CORS middleware."""
-        app = self.mcp.streamable_http_app()
+        # `transport_security` ici et nulle part ailleurs : en 2.x il a quitté
+        # le constructeur, et l'omettre RÉACTIVE la protection DNS-rebinding
+        # (hôte par défaut 127.0.0.1), qui refuse l'`Origin: null` de MIAOU
+        # servi en file:// — cf. CLAUDE.md, « Deux points à ne pas toucher ».
+        app = self.mcp.streamable_http_app(
+            transport_security=TransportSecuritySettings(
+                enable_dns_rebinding_protection=False
+            ),
+            max_request_body_size=MAX_REQUEST_BODY_BYTES,
+            session_idle_timeout=SESSION_IDLE_TIMEOUT_S,
+        )
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],

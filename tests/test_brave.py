@@ -93,9 +93,9 @@ async def test_brave_valid_response_returns_embedded_resource():
     mock_resp = _make_mock_resp(_BRAVE_RESPONSE)
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_search", {"query": "python"})
+        result = await _TM.call_tool("brave_search", {"query": "python"}, None)
     assert isinstance(result, types.EmbeddedResource)
-    assert result.resource.mimeType == "application/json"
+    assert result.resource.mime_type == "application/json"
 
 
 @pytest.mark.asyncio
@@ -103,7 +103,7 @@ async def test_brave_extracts_title_url_description():
     mock_resp = _make_mock_resp(_BRAVE_RESPONSE)
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_search", {"query": "python"})
+        result = await _TM.call_tool("brave_search", {"query": "python"}, None)
     items = json.loads(result.resource.text)
     assert len(items) == 2
     assert items[0]["title"] == "Python (programming language)"
@@ -116,7 +116,7 @@ async def test_brave_uri_contains_query():
     mock_resp = _make_mock_resp(_BRAVE_RESPONSE)
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_search", {"query": "asyncio"})
+        result = await _TM.call_tool("brave_search", {"query": "asyncio"}, None)
     assert "asyncio" in str(result.resource.uri)
 
 
@@ -127,7 +127,7 @@ async def test_brave_401_returns_specific_error():
     )
     with patch.dict(os.environ, {"BRAVE_API_KEY": "bad-key"}), \
          patch("urllib.request.OpenerDirector.open", side_effect=err):
-        result = await _TM.call_tool("brave_search", {"query": "python"})
+        result = await _TM.call_tool("brave_search", {"query": "python"}, None)
     assert err.fp.closed   # fermée par le serveur, pas par le test
     assert isinstance(result, str)
     assert "401" in result or "invalide" in result.lower()
@@ -140,7 +140,7 @@ async def test_brave_429_returns_quota_error():
     )
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", side_effect=err):
-        result = await _TM.call_tool("brave_search", {"query": "python"})
+        result = await _TM.call_tool("brave_search", {"query": "python"}, None)
     assert err.fp.closed   # fermée par le serveur, pas par le test
     assert isinstance(result, str)
     assert "429" in result or "quota" in result.lower()
@@ -151,7 +151,7 @@ async def test_brave_url_error_returns_string():
     err = urllib.error.URLError("Network unreachable")
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", side_effect=err):
-        result = await _TM.call_tool("brave_search", {"query": "python"})
+        result = await _TM.call_tool("brave_search", {"query": "python"}, None)
     assert isinstance(result, str)
     assert "réseau" in result.lower() or "Network unreachable" in result
 
@@ -169,7 +169,7 @@ async def test_brave_search_degenerate_web_field_returns_empty_results():
     mock_resp = _make_mock_resp({"web": None})
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_search", {"query": "python"})
+        result = await _TM.call_tool("brave_search", {"query": "python"}, None)
     assert isinstance(result, types.EmbeddedResource)
     assert json.loads(result.resource.text) == []
 
@@ -179,7 +179,7 @@ async def test_brave_search_degenerate_results_field_returns_clear_string():
     mock_resp = _make_mock_resp({"web": {"results": "not-a-list"}})
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_search", {"query": "python"})
+        result = await _TM.call_tool("brave_search", {"query": "python"}, None)
     assert isinstance(result, str)
     assert "invalide" in result.lower()
 
@@ -189,7 +189,7 @@ async def test_brave_search_result_entry_not_dict_skipped():
     mock_resp = _make_mock_resp({"web": {"results": ["not-a-dict"]}})
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_search", {"query": "python"})
+        result = await _TM.call_tool("brave_search", {"query": "python"}, None)
     items = json.loads(result.resource.text)
     assert items == []
 
@@ -206,7 +206,7 @@ async def test_brave_search_count_clamped_to_20():
 
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", capturing_open):
-        await _TM.call_tool("brave_search", {"query": "python", "count": 50})
+        await _TM.call_tool("brave_search", {"query": "python", "count": 50}, None)
     assert "count=20" in captured["url"]
 
 
@@ -220,7 +220,7 @@ async def test_brave_search_count_clamped_to_1():
 
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", capturing_open):
-        await _TM.call_tool("brave_search", {"query": "python", "count": 0})
+        await _TM.call_tool("brave_search", {"query": "python", "count": 0}, None)
     assert "count=1" in captured["url"]
 
 
@@ -251,9 +251,9 @@ async def test_image_search_valid_response_returns_embedded_resource():
     mock_resp = _make_mock_resp(_BRAVE_IMAGES_RESPONSE)
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+        result = await _TM.call_tool("brave_image_search", {"query": "python"}, None)
     assert isinstance(result, types.EmbeddedResource)
-    assert result.resource.mimeType == "application/json"
+    assert result.resource.mime_type == "application/json"
 
 
 @pytest.mark.asyncio
@@ -261,7 +261,7 @@ async def test_image_search_output_fields():
     mock_resp = _make_mock_resp(_BRAVE_IMAGES_RESPONSE)
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+        result = await _TM.call_tool("brave_image_search", {"query": "python"}, None)
     items = json.loads(result.resource.text)
     assert len(items) == 1  # second entry dropped (no properties.url)
     assert items[0]["title"] == "Python logo"
@@ -276,7 +276,7 @@ async def test_image_search_drops_entries_without_image_url():
     mock_resp = _make_mock_resp(_BRAVE_IMAGES_RESPONSE)
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+        result = await _TM.call_tool("brave_image_search", {"query": "python"}, None)
     items = json.loads(result.resource.text)
     assert all(item["image_url"] for item in items)
 
@@ -293,7 +293,7 @@ async def test_image_search_count_clamped_to_20():
 
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", capturing_open):
-        await _TM.call_tool("brave_image_search", {"query": "python", "count": 50})
+        await _TM.call_tool("brave_image_search", {"query": "python", "count": 50}, None)
     assert "count=20" in captured["url"]
 
 
@@ -302,7 +302,7 @@ async def test_image_search_uri_contains_query():
     mock_resp = _make_mock_resp({"results": []})
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_image_search", {"query": "asyncio"})
+        result = await _TM.call_tool("brave_image_search", {"query": "asyncio"}, None)
     assert "asyncio" in str(result.resource.uri)
     assert "brave-images" in str(result.resource.uri)
 
@@ -314,7 +314,7 @@ async def test_image_search_401_returns_error():
     )
     with patch.dict(os.environ, {"BRAVE_API_KEY": "bad-key"}), \
          patch("urllib.request.OpenerDirector.open", side_effect=err):
-        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+        result = await _TM.call_tool("brave_image_search", {"query": "python"}, None)
     assert err.fp.closed   # fermée par le serveur, pas par le test
     assert isinstance(result, str)
     assert "401" in result or "invalide" in result.lower()
@@ -327,7 +327,7 @@ async def test_image_search_429_returns_quota_error():
     )
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", side_effect=err):
-        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+        result = await _TM.call_tool("brave_image_search", {"query": "python"}, None)
     assert err.fp.closed   # fermée par le serveur, pas par le test
     assert isinstance(result, str)
     assert "429" in result or "quota" in result.lower()
@@ -338,7 +338,7 @@ async def test_image_search_url_error_returns_string():
     err = urllib.error.URLError("Network unreachable")
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", side_effect=err):
-        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+        result = await _TM.call_tool("brave_image_search", {"query": "python"}, None)
     assert isinstance(result, str)
     assert "réseau" in result.lower() or "Network unreachable" in result
 
@@ -366,7 +366,7 @@ async def test_image_search_handles_null_thumbnail():
     mock_resp = _make_mock_resp(response)
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+        result = await _TM.call_tool("brave_image_search", {"query": "python"}, None)
     items = json.loads(result.resource.text)
     assert len(items) == 1
     assert items[0]["thumbnail_url"] == ""
@@ -378,7 +378,7 @@ async def test_image_search_degenerate_results_field_returns_clear_string():
     mock_resp = _make_mock_resp({"results": "not-a-list"})
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+        result = await _TM.call_tool("brave_image_search", {"query": "python"}, None)
     assert isinstance(result, str)
     assert "invalide" in result.lower()
 
@@ -388,6 +388,6 @@ async def test_image_search_result_entry_not_dict_skipped():
     mock_resp = _make_mock_resp({"results": ["not-a-dict"]})
     with patch.dict(os.environ, {"BRAVE_API_KEY": "test-key"}), \
          patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
-        result = await _TM.call_tool("brave_image_search", {"query": "python"})
+        result = await _TM.call_tool("brave_image_search", {"query": "python"}, None)
     items = json.loads(result.resource.text)
     assert items == []

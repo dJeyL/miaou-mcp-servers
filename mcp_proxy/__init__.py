@@ -100,7 +100,6 @@ from .netproxy import (  # noqa: E402
     resolve_proxy_url,
 )
 from .server import (  # noqa: E402
-    _AUTHORIZATION_SENTINEL,
     _INSTRUCTIONS_PREAMBLE,
     STATUS_TOOL_NAME,
     UNAUTHORIZED_UPSTREAMS_META_KEY,
@@ -108,8 +107,6 @@ from .server import (  # noqa: E402
     UpstreamNotAuthorized,
     _resolve_via_prefix,
     _status_tool,
-    _wrap_authorization_required,
-    _wrap_ref_unknown_sentinel,
     aggregate_instructions,
     build_proxy_server,
     build_status_report,

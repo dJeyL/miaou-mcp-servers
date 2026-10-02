@@ -16,6 +16,7 @@ for p in (_ROOT, _SERVERS):
 import mcp.types as types
 
 import mcp_proxy
+from tests.proxy_client import call_tool, list_tools
 from mcp_proxy import (
     InProcessUpstream,
     StdioUpstream,
@@ -237,8 +238,8 @@ async def test_proxy_list_tools_prefixes():
 
     mock_upstream.list_tools = AsyncMock(
         return_value=[
-            types.Tool(name="echo", description="", inputSchema={}),
-            types.Tool(name="add", description="", inputSchema={}),
+            types.Tool(name="echo", description="", inputSchema={"type": "object"}),
+            types.Tool(name="add", description="", inputSchema={"type": "object"}),
         ]
     )
 
@@ -246,12 +247,8 @@ async def test_proxy_list_tools_prefixes():
     tool_map: dict = {}
     server = build_proxy_server(upstreams, tool_map)
 
-    # Appelle le handler list_tools directement via le request_handlers dict
-    handler = server.request_handlers.get(types.ListToolsRequest)
-    assert handler is not None
-
-    result = await handler(types.ListToolsRequest(method="tools/list", params=None))
-    names = {t.name for t in result.root.tools}
+    result = await list_tools(server)
+    names = {t.name for t in result.tools}
     assert "bench__echo" in names
     assert "bench__add" in names
     assert "echo" not in names
@@ -264,10 +261,12 @@ async def test_proxy_call_tool_routes_correctly():
     import mcp.types as types
 
     mock_upstream.list_tools = AsyncMock(
-        return_value=[types.Tool(name="echo", description="", inputSchema={})]
+        return_value=[types.Tool(name="echo", description="", inputSchema={"type": "object"})]
     )
     mock_upstream.call_tool = AsyncMock(
-        return_value=[types.TextContent(type="text", text="hello")]
+        return_value=types.CallToolResult(
+            content=[types.TextContent(type="text", text="hello")]
+        )
     )
 
     upstreams = {"bench": mock_upstream}
@@ -275,16 +274,8 @@ async def test_proxy_call_tool_routes_correctly():
     server = build_proxy_server(upstreams, tool_map)
 
     # Peuple le tool_map via list_tools
-    list_handler = server.request_handlers.get(types.ListToolsRequest)
-    await list_handler(types.ListToolsRequest(method="tools/list", params=None))
-
-    call_handler = server.request_handlers.get(types.CallToolRequest)
-    await call_handler(
-        types.CallToolRequest(
-            method="tools/call",
-            params=types.CallToolRequestParams(name="bench__echo", arguments={"text": "hello"}),
-        )
-    )
+    await list_tools(server)
+    await call_tool(server, "bench__echo", {"text": "hello"})
     mock_upstream.call_tool.assert_awaited_once_with("echo", {"text": "hello"})
 
 
@@ -457,20 +448,20 @@ async def test_inprocess_upstream_uses_build_when_available():
     """Un module avec build(config) est instancié via build(), pas via l'attribut mcp."""
     import types as _types
 
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
     fake_module = _types.ModuleType("mcp_fake_buildable")
     captured: dict = {}
 
     def build(config=None):
         captured["config"] = config
-        fastmcp = FastMCP("fake")
+        server = MCPServer("fake")
 
-        @fastmcp.tool()
+        @server.tool()
         def get_base_url() -> str:
             return (config or {}).get("base_url", "unset")
 
-        return fastmcp
+        return server
 
     fake_module.build = build
     sys.modules["mcp_fake_buildable"] = fake_module
@@ -498,7 +489,7 @@ async def test_inprocess_upstream_falls_back_to_mcp_singleton_without_build():
 @pytest.mark.asyncio
 async def test_inprocess_upstream_warns_on_shared_module_without_build(capsys):
     """PRX5 : deux entrées inprocess pointant le même module sans build()
-    partagent le même singleton FastMCP (env figé au premier import) — un
+    partagent le même singleton MCPServer (env figé au premier import) — un
     warning stderr doit signaler la situation, pas silencieusement."""
     first = InProcessUpstream("mcp_bench")
     second = InProcessUpstream("mcp_bench")
@@ -513,22 +504,22 @@ async def test_inprocess_upstream_warns_on_shared_module_without_build(capsys):
 @pytest.mark.asyncio
 async def test_inprocess_upstream_two_instances_same_module_different_config():
     """Le cas d'usage cible : deux instances du même module (un seul fichier),
-    chacune avec sa propre config, produisent des FastMCP indépendants qui
+    chacune avec sa propre config, produisent des MCPServer indépendants qui
     renvoient des valeurs différentes."""
     import types as _types
 
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
     fake_module = _types.ModuleType("mcp_fake_multi")
 
     def build(config=None):
-        fastmcp = FastMCP("fake-multi")
+        server = MCPServer("fake-multi")
 
-        @fastmcp.tool()
+        @server.tool()
         def get_base_url() -> str:
             return (config or {}).get("base_url", "unset")
 
-        return fastmcp
+        return server
 
     fake_module.build = build
     sys.modules["mcp_fake_multi"] = fake_module
@@ -559,19 +550,15 @@ async def test_proxy_call_tool_falls_back_to_prefix_when_not_in_tool_map():
     mock_upstream = MagicMock()
     mock_upstream.list_tools = AsyncMock(return_value=[])  # cache SDK : rien à lister
     mock_upstream.call_tool = AsyncMock(
-        return_value=[types.TextContent(type="text", text="hello")]
+        return_value=types.CallToolResult(
+            content=[types.TextContent(type="text", text="hello")]
+        )
     )
     upstreams = {"bench": mock_upstream}
     tool_map: dict = {}  # "bench__echo" absent malgré le upstream connu
     server = build_proxy_server(upstreams, tool_map)
 
-    call_handler = server.request_handlers.get(types.CallToolRequest)
-    await call_handler(
-        types.CallToolRequest(
-            method="tools/call",
-            params=types.CallToolRequestParams(name="bench__echo", arguments={"text": "hi"}),
-        )
-    )
+    await call_tool(server, "bench__echo", {"text": "hi"})
     mock_upstream.call_tool.assert_awaited_once_with("echo", {"text": "hi"})
 
 
@@ -580,25 +567,15 @@ async def test_proxy_call_tool_unknown_prefix_still_fails():
     """Le fallback ne doit pas masquer un vrai outil inconnu : un préfixe qui
     ne correspond à aucun upstream reste une erreur (T7 : fusion de deux tests
     quasi-identiques, même chemin de code — outil inconnu = préfixe inconnu
-    ici, aucun upstream enregistré). Le pattern try/except est tolérant par
-    design : le SDK peut soit capturer McpError en isError, soit la propager."""
-    import mcp.types as types
-    from mcp.shared.exceptions import McpError
-
+    ici, aucun upstream enregistré). isError textuel, comme avant la 2.x :
+    c'est ce que le modèle lit, et le seul refus qu'il puisse corriger."""
     upstreams: dict = {}
     tool_map: dict = {}
     server = build_proxy_server(upstreams, tool_map)
 
-    call_handler = server.request_handlers.get(types.CallToolRequest)
-    request = types.CallToolRequest(
-        method="tools/call",
-        params=types.CallToolRequestParams(name="ghost__tool", arguments={}),
-    )
-    try:
-        result = await call_handler(request)
-        assert result.root.isError, "Attendu isError=True pour un outil inconnu"
-    except McpError:
-        pass  # comportement attendu si le SDK propage l'exception
+    result = await call_tool(server, "ghost__tool")
+    assert result.is_error is True
+    assert result.content[0].text == "Outil inconnu : 'ghost__tool'"
 
 
 # ---------------------------------------------------------------------------
@@ -654,56 +631,84 @@ async def test_build_app_mcp_without_trailing_slash_no_redirect():
 
 
 # ---------------------------------------------------------------------------
-# Portée du sentinel REF_UNKNOWN (PRX1/PRX2)
+# Erreurs d'outil : ce qui sort en isError, ce qui sort en erreur JSON-RPC
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_ref_unknown_sentinel_not_converted_for_upstream_without_contract():
-    """PRX1 : un upstream qui ne déclare pas le contrat REF_UNKNOWN garde son
-    isError textuel, même si le texte contient « REF_UNKNOWN » — avant le
-    scoping, ce faux positif était converti en erreur JSON-RPC et déclenchait un
-    rejeu client inutile."""
-    import mcp.types as types
+async def test_upstream_exception_reaches_the_model_as_iserror_text():
+    """Le `Server` bas niveau du SDK 2.x n'enveloppe plus les exceptions d'outil :
+    sans la prise de handle_call_tool, celle-ci sortirait en erreur JSON-RPC de
+    code 0, et le modèle ne lirait plus rien. Comme en 1.x : isError + str(e)."""
+    upstream = MagicMock()
+    upstream.call_tool = AsyncMock(side_effect=RuntimeError("boom REF_UNKNOWN cité"))
+    upstream.list_tools = AsyncMock(return_value=[])
+
+    server = build_proxy_server({"other": upstream}, {"other__t": ("other", "t")})
+    result = await call_tool(server, "other__t")
+
+    assert result.is_error is True
+    assert result.content[0].text == "boom REF_UNKNOWN cité"
+
+
+@pytest.mark.asyncio
+async def test_a_schemaless_tool_does_not_take_the_whole_listing_down():
+    """Le SDK 2.x valide un résultat contre le schéma du protocole avant de
+    l'émettre : un seul `inputSchema` sans `"type": "object"` ferait rejeter
+    TOUT le tools/list en INTERNAL_ERROR, les autres upstreams avec. Le proxy
+    complète le schéma plutôt que de laisser un outil éteindre les autres."""
+    sloppy = MagicMock()
+    sloppy.list_tools = AsyncMock(
+        return_value=[types.Tool(name="vague", description="", input_schema={})]
+    )
+    sound = MagicMock()
+    sound.list_tools = AsyncMock(
+        return_value=[
+            types.Tool(name="echo", description="", input_schema={"type": "object"})
+        ]
+    )
+    server = build_proxy_server({"sloppy": sloppy, "sound": sound}, {})
+
+    result = await list_tools(server)
+    by_name = {t.name: t for t in result.tools}
+    assert set(by_name) == {"sloppy__vague", "sound__echo"}
+    assert by_name["sloppy__vague"].input_schema["type"] == "object"
+
+
+@pytest.mark.asyncio
+async def test_remote_upstream_jsonrpc_error_is_flattened_to_iserror():
+    """La réponse d'erreur JSON-RPC d'un upstream DISTANT est la sienne, pas un
+    contrat du proxy : elle reste aplatie en isError, comme en 1.x. Seule une
+    MCPError d'un upstream inprocess traverse (test suivant)."""
+    from mcp.shared.exceptions import MCPError
 
     upstream = MagicMock()
-    upstream.ref_unknown_contract = None
     upstream.call_tool = AsyncMock(
-        side_effect=RuntimeError("boom REF_UNKNOWN mentionné dans le message")
+        side_effect=MCPError(-31999, "refus distant", data={"code": "REF_UNKNOWN"})
     )
     upstream.list_tools = AsyncMock(return_value=[])
 
     server = build_proxy_server({"other": upstream}, {"other__t": ("other", "t")})
-    handler = server.request_handlers[types.CallToolRequest]
-    result = await handler(
-        types.CallToolRequest(
-            method="tools/call",
-            params=types.CallToolRequestParams(name="other__t", arguments={}),
-        )
-    )
+    result = await call_tool(server, "other__t")
 
-    # Pas de McpError levée : le résultat reste un CallToolResult isError.
-    assert result.root.isError is True
-    assert "REF_UNKNOWN" in result.root.content[0].text
+    assert result.is_error is True
+    assert "refus distant" in result.content[0].text
 
 
 @pytest.mark.asyncio
-async def test_ref_unknown_contract_read_from_upstream_module():
-    """PRX2 : le contrat est lu sur le module upstream réellement importé
-    (getattr), pas via un import mcp_docs codé en dur dans le proxy."""
+async def test_inprocess_mcperror_crosses_the_proxy_with_its_data():
+    """Une MCPError levée délibérément par un outil inprocess (REF_UNKNOWN de
+    mcp_docs) traverse en erreur JSON-RPC, `data` intact — sur le vrai chemin
+    JSON-RPC, pas sur l'objet Python."""
+    from mcp.shared.exceptions import MCPError
+
     upstream = InProcessUpstream("mcp_docs")
     await upstream.start()
+    server = build_proxy_server({"docs": upstream}, {})
+    await list_tools(server)
 
-    import mcp_docs
-
-    assert upstream.ref_unknown_contract == (
-        mcp_docs.REF_UNKNOWN_SENTINEL,
-        mcp_docs.REF_UNKNOWN_ERROR_CODE,
-    )
-
-    # Un module sans les constantes ne déclare aucun contrat.
-    bench = InProcessUpstream("mcp_bench")
-    await bench.start()
-    assert bench.ref_unknown_contract is None
+    with pytest.raises(MCPError) as exc_info:
+        await call_tool(server, "docs__list", {"ref": "att-99", "session_id": "conv-1"})
+    assert exc_info.value.error.data == {"code": "REF_UNKNOWN"}
 
 
 def test_proxy_without_docs_does_not_import_mcp_docs(tmp_path):
@@ -812,10 +817,8 @@ async def test_lifespan_skips_upstream_that_fails_to_start(capsys):
         # Retiré de la table de routage : sinon _resolve_via_prefix le verrait
         # encore et un appel d'outil échouerait de façon obscure.
         assert "broken" not in upstreams
-        tools = await server.request_handlers[types.ListToolsRequest](
-            types.ListToolsRequest(method="tools/list")
-        )
-        names = [t.name for t in tools.root.tools]
+        tools = await list_tools(server)
+        names = [t.name for t in tools.tools]
         assert any(n.startswith("bench__") for n in names)
         assert not any(n.startswith("broken__") for n in names)
 
@@ -897,10 +900,10 @@ async def test_http_upstream_start_times_out(monkeypatch):
     @asynccontextmanager
     async def _never_responds(*a, **kw):
         await anyio.sleep_forever()
-        yield (None, None, None)  # pragma: no cover
+        yield (None, None)  # pragma: no cover
 
     monkeypatch.setattr(
-        "mcp.client.streamable_http.streamablehttp_client", _never_responds
+        "mcp.client.streamable_http.streamable_http_client", _never_responds
     )
     up = mcp_proxy.HttpUpstream("https://example.test/mcp", timeout=0.05)
     async with anyio.create_task_group() as tg:
@@ -931,7 +934,7 @@ async def test_http_upstream_delegates_to_session():
     """list_tools/call_tool délèguent à la session, comme StdioUpstream."""
     up = mcp_proxy.HttpUpstream("https://example.test/mcp")
     session = MagicMock()
-    tool = types.Tool(name="echo", description="d", inputSchema={})
+    tool = types.Tool(name="echo", description="d", inputSchema={"type": "object"})
     session.list_tools = AsyncMock(return_value=MagicMock(tools=[tool]))
     block = types.TextContent(type="text", text="hi")
     session.call_tool = AsyncMock(return_value=types.CallToolResult(content=[block]))
@@ -940,7 +943,7 @@ async def test_http_upstream_delegates_to_session():
     assert await up.list_tools() == [tool]
     relayed = await up.call_tool("echo", {"text": "hi"})
     assert relayed.content == [block]
-    assert relayed.isError is False
+    assert relayed.is_error is False
     session.call_tool.assert_awaited_once_with("echo", {"text": "hi"})
 
 
@@ -964,9 +967,9 @@ async def test_http_upstream_relays_is_error_and_meta():
     up._session = session
 
     relayed = await up.call_tool("echo", {})
-    assert relayed.isError is True
+    assert relayed.is_error is True
     assert relayed.meta == {"miaou/web": {"title": "T"}}
-    assert relayed.structuredContent is None
+    assert relayed.structured_content is None
     wire = relayed.model_dump_json(by_alias=True, exclude_none=True)
     assert '"_meta":{"miaou/web":{"title":"T"}}' in wire
 
@@ -984,7 +987,7 @@ async def test_stdio_upstream_relays_meta():
     up._session = session
     relayed = await up.call_tool("t", {})
     assert relayed.meta == {"k": 1}
-    assert relayed.isError is False
+    assert relayed.is_error is False
 
 
 async def test_proxy_passes_call_tool_result_through_with_meta():
@@ -993,7 +996,7 @@ async def test_proxy_passes_call_tool_result_through_with_meta():
     l'objet passerait aussi sur une clé mal sérialisée)."""
     mock_upstream = MagicMock()
     mock_upstream.list_tools = AsyncMock(
-        return_value=[types.Tool(name="fetch_url", description="", inputSchema={})]
+        return_value=[types.Tool(name="fetch_url", description="", inputSchema={"type": "object"})]
     )
     mock_upstream.call_tool = AsyncMock(
         return_value=types.CallToolResult(
@@ -1002,53 +1005,47 @@ async def test_proxy_passes_call_tool_result_through_with_meta():
         )
     )
     server = build_proxy_server({"web": mock_upstream}, {})
-    await server.request_handlers[types.ListToolsRequest](
-        types.ListToolsRequest(method="tools/list", params=None)
-    )
-    result = await server.request_handlers[types.CallToolRequest](
-        types.CallToolRequest(
-            method="tools/call",
-            params=types.CallToolRequestParams(name="web__fetch_url", arguments={}),
-        )
-    )
+    await list_tools(server)
+    # Relu côté client après un vrai passage JSON-RPC : un `_meta` mal aliasé
+    # aurait été jeté à la relecture (la 2.x ignore les champs inconnus).
+    result = await call_tool(server, "web__fetch_url")
     wire = result.model_dump_json(by_alias=True, exclude_none=True)
     assert '"_meta":{"miaou/web":{"site_name":"S"}}' in wire
-    assert result.root.isError is False
+    assert result.is_error is False
 
 
-def test_mcp_sdk_http_client_still_trusts_env():
+def test_http_upstream_client_trusts_env():
     """Le contrat --proxy/--noproxy vaut pour un upstream HTTP UNIQUEMENT parce
-    que le client httpx du SDK garde trust_env=True (défaut httpx) : il lit alors
+    que son client garde trust_env=True (défaut httpx2) : il lit alors
     os.environ, que main() a déjà modifié avant build_upstreams().
 
-    C'est une propriété d'une bibliothèque tierce, pas de notre code — d'où ce
-    test : si un jour le SDK passait trust_env=False, --noproxy deviendrait
-    silencieusement inopérant sur ce seul type d'upstream.
+    Porte sur le client que HttpUpstream construit RÉELLEMENT. Avant le SDK
+    2.x, c'était le SDK qui le construisait, et ce test visait le sien
+    (`create_mcp_http_client`) — un test resté vert sur un client que plus
+    personne n'emploie ne prouverait rien.
     """
-    from mcp.shared._httpx_utils import create_mcp_http_client
-
-    client = create_mcp_http_client()
+    client = mcp_proxy.HttpUpstream("https://example.test/mcp")._build_http_client()
     assert client.trust_env is True
 
 
 def test_noproxy_overrides_reach_http_upstream_via_process_env(monkeypatch):
-    """--noproxy efface les variables du process, donc le client httpx d'un
-    HttpUpstream ne voit plus de proxy. Le chemin est indirect (os.environ),
-    d'où la vérification de bout en bout plutôt que sur un attribut."""
-    from mcp.shared._httpx_utils import create_mcp_http_client
-
+    """--noproxy efface les variables du process, donc le client d'un
+    HttpUpstream ne monte plus de proxy. Vérifié sur l'EFFET (un transport de
+    proxy monté ou non), pas sur l'attribut trust_env : avec l'environnement
+    d'origine, le même client en monte un."""
     monkeypatch.setenv("http_proxy", "http://from-env:3128")
     monkeypatch.setenv("HTTPS_PROXY", "http://from-env:3128")
+    upstream = mcp_proxy.HttpUpstream("https://example.test/mcp")
+
+    # Témoin : l'environnement d'origine fait bien monter un proxy.
+    assert upstream._build_http_client()._mounts
 
     overrides = compute_proxy_env_overrides(proxy=None, noproxy=True)
     apply_proxy_env_overrides_to_process(overrides)
 
     for key in mcp_proxy._PROXY_ENV_KEYS:
         assert key not in os.environ
-
-    # trust_env=True + environnement nettoyé = aucun proxy monté.
-    client = create_mcp_http_client()
-    assert client.trust_env is True
+    assert not upstream._build_http_client()._mounts
 
 
 # ---------------------------------------------------------------------------
@@ -1087,34 +1084,25 @@ def test_main_enables_system_trust_store_before_building_upstreams(tmp_path, mon
     assert order == ["trust", "upstreams", "serve"]
 
 
-def test_sdk_http_client_uses_injected_ssl_context():
-    """Le client httpx du SDK doit construire son contexte SSL via ssl.SSLContext.
+def test_http_upstream_client_checks_the_system_trust_store():
+    """Le client d'un upstream `http` doit vérifier les certificats contre le
+    magasin de confiance du SYSTÈME — c'est le cas qui a motivé truststore (AC
+    d'entreprise interne, `CERTIFICATE_VERIFY_FAILED` alors que le navigateur
+    accepte).
 
-    C'est le maillon qui fait tenir toute la migration pour un upstream `http` :
-    on n'injecte rien dans ce client, on remplace la classe qu'il utilise. S'il
-    se mettait un jour à construire un contexte autrement (ssl_context explicite,
-    bundle certifi câblé en dur), `enable_system_trust_store()` deviendrait
-    silencieusement inopérant sur le seul type d'upstream qui a motivé le
-    changement — même raison d'être que le test sur trust_env juste au-dessus.
+    Depuis le SDK 2.x, c'est httpx2 qui le fait de lui-même
+    (`truststore.SSLContext` par défaut), sans dépendre de l'injection de
+    `enable_system_trust_store()` — qui reste utile pour urllib (serveurs). Le
+    test porte sur le client que HttpUpstream construit RÉELLEMENT ; il visait
+    avant la migration celui que construisait le SDK, que plus personne n'emploie.
+    """
+    import os as _os
 
-    Sous-process : l'injection est globale et irréversible dans un process."""
-    import subprocess
-
-    code = (
-        "import ssl, truststore;"
-        "truststore.inject_into_ssl();"
-        "from mcp.shared._httpx_utils import create_mcp_http_client;"
-        "c = create_mcp_http_client();"
-        "ctx = c._transport._pool._ssl_context;"
-        "print(isinstance(ctx, ssl.SSLContext), type(ctx).__module__)"
-    )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-    assert out.returncode == 0, out.stderr
-    is_instance, module = out.stdout.split()
-    assert is_instance == "True"
-    assert module == "truststore._api", (
-        "le client httpx du SDK ne passe plus par la classe ssl.SSLContext injectée"
-    )
+    if _os.environ.get("SSL_CERT_FILE") or _os.environ.get("SSL_CERT_DIR"):
+        pytest.skip("SSL_CERT_FILE/SSL_CERT_DIR posés : httpx2 les préfère, à dessein")
+    client = mcp_proxy.HttpUpstream("https://example.test/mcp")._build_http_client()
+    ctx = client._transport._pool._ssl_context
+    assert type(ctx).__module__.startswith("truststore"), type(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -1173,7 +1161,7 @@ async def test_bench_instructions_survive_aggregation():
 @pytest.mark.asyncio
 async def test_inprocess_upstream_captures_instructions():
     """Chemin inprocess : pas d'initialize, les instructions se lisent sur le
-    FastMCP importé."""
+    MCPServer importé."""
     up = InProcessUpstream("mcp_bench")
     await up.start()
     import mcp_bench

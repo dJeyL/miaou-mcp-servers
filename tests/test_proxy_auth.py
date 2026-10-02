@@ -15,7 +15,7 @@ import asyncio
 import contextlib
 from contextlib import asynccontextmanager
 
-import httpx
+import httpx2
 import pytest
 
 _ROOT = Path(__file__).parent.parent
@@ -83,7 +83,7 @@ def _app(auth=None, token_verifier=None):
 
 
 def _client(app):
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver")
+    return httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url="http://testserver")
 
 
 @asynccontextmanager
@@ -208,7 +208,12 @@ async def test_well_known_is_public_when_auth_enabled():
         r = await c.get("/.well-known/oauth-protected-resource/mcp")
     assert r.status_code == 200
     body = r.json()
-    assert body["authorization_servers"] == [_ISSUER + "/"]
+    # À l'OCTET près, sans slash ajouté : un client du SDK 2.x compare
+    # l'issuer de l'AS à cette valeur par égalité stricte (RFC 8414 §3.3). Ce
+    # test a longtemps exigé `_ISSUER + "/"` — il épinglait la normalisation
+    # d'`AnyHttpUrl`, qui fait échouer le parcours face à un AS déclaré sans
+    # slash (le nôtre, dev_auth_server, entre autres).
+    assert body["authorization_servers"] == [_ISSUER]
     assert body["resource"].endswith("/mcp")
 
 
@@ -244,7 +249,7 @@ async def test_resource_metadata_pointer_is_fetchable():
     async with _client(app) as c:
         r = await c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
         url = r.headers["www-authenticate"].split('resource_metadata="')[1].split('"')[0]
-        assert (await c.get(httpx.URL(url).path)).status_code == 200
+        assert (await c.get(httpx2.URL(url).path)).status_code == 200
 
 
 async def test_invalid_token_is_401_not_500():
