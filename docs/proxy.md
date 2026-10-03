@@ -193,7 +193,7 @@ parle, `initialize` sinon. Rien n'est écrit ici : `StdioUpstream.start()` et
 qui sonde et se replie lui-même (`mcp/client/_probe.py`, `negotiate_auto`), puis lisent
 sur `client.session` ce que les deux ères posent pareil : `instructions`,
 `protocol_version`, `server_capabilities` (recopiés sur `Upstream.instructions`,
-`protocol_version`, `capabilities`). `mode` vient de la clé `protocol` de l'entrée :
+`protocol_version`, `capabilities`). `mode` vient de la clé `protocol_era` de l'entrée :
 `"auto"` par défaut, `"legacy"` pour imposer `initialize` — le recours, sans code, pour un
 upstream moderne d'un autre SDK que la validation de la révision 2026-07-28 ferait
 échouer. L'ère retenue figure dans le journal de démarrage, à la suite du nombre
@@ -399,7 +399,7 @@ de l'upstream. Faux, elles rendent « aucune skill » sans émettre de requête.
 deux : un serveur 2.x répond à `skills/*` même abordé en `initialize` (mesuré), la
 réponse ne dit donc pas si l'on avait le droit de demander — et la spec lie l'extension
 à `server/discover`. Un upstream legacy, constaté par la sonde ou forcé par
-`protocol: "legacy"`, ne reçoit ainsi aucune requête de plus, et ce que le proxy publie
+`protocol_era: "legacy"`, ne reçoit ainsi aucune requête de plus, et ce que le proxy publie
 pour lui ne change pas. L'inprocess, sans fil, sert toujours (`serves_skills` vrai, ses
 skills lues sur le `MCPServer`).
 
@@ -410,7 +410,7 @@ le client vérifie (empreintes comprises). `skills/get` rend l'entrée déballé
 comme l'inprocess. `resources/read` par `session.read_resource`, qui pose `Mcp-Name` en
 ère moderne ; le SDK y valide le résultat contre la révision 2026-07-28 (`cacheScope` et
 `resultType` requis), ce qu'un upstream d'un autre SDK peut ne pas tenir — erreur rendue
-en `INTERNAL_ERROR`, seul recours `protocol: "legacy"`, qui coupe aussi ses skills.
+en `INTERNAL_ERROR`, seul recours `protocol_era: "legacy"`, qui coupe aussi ses skills.
 `skills/*` n'est pas validé par le SDK (méthode hors de son tableau). Le tampon moderne
 (`_meta`, en-têtes d'ère) est posé par le SDK, rien à écrire ici. Chaque requête est
 bornée par le délai de l'upstream (`timeout` http, 15 s stdio) : un upstream muet ne
@@ -467,7 +467,7 @@ nombre (`up           7 tools, 1 skill (2026-07-28)`, inprocess compris), et le 
 d'outils exclut le repli retiré. Une ligne par upstream, avec l'URI et le nombre
 d'outils, pour une skill exigée mais non servie (`skill exigée mais non servie par 'x' :
 skill://…/SKILL.md (7 outils)`). « skills non relayées (… forcé en ère legacy par la
-config…) » reste pour un upstream en `protocol: "legacy"` : jamais interrogé en moderne,
+config…) » reste pour un upstream en `protocol_era: "legacy"` : jamais interrogé en moderne,
 il peut servir des skills que le proxy ne relaiera pas. Rien pour un legacy constaté par
 la sonde, qui ne peut pas servir l'extension.
 
@@ -557,7 +557,7 @@ l'affaire du client.
 
 `type` absent → `stdio` (défaut). `port` est obligatoire, `host` est optionnel.
 Une entrée `http` exige `url` ; `headers` et `timeout` y sont optionnels.
-`protocol` sur une entrée stdio ou http : `"auto"` (défaut, l'ère est négociée) ou
+`protocol_era` sur une entrée stdio ou http : `"auto"` (défaut, l'ère est négociée) ou
 `"legacy"` (`initialize` d'emblée, sans sonde) — cf. « Ère des upstreams stdio et http ».
 Toute autre valeur, ou la clé sur une entrée inprocess, est une erreur de config signalée
 au démarrage. Un bloc

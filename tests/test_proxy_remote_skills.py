@@ -60,11 +60,11 @@ def skills_dir(tmp_path: Path) -> Path:
     return root
 
 
-def _stdio_skills(skills_dir: Path, protocol: str = "auto") -> StdioUpstream:
+def _stdio_skills(skills_dir: Path, protocol_era: str = "auto") -> StdioUpstream:
     return StdioUpstream(
         command=sys.executable,
         args=[str(TESTS / "skills_fixture_server.py"), str(skills_dir), "tips"],
-        protocol=protocol,
+        protocol_era=protocol_era,
     )
 
 
@@ -177,7 +177,7 @@ async def test_forced_legacy_http_upstream_receives_no_skills_request(skills_dir
     fixture, app = _skills_server(skills_dir)
     recorder = _Recorder()
     async with fixture.session_manager.run():
-        async with _hosted(_http_upstream(app, recorder, protocol="legacy")) as upstream:
+        async with _hosted(_http_upstream(app, recorder, protocol_era="legacy")) as upstream:
             await upstream.start()
             assert upstream.protocol_version == LEGACY
             assert upstream.serves_skills is False
@@ -575,7 +575,7 @@ async def test_chained_legacy_upstream_is_published_unchanged(skills_dir):
     from tests.proxy_client import list_tools
 
     async with _upstream_proxy(skills_dir) as app:
-        async with _hosted(_http_upstream(app, _Recorder(), protocol="legacy")) as upstream:
+        async with _hosted(_http_upstream(app, _Recorder(), protocol_era="legacy")) as upstream:
             await upstream.start()
             server, served = await _proxy_over({"upl": upstream})
             names = [t.name for t in (await list_tools(server)).tools]

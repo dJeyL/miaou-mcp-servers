@@ -372,7 +372,7 @@ lots — piège déjà payé côté MIAOU.
   legacy identique à une requête près, `protocol_version`/`capabilities` sur
   `Upstream`, `tools/list` amorcé au démarrage d'un moderne (`Mcp-Param-*` ne
   part que pour un outil listé sur la session), aucune capacité d'upstream
-  republiée, clé `protocol` (`auto`/`legacy`) d'une entrée stdio/http, ère au
+  republiée, clé `protocol_era` (`auto`/`legacy`) d'une entrée stdio/http, ère au
   journal de démarrage, ligne « skills non relayées » réservée au legacy forcé par
   la config.
   Extension Skills agrégée : `prefix_skill_uri`/`resolve_skill_uri`,

@@ -17,20 +17,20 @@ from .upstream import (
 )
 
 
-# Valeurs de la clé `protocol` d'une entrée stdio ou http : l'ère est négociée
+# Valeurs de la clé `protocol_era` d'une entrée stdio ou http : l'ère est négociée
 # ("auto", défaut) ou imposée en legacy — le recours pour un upstream moderne
 # d'un autre SDK que la validation de la révision 2026-07-28 ferait échouer.
-_PROTOCOL_VALUES = ("auto", "legacy")
+_PROTOCOL_ERA_VALUES = ("auto", "legacy")
 
 
-def _protocol(name: str, srv: dict[str, Any]) -> str:
-    protocol = srv.get("protocol", "auto")
-    if protocol not in _PROTOCOL_VALUES:
+def _protocol_era(name: str, srv: dict[str, Any]) -> str:
+    era = srv.get("protocol_era", "auto")
+    if era not in _PROTOCOL_ERA_VALUES:
         raise ValueError(
-            f"Serveur '{name}' : 'protocol' vaut {protocol!r}, attendu "
-            f"{' ou '.join(repr(v) for v in _PROTOCOL_VALUES)}."
+            f"Serveur '{name}' : 'protocol_era' vaut {era!r}, attendu "
+            f"{' ou '.join(repr(v) for v in _PROTOCOL_ERA_VALUES)}."
         )
-    return protocol
+    return era
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -62,9 +62,9 @@ def build_upstreams(
             module = srv.get("module")
             if not module:
                 raise ValueError(f"Serveur '{name}' inprocess sans clé 'module'.")
-            if "protocol" in srv:
+            if "protocol_era" in srv:
                 raise ValueError(
-                    f"Serveur '{name}' : la clé 'protocol' n'a de sens que sur un "
+                    f"Serveur '{name}' : la clé 'protocol_era' n'a de sens que sur un "
                     f"upstream 'stdio' ou 'http' (un inprocess n'a pas de fil)."
                 )
             upstreams[name] = InProcessUpstream(
@@ -80,7 +80,7 @@ def build_upstreams(
                 args=srv.get("args", []),
                 env=env,
                 cwd=srv.get("cwd"),
-                protocol=_protocol(name, srv),
+                protocol_era=_protocol_era(name, srv),
             )
         elif srv_type == "http":
             url = srv.get("url")
@@ -90,7 +90,7 @@ def build_upstreams(
                 url=url,
                 headers=srv.get("headers"),
                 timeout=srv.get("timeout", _HTTP_HANDSHAKE_TIMEOUT_S),
-                protocol=_protocol(name, srv),
+                protocol_era=_protocol_era(name, srv),
             )
         else:
             raise ValueError(f"Type de serveur inconnu pour '{name}': '{srv_type}'.")

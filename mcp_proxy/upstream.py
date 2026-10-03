@@ -36,7 +36,7 @@ class Upstream(ABC):
     protocol_version: str | None = None
     capabilities: types.ServerCapabilities | None = None
 
-    # Ère DEMANDÉE par la config (clé `protocol`) pour un upstream stdio ou
+    # Ère DEMANDÉE par la config (clé `protocol_era`) pour un upstream stdio ou
     # http : "auto" (sonde `server/discover`, repli sur `initialize`) ou
     # "legacy" (`initialize` d'emblée), passée telle quelle en `mode` à
     # `Client`. None pour l'inprocess, qui n'a pas de fil.
@@ -439,13 +439,13 @@ class StdioUpstream(_RemoteSkills, Upstream):
         args: list[str],
         env: dict[str, str] | None = None,
         cwd: str | None = None,
-        protocol: str = "auto",
+        protocol_era: str = "auto",
     ) -> None:
         self._command = command
         self._args = args
         self._env = env
         self._cwd = cwd
-        self.mode = protocol
+        self.mode = protocol_era
         self._exit_stack = AsyncExitStack()
         self._session: Any = None
 
@@ -562,13 +562,13 @@ class HttpUpstream(_RemoteSkills, Upstream):
         headers: dict[str, str] | None = None,
         auth: Any = None,
         timeout: float = _HTTP_HANDSHAKE_TIMEOUT_S,
-        protocol: str = "auto",
+        protocol_era: str = "auto",
     ) -> None:
         self._url = url
         self._headers = headers
         self._auth = auth
         self._timeout = timeout
-        self.mode = protocol
+        self.mode = protocol_era
         self._session: Any = None
         self._host_task_group: Any = None
         self._stop_event: Any = None

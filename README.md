@@ -157,7 +157,7 @@ L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'
 `env` sur une entrée inprocess → variables d'environnement injectées avant l'import.
 `"type": "http"` + `url` → serveur MCP **distant** en streamable-http (cf. `docs/proxy.md`).
 Avec un serveur stdio ou http, le proxy négocie la révision MCP 2026-07-28 et se replie
-sur `initialize` si le serveur ne la parle pas ; `"protocol": "legacy"` sur l'entrée
+sur `initialize` si le serveur ne la parle pas ; `"protocol_era": "legacy"` sur l'entrée
 impose `initialize` d'emblée (défaut : `"auto"`). Les skills d'un tel serveur sont
 relayées s'il négocie 2026-07-28 et déclare l'extension Skills ; `"legacy"` les coupe.
 Un bloc `auth` sur une entrée `http` → le proxy devient **client OAuth** de ce

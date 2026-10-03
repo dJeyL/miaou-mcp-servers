@@ -177,7 +177,7 @@ async def test_unrelayed_skills_are_logged_only_when_informative(capsys):
     probed_legacy = StdioUpstream("true", [])
     probed_legacy.protocol_version = "2025-11-25"
     probed_legacy.capabilities = types.ServerCapabilities()
-    forced = StdioUpstream("true", [], protocol="legacy")
+    forced = StdioUpstream("true", [], protocol_era="legacy")
     upstreams = {"serving": serving, "plain": plain, "probed": probed_legacy, "forced": forced}
     server = build_proxy_server(upstreams, {})
     assert await install_skills(server, upstreams) is False

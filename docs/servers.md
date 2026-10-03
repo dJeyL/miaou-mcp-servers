@@ -107,7 +107,9 @@ apprend au modèle à les lire par leur nom, et un nom nu l'envoyait chercher un
 skill locale inexistante — observé, détour par `miaou__skills__read` ou abandon
 de l'outil. La skill
 (`servers/skills/bench/bench/SKILL.md`, servie en `skill://bench/SKILL.md`, avec
-une annexe `dns.md` sans enjeu, sur la lecture des résultats DNS) porte la
+une annexe `dns.md` sur la lecture des résultats DNS, à lire avant d'en rapporter
+un — « pour interpréter » laissait un modèle juger son résultat assez clair pour
+s'en passer, et le rapporter sans dire d'où il était résolu) porte la
 règle : signaler chaque usage d'un outil `bench` par la ligne
 « *Banc d'essai bench — résultat **non contractuel**.* ». Tous les outils l'exigent
 (`_meta["miaou/requiresSkill"]`, posé par `finalize_tools(requires_skill="bench")`).

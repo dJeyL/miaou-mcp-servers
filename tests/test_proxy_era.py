@@ -45,11 +45,11 @@ def _stdio_modern() -> StdioUpstream:
     return StdioUpstream(command=sys.executable, args=[str(TESTS / "era_fixture_server.py")])
 
 
-def _stdio_legacy(log: Path, protocol: str = "auto") -> StdioUpstream:
+def _stdio_legacy(log: Path, protocol_era: str = "auto") -> StdioUpstream:
     return StdioUpstream(
         command=sys.executable,
         args=[str(TESTS / "legacy_stdio_fixture.py"), str(log)],
-        protocol=protocol,
+        protocol_era=protocol_era,
     )
 
 
@@ -130,9 +130,9 @@ def _status_app(status: int) -> Any:
 
 
 def _http_upstream(
-    app: Any, recorder: _Recorder, auth: Any = None, protocol: str = "auto"
+    app: Any, recorder: _Recorder, auth: Any = None, protocol_era: str = "auto"
 ) -> HttpUpstream:
-    upstream = HttpUpstream("http://upstream.test/mcp", auth=auth, timeout=5, protocol=protocol)
+    upstream = HttpUpstream("http://upstream.test/mcp", auth=auth, timeout=5, protocol_era=protocol_era)
 
     def build_http_client() -> httpx2.AsyncClient:
         return httpx2.AsyncClient(
@@ -186,7 +186,7 @@ async def test_stdio_upstream_falls_back_to_legacy_identically(tmp_path):
     auto_log, legacy_log = tmp_path / "auto.jsonl", tmp_path / "legacy.jsonl"
     results = {}
     for log, mode in ((auto_log, "auto"), (legacy_log, "legacy")):
-        upstream = _stdio_legacy(log, protocol=mode)
+        upstream = _stdio_legacy(log, protocol_era=mode)
         try:
             await upstream.start()
             assert upstream.protocol_version == LEGACY
@@ -251,7 +251,7 @@ async def test_http_upstream_falls_back_to_legacy_identically():
         app = _legacy_only(_app(server))
         recorder = recorders[mode] = _Recorder()
         async with server.session_manager.run():
-            async with _hosted(_http_upstream(app, recorder, protocol=mode)) as upstream:
+            async with _hosted(_http_upstream(app, recorder, protocol_era=mode)) as upstream:
                 await upstream.start()
                 assert upstream.protocol_version == LEGACY
                 assert upstream.instructions == era_fixture_server.INSTRUCTIONS
@@ -275,7 +275,7 @@ async def test_http_upstream_bare_refusal_fails_as_before(status):
     failures = {}
     for mode in ("auto", "legacy"):
         recorder = _Recorder()
-        async with _hosted(_http_upstream(_status_app(status), recorder, protocol=mode)) as upstream:
+        async with _hosted(_http_upstream(_status_app(status), recorder, protocol_era=mode)) as upstream:
             with pytest.raises(Exception) as excinfo:
                 await upstream.start()
             failures[mode] = (type(excinfo.value), str(excinfo.value))
@@ -386,7 +386,7 @@ async def test_startup_log_shows_the_negotiated_era(tmp_path, capsys):
     upstreams = {
         "modern": _stdio_modern(),
         "forced": StdioUpstream(
-            command=sys.executable, args=[str(TESTS / "era_fixture_server.py")], protocol="legacy"
+            command=sys.executable, args=[str(TESTS / "era_fixture_server.py")], protocol_era="legacy"
         ),
         "probed": _stdio_legacy(tmp_path / "legacy.jsonl"),
         "bench": InProcessUpstream("mcp_bench"),

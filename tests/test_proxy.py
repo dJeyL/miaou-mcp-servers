@@ -83,17 +83,17 @@ def test_build_upstreams_stdio():
     assert isinstance(upstreams["ext"], StdioUpstream)
 
 
-def test_build_upstreams_protocol_key():
-    """`protocol` impose l'ère d'un upstream stdio ou http : "auto" par défaut
+def test_build_upstreams_protocol_era_key():
+    """`protocol_era` impose l'ère d'un upstream stdio ou http : "auto" par défaut
     (sonde puis repli), "legacy" pour `initialize` d'emblée. Passé tel quel en
     `mode` au `Client` du SDK."""
     cfg = {
         "port": 8765,
         "mcpServers": {
             "s": {"command": "uv"},
-            "s_legacy": {"command": "uv", "protocol": "legacy"},
+            "s_legacy": {"command": "uv", "protocol_era": "legacy"},
             "h": {"type": "http", "url": "http://127.0.0.1:9/mcp"},
-            "h_legacy": {"type": "http", "url": "http://127.0.0.1:9/mcp", "protocol": "legacy"},
+            "h_legacy": {"type": "http", "url": "http://127.0.0.1:9/mcp", "protocol_era": "legacy"},
             "i": {"type": "inprocess", "module": "mcp_bench"},
         },
     }
@@ -110,12 +110,12 @@ def test_build_upstreams_protocol_key():
 @pytest.mark.parametrize(
     "entry, match",
     [
-        ({"command": "uv", "protocol": "2026-07-28"}, "'protocol'"),
-        ({"type": "http", "url": "http://x/mcp", "protocol": "modern"}, "'protocol'"),
-        ({"type": "inprocess", "module": "mcp_bench", "protocol": "legacy"}, "inprocess"),
+        ({"command": "uv", "protocol_era": "2026-07-28"}, "'protocol_era'"),
+        ({"type": "http", "url": "http://x/mcp", "protocol_era": "modern"}, "'protocol_era'"),
+        ({"type": "inprocess", "module": "mcp_bench", "protocol_era": "legacy"}, "inprocess"),
     ],
 )
-def test_build_upstreams_rejects_a_misplaced_or_unknown_protocol(entry, match):
+def test_build_upstreams_rejects_a_misplaced_or_unknown_protocol_era(entry, match):
     """Une valeur hors "auto"/"legacy" est une erreur de config signalée au
     démarrage, pas un mode passé au SDK ; un inprocess n'a pas de fil, la clé
     n'y a pas de sens."""
