@@ -6,13 +6,24 @@ whose own PEP 723 blocks declare the shared dependencies.
 """
 
 import argparse
+import hashlib
 import inspect
+import json
+import mimetypes
+import re
 import sys
 import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
+import mcp.types as types
+from mcp.server.extension import Extension, MethodBinding, ResourceBinding
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.resources import Resource
 from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.exceptions import MCPError
 from starlette.middleware.cors import CORSMiddleware
 
 # Par défaut, ArgModelBase laisse Pydantic ignorer silencieusement
@@ -117,6 +128,357 @@ def make_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.ProxyHandler())
 
 
+# ---------------------------------------------------------------------------
+# Extension Skills (io.modelcontextprotocol/skills)
+#
+# Spec : specification/stable/skills.mdx du dépôt modelcontextprotocol/ext-skills.
+# Le format d'une skill (dossier, `SKILL.md`, frontmatter YAML) est celui d'Agent
+# Skills ; l'extension ne définit que le transport : chaque fichier est une
+# ressource `skill://<nom>/<chemin>`, et `skills/list` / `skills/get` rendent une
+# entrée par skill — frontmatter VERBATIM, manifeste COMPLET des fichiers avec
+# empreinte et taille.
+#
+# Écrite à la main sur l'`Extension` publique du SDK : le jour où le SDK livre
+# la sienne, on remplace cette classe, le format sur le fil ne bouge pas.
+# ---------------------------------------------------------------------------
+
+SKILLS_EXTENSION_ID = "io.modelcontextprotocol/skills"
+
+REQUIRES_SKILL_META_KEY = "miaou/requiresSkill"
+"""Clé du `_meta` d'un outil : URI du `SKILL.md` à lire avant de l'appeler.
+
+L'URI est relative au serveur qui liste l'outil (un proxy la réécrit). Préfixe
+`miaou/` : `_meta` est un espace partagé, une clé nue collisionnerait."""
+
+# Bornes par skill fixées par la spec : un hôte conforme DOIT accepter jusque-là,
+# un serveur NE DEVRAIT PAS servir au-delà. On refuse au démarrage.
+SKILL_MAX_FILES = 512
+SKILL_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+
+# Fraîcheur annoncée sur `skills/list` et `skills/get` (champs REQUIS par la
+# spec). Indice de cache, pas une propriété d'intégrité : les empreintes sont de
+# toute façon recalculées à chaque appel.
+SKILLS_TTL_MS = 300_000
+SKILLS_CACHE_SCOPE = "public"
+
+# Règles de nom d'Agent Skills : 1 à 64 caractères, minuscules, chiffres et
+# tirets, ni tiret en bord ni double tiret.
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_SKILL_NAME_MAX = 64
+# Agent Skills borne `description` à 1024 caractères.
+_SKILL_DESCRIPTION_MAX = 1024
+# Un segment de chemin de fichier entre tel quel dans l'URI : on s'en tient aux
+# caractères non réservés de la RFC 3986, plutôt que d'encoder des chemins que le
+# modèle devrait ensuite recopier à l'identique.
+_SKILL_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
+
+
+class SkillError(ValueError):
+    """Skill invalide, refusée au démarrage. Le message nomme la skill et la cause."""
+
+
+def skill_digest(data: bytes) -> str:
+    """Empreinte d'un fichier de skill au format de la spec : `sha256:<hex minuscule>`."""
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def validate_skill_name(name: Any) -> None:
+    if not isinstance(name, str) or not name:
+        raise SkillError("`name` absent ou vide")
+    if len(name) > _SKILL_NAME_MAX:
+        raise SkillError(f"`name` « {name} » dépasse {_SKILL_NAME_MAX} caractères")
+    if not _SKILL_NAME_RE.match(name):
+        raise SkillError(
+            f"`name` « {name} » invalide : minuscules, chiffres et tirets "
+            f"seulement, ni tiret en bord ni double tiret"
+        )
+
+
+def parse_skill_frontmatter(text: str) -> dict[str, Any]:
+    """Frontmatter YAML d'un `SKILL.md`, rendu tel quel en dict JSON-compatible.
+
+    La spec exige le frontmatter VERBATIM (tous les champs, pas une sélection) :
+    d'où un vrai parseur YAML plutôt qu'une lecture ligne à ligne. Mais YAML type
+    plus large que JSON — une date non quotée devient un `date` Python, `.nan` un
+    flottant que JSON n'a pas : une telle valeur est refusée en nommant le champ,
+    puisqu'on ne saurait pas la rendre sans la transformer.
+
+    PyYAML est importé ici et non en tête de module : mcp_base est importé par
+    tous les serveurs, seuls ceux qui servent des skills déclarent la dépendance.
+    """
+    import yaml
+
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        raise SkillError("SKILL.md ne commence pas par un frontmatter (`---`)")
+    for index in range(1, len(lines)):
+        if lines[index].rstrip("\r\n") == "---":
+            block = "".join(lines[1:index])
+            break
+    else:
+        raise SkillError("frontmatter de SKILL.md non refermé (`---`)")
+    try:
+        data = yaml.safe_load(block)
+    except yaml.YAMLError as e:
+        raise SkillError(f"frontmatter YAML illisible : {e}") from e
+    if not isinstance(data, dict):
+        raise SkillError("le frontmatter n'est pas un objet YAML")
+    for key, value in data.items():
+        if not isinstance(key, str):
+            raise SkillError(f"clé de frontmatter non textuelle : {key!r}")
+        try:
+            json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError) as e:
+            raise SkillError(
+                f"champ `{key}` du frontmatter non représentable en JSON "
+                f"({type(value).__name__}) — le quoter dans le YAML"
+            ) from e
+    return data
+
+
+@dataclass(frozen=True)
+class SkillSource:
+    """Une skill sur disque : son nom, son dossier, et ses fichiers.
+
+    L'ensemble des fichiers est figé au démarrage (chacun est enregistré comme
+    ressource à ce moment-là) ; leur CONTENU est relu à chaque appel."""
+
+    name: str
+    root: Path
+    files: tuple[str, ...]  # chemins relatifs, séparateur `/`, SKILL.md compris
+
+    @property
+    def uri(self) -> str:
+        return self.file_uri("SKILL.md")
+
+    def file_uri(self, rel_path: str) -> str:
+        return f"skill://{self.name}/{rel_path}"
+
+
+def _skill_files(root: Path) -> list[str]:
+    """Fichiers d'une skill, triés. Un chemin dont un segment commence par un
+    point est écarté (`.DS_Store`, `.git/`…) : ce n'est pas du contenu de skill,
+    et le servir ferait changer l'empreinte au gré du système de fichiers."""
+    files: list[str] = []
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if not path.is_file():
+            continue
+        for part in rel.parts:
+            if not _SKILL_PATH_SEGMENT_RE.match(part):
+                raise SkillError(
+                    f"chemin « {rel.as_posix()} » : le segment « {part} » sort des "
+                    f"caractères admis dans une URI (lettres, chiffres, `.`, `_`, `~`, `-`)"
+                )
+        files.append(rel.as_posix())
+    return files
+
+
+def scan_skills_dir(skills_dir: str | Path) -> list[SkillSource]:
+    """Chaque sous-dossier de `skills_dir` qui contient un `SKILL.md` est une
+    skill, et le nom du sous-dossier est son `name`. Valide tout ce qui peut
+    l'être sans servir (nom, frontmatter, bornes), et lève `SkillError` à la
+    première skill invalide : un serveur ne démarre pas avec une skill qu'il ne
+    saurait pas servir conformément."""
+    base = Path(skills_dir)
+    if not base.is_dir():
+        raise SkillError(f"dossier de skills introuvable : {base}")
+    sources: list[SkillSource] = []
+    for root in sorted(p for p in base.iterdir() if p.is_dir()):
+        if root.name.startswith(".") or not (root / "SKILL.md").is_file():
+            continue
+        try:
+            validate_skill_name(root.name)
+            source = SkillSource(root.name, root, tuple(_skill_files(root)))
+            build_skill_entry(source)  # frontmatter, nom, bornes
+        except SkillError as e:
+            raise SkillError(f"skill « {root.name} » ({root}) : {e}") from e
+        sources.append(source)
+    return sources
+
+
+def build_skill_entry(source: SkillSource) -> dict[str, Any]:
+    """Entrée `Skill` de la spec, recalculée depuis le disque à chaque appel.
+
+    Relire à chaque `skills/list` / `skills/get` garde l'entrée vraie quand un
+    fichier change sans redémarrage : le frontmatter doit être celui du
+    `SKILL.md` servi, et les empreintes celles des octets que `resources/read`
+    rendra."""
+    resources: list[dict[str, Any]] = []
+    total = 0
+    skill_md: bytes | None = None
+    if len(source.files) > SKILL_MAX_FILES:
+        raise SkillError(f"{len(source.files)} fichiers, au-delà de la borne de {SKILL_MAX_FILES}")
+    for rel in source.files:
+        try:
+            data = (source.root / rel).read_bytes()
+        except OSError as e:
+            raise SkillError(f"fichier « {rel} » illisible : {e}") from e
+        if rel == "SKILL.md":
+            skill_md = data
+        total += len(data)
+        resources.append({"uri": source.file_uri(rel), "digest": skill_digest(data), "size": len(data)})
+    if total > SKILL_MAX_TOTAL_BYTES:
+        raise SkillError(f"{total} octets, au-delà de la borne de {SKILL_MAX_TOTAL_BYTES}")
+    if skill_md is None:
+        raise SkillError("SKILL.md absent")
+    try:
+        text = skill_md.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise SkillError(f"SKILL.md n'est pas de l'UTF-8 : {e}") from e
+    frontmatter = parse_skill_frontmatter(text)
+    validate_skill_name(frontmatter.get("name"))
+    if frontmatter["name"] != source.name:
+        raise SkillError(
+            f"`name` « {frontmatter['name']} » différent du dossier « {source.name} » "
+            f"(le dernier segment de l'URI doit être le nom)"
+        )
+    description = frontmatter.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise SkillError("`description` absente ou vide")
+    if len(description) > _SKILL_DESCRIPTION_MAX:
+        raise SkillError(f"`description` dépasse {_SKILL_DESCRIPTION_MAX} caractères")
+    return {"uri": source.uri, "frontmatter": frontmatter, "resources": resources}
+
+
+class SkillFileResource(Resource):
+    """Un fichier de skill, relu sur disque à chaque `resources/read`.
+
+    Rend les octets INTACTS : du texte s'ils sont de l'UTF-8 valide (décodage
+    strict, réversible), un blob sinon. Le `FileResource` du SDK ne convient
+    pas : il lit en `utf-8-sig` (BOM retiré) et en mode texte (CRLF ramené à LF),
+    deux transformations qui feraient diverger les octets servis de l'empreinte
+    publiée."""
+
+    path: Path
+
+    async def read(self) -> str | bytes:
+        import anyio
+
+        data = await anyio.to_thread.run_sync(self.path.read_bytes)
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+
+
+def skill_file_mime_type(rel_path: str) -> str:
+    if rel_path.lower().endswith(".md"):
+        return "text/markdown"
+    return mimetypes.guess_type(rel_path)[0] or "application/octet-stream"
+
+
+class ListSkillsResult(types.PaginatedResult, types.CacheableResult):
+    result_type: types.ResultType = "complete"
+    skills: list[dict[str, Any]]
+
+
+class GetSkillParams(types.RequestParams):
+    uri: str
+
+
+class GetSkillResult(types.CacheableResult):
+    result_type: types.ResultType = "complete"
+    skill: dict[str, Any]
+
+
+class Skills(Extension):
+    """Sert les skills d'un dossier (`skills/list`, `skills/get`, et chaque
+    fichier en ressource `skill://`).
+
+    Pas de pagination : le catalogue d'un serveur de ce dépôt tient en une page.
+    Pas de `directoryRead` : le manifeste complet de chaque entrée suffit."""
+
+    identifier = SKILLS_EXTENSION_ID
+
+    def __init__(self, skills_dir: str | Path) -> None:
+        self.sources = scan_skills_dir(skills_dir)
+        self._by_uri = {source.uri: source for source in self.sources}
+
+    def skill_uri(self, name: str) -> str | None:
+        """URI du `SKILL.md` de la skill `name`, ou None si ce serveur ne la sert pas."""
+        for source in self.sources:
+            if source.name == name:
+                return source.uri
+        return None
+
+    def list_entries(self) -> list[dict[str, Any]]:
+        """Entrées de toutes les skills. Une skill devenue invalide sur disque
+        depuis le démarrage est omise et signalée, plutôt que de faire échouer
+        la liste entière."""
+        entries = []
+        for source in self.sources:
+            try:
+                entries.append(build_skill_entry(source))
+            except SkillError as e:
+                print(f"Skill « {source.name} » omise : {e}", file=sys.stderr)
+        return entries
+
+    def get_entry(self, uri: str) -> dict[str, Any]:
+        source = self._by_uri.get(uri)
+        if source is None:
+            raise MCPError(types.INVALID_PARAMS, f"No skill is served at {uri}")
+        try:
+            return build_skill_entry(source)
+        except SkillError as e:
+            raise MCPError(types.INTERNAL_ERROR, f"Skill {uri} unavailable: {e}") from e
+
+    def resources(self) -> list[ResourceBinding]:
+        bindings = []
+        for source in self.sources:
+            entry = build_skill_entry(source)
+            for rel in source.files:
+                fields: dict[str, Any] = {}
+                if rel == "SKILL.md":
+                    # Métadonnées que la spec recommande pour le SKILL.md.
+                    fields = {
+                        "name": entry["frontmatter"]["name"],
+                        "description": entry["frontmatter"]["description"],
+                    }
+                bindings.append(
+                    ResourceBinding(
+                        SkillFileResource(
+                            uri=source.file_uri(rel),
+                            mime_type=skill_file_mime_type(rel),
+                            path=(source.root / rel).resolve(),
+                            **fields,
+                        )
+                    )
+                )
+        return bindings
+
+    def methods(self) -> list[MethodBinding]:
+        async def skills_list(ctx: Any, params: Any) -> ListSkillsResult:
+            return ListSkillsResult(
+                skills=self.list_entries(), ttl_ms=SKILLS_TTL_MS, cache_scope=SKILLS_CACHE_SCOPE
+            )
+
+        async def skills_get(ctx: Any, params: GetSkillParams) -> GetSkillResult:
+            return GetSkillResult(
+                skill=self.get_entry(params.uri), ttl_ms=SKILLS_TTL_MS, cache_scope=SKILLS_CACHE_SCOPE
+            )
+
+        return [
+            MethodBinding("skills/list", types.PaginatedRequestParams, skills_list),
+            MethodBinding("skills/get", GetSkillParams, skills_get),
+        ]
+
+
+def find_skills_extension(server: Any) -> Skills | None:
+    """L'extension Skills d'un `MCPServer`, ou None s'il n'en sert pas.
+
+    Lit `_extensions`, attribut PRIVÉ du SDK : aucune API publique ne rend les
+    extensions d'un `MCPServer`, et ses méthodes `skills/*` ne sont joignables
+    que par un transport. Seul point du dépôt qui y touche, couvert par un test
+    qui casse si le SDK renomme l'attribut."""
+    for extension in getattr(server, "_extensions", ()):
+        if isinstance(extension, Skills):
+            return extension
+    return None
+
+
 class MiaouMCPBase:
     """Base for MIAOU MCP servers.
 
@@ -139,6 +501,11 @@ class MiaouMCPBase:
     Facultatif et sans valeur par défaut : un serveur qui n'a pas de consigne de
     portée serveur n'en déclare pas, et son `InitializeResult` est inchangé.
     Ne vaut que si le client lit le champ — il n'atteint pas le modèle seul.
+
+    `skills_dir` désigne un dossier de skills à servir par l'extension Skills
+    (cf. `Skills`) : chaque sous-dossier contenant un `SKILL.md` en est une.
+    `None` (défaut) : aucune extension, rien ne change. Une skill invalide fait
+    échouer la construction avec un message qui la nomme.
 
     Usage:
         class MyServer(MiaouMCPBase):
@@ -163,15 +530,21 @@ class MiaouMCPBase:
         default_port: int,
         config: dict | None = None,
         instructions: str | None = None,
+        skills_dir: str | Path | None = None,
     ) -> None:
         self.default_port = default_port
         self.config = config or {}
+        self.skills = Skills(skills_dir) if skills_dir is not None else None
         # `instructions` PAR MOT-CLEF : en 2.x, le deuxième paramètre
         # positionnel de MCPServer est `title`, et une consigne passée là
         # partirait en `serverInfo.title` sans erreur.
-        self.mcp = MCPServer(name, instructions=instructions)
+        self.mcp = MCPServer(
+            name,
+            instructions=instructions,
+            extensions=[self.skills] if self.skills is not None else None,
+        )
 
-    def finalize_tools(self) -> None:
+    def finalize_tools(self, requires_skill: str | dict[str, str] | None = None) -> None:
         """Normalise ce que tools/list expose, pour réduire le payload envoyé au
         modèle à chaque requête. À appeler en dernière ligne du __init__ de chaque
         serveur, après l'enregistrement de tous les outils. Idempotent.
@@ -181,11 +554,34 @@ class MiaouMCPBase:
           sur le wire avec l'indentation source de chaque ligne de continuation.
         - Schémas de paramètres : suppression des "title" auto-générés par Pydantic
           (voir _strip_schema_titles).
+
+        `requires_skill` déclare la skill à lire avant d'appeler un outil, posée
+        en `_meta["miaou/requiresSkill"]` (URI du `SKILL.md`) : un nom de skill
+        vaut pour TOUS les outils du serveur, un dict `{outil: skill}` pour ceux
+        qu'il nomme. Le nom doit désigner une skill servie par ce serveur, et
+        l'outil exister : sinon ValueError, au démarrage.
         """
-        for tool in self.mcp._tool_manager._tools.values():
+        tools = self.mcp._tool_manager._tools
+        for tool in tools.values():
             if tool.description:
                 tool.description = inspect.cleandoc(tool.description)
             _strip_schema_titles(tool.parameters)
+
+        if requires_skill is None:
+            return
+        if isinstance(requires_skill, str):
+            requires_skill = {name: requires_skill for name in tools}
+        for tool_name, skill_name in requires_skill.items():
+            if tool_name not in tools:
+                raise ValueError(f"requires_skill : outil inconnu « {tool_name} »")
+            uri = self.skills.skill_uri(skill_name) if self.skills is not None else None
+            if uri is None:
+                raise ValueError(
+                    f"requires_skill : l'outil « {tool_name} » exige la skill "
+                    f"« {skill_name} », que ce serveur ne sert pas"
+                )
+            tool = tools[tool_name]
+            tool.meta = {**(tool.meta or {}), REQUIRES_SKILL_META_KEY: uri}
 
     def _make_app(self):
         """Build the Starlette ASGI app with CORS middleware."""

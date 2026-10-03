@@ -21,10 +21,11 @@ miaou-mcp-servers/
 │   ├── __main__.py       # `python -m mcp_proxy`
 │   ├── contract.py       # constantes/exceptions partagées (casse le cycle server↔auth_out)
 │   ├── logging.py        # `_log` format uvicorn
-│   ├── upstream.py       # InProcess / Stdio / Http
+│   ├── upstream.py       # InProcess / Stdio / Http (skills : inprocess seulement)
 │   ├── netproxy.py       # override --proxy / --noproxy
 │   ├── config.py         # load_config, build_upstreams
-│   ├── server.py         # build_proxy_server, catalogue, instructions
+│   ├── server.py         # build_proxy_server, catalogue, instructions, relais du `_meta` d'outil
+│   ├── skills.py         # extension Skills agrégée : URI préfixées, bloc des instructions, repli read_skill
 │   ├── auth_in.py        # Resource Server OAuth (AB-1)
 │   ├── auth_out/         # client OAuth d'upstreams tiers (AB-2/AB-3), package
 │   │   ├── debug.py      # --debug-auth, masquage (porte _AUTH_DEBUG)
@@ -35,12 +36,13 @@ miaou-mcp-servers/
 │   └── entry.py          # CLI, main()
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
-│   ├── mcp_base.py       # classe de base partagée (MiaouMCPBase + make_opener)
+│   ├── mcp_base.py       # classe de base partagée (MiaouMCPBase + make_opener + extension Skills)
 │   ├── mcp_bench.py      # banc d'essai général (port 8766)
 │   ├── mcp_weather.py    # météo réelle via wttr.in (port 8767)
 │   ├── mcp_web/          # téléchargement d'URL (port 8768), package — `_meta` client sur fetch_url
 │   ├── mcp_ddg.py        # recherche DuckDuckGo HTML (port 8769)
 │   ├── mcp_brave.py      # recherche Brave Search API (port 8770)
+│   ├── skills/           # skills des serveurs mono-fichier : skills/<serveur>/<skill>/SKILL.md
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — OBSOLÈTE, désactivé par défaut
 ├── docs/                 # domaines détaillés, lus à la demande (voir index en fin de fichier)
 ├── tests/
@@ -48,6 +50,7 @@ miaou-mcp-servers/
 │   ├── live_auth_probe.py  # ce qu'un upstream répond SANS jeton (non collecté)
 │   ├── live_discovery_probe.py  # ce que la découverte OAuth du SDK 2.x conclurait (non collecté)
 │   ├── proxy_client.py   # harnais : parler au Server du proxy en JSON-RPC legacy (non collecté)
+│   ├── skills_fixture_server.py  # upstream inprocess de test qui sert des skills, build(config) (non collecté)
 │   ├── test_base.py
 │   ├── test_bench.py
 │   ├── test_weather.py
@@ -58,6 +61,8 @@ miaou-mcp-servers/
 │   ├── test_brave.py
 │   ├── test_docs.py
 │   ├── test_proxy.py
+│   ├── test_skills.py    # extension Skills de mcp_base (vecteurs d'empreinte de la spec)
+│   ├── test_proxy_skills.py  # skills servies par le proxy : URI, `_meta`, bloc, repli
 │   ├── test_proxy_auth.py  # auth OAuth entrante (lot AB-1)
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante (lot AB-2)
 │   └── test_dev_auth_server.py  # serveur d'autorisation de développement (lot AB-1.3)
@@ -85,7 +90,7 @@ Six serveurs de banc d'essai plus un proxy qui les agrège. Le détail de chacun
 | `mcp_ddg.py` | 8769 | Recherche DuckDuckGo (HTML scrapé) | `ddg_search` |
 | `mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) | `brave_search`, `brave_image_search` |
 | `mcp_docs/` | 8771 | Extraction PDF/Office/Zip — **obsolète, désactivé par défaut** | `list`, `read`, `search`, `extract`, `drop_session` |
-| `mcp_proxy/` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) | (+ `status` si auth sortante) |
+| `mcp_proxy/` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) et les skills | (+ `status` si auth sortante, `read_skill` si une skill est servie) |
 
 Deux points qu'on ne devine pas depuis le tableau :
 
@@ -191,7 +196,7 @@ eux-mêmes — c'est ce geste, dans chaque test, qui a masqué la fuite dans tou
 ```bash
 # Avec uv — commande canonique, ne dépend pas de pyproject.toml/uv.lock
 uv run --with pytest --with pytest-asyncio --with html2text --with pymupdf \
-  --with python-docx --with openpyxl --with python-pptx --with truststore pytest tests/
+  --with python-docx --with openpyxl --with python-pptx --with truststore --with pyyaml pytest tests/
 
 # Avec uv — alternative via pyproject.toml (groupe dev) + uv.lock, équivalente
 # depuis que [project.dependencies] couvre l'union runtime (DD7)
@@ -286,6 +291,20 @@ self.mcp.tool(name="read")(read)
 Voir `servers/mcp_docs/__init__.py` (outils `read`/`search`) pour l'exemple appliqué.
 
 
+## Ajouter une skill à un serveur
+
+Une skill (format Agent Skills) est un dossier contenant un `SKILL.md` à frontmatter
+YAML (`name` = nom du dossier, `description` non vide), plus d'éventuelles annexes
+citées par chemin relatif. Elle se pose dans le `skills_dir` du serveur :
+`servers/skills/<serveur>/<skill>/` pour un serveur mono-fichier,
+`servers/mcp_<serveur>/skills/<skill>/` pour un package. Le serveur passe
+`skills_dir=` à `MiaouMCPBase`, déclare `pyyaml` dans son bloc PEP 723, et, si ses
+outils l'exigent, appelle `self.finalize_tools(requires_skill=...)`. Une skill invalide
+fait échouer le démarrage avec sa cause. Le texte libre du serveur (instructions,
+docstrings) nomme la skill comme « skill MCP » à lire par son URI, sans jamais écrire
+cette URI : le proxy la préfixe, et génère lui-même la ligne qui la donne. Détail :
+`docs/servers.md` (section « Skills d'un serveur ») et `docs/proxy.md`.
+
 ## Domaines détaillés (`docs/`)
 
 À lire à la demande, selon la zone touchée — pas systématiquement. CLAUDE.md garde
@@ -300,9 +319,13 @@ dans le même lot. Sans ce déclencheur, une ligne d'index reste fausse pendant 
 lots — piège déjà payé côté MIAOU.
 
 - **`docs/servers.md`** — les six serveurs en détail : outils exposés, contrats,
-  variables d'environnement, décisions de conception. `mcp_bench` (chemins de
-  résultat D8/D9, seul serveur à publier des `instructions` — consigne durable qui
-  se nomme au lieu de se désigner, et qui lui interdit de servir d'upstream muet
+  variables d'environnement, décisions de conception. Skills d'un serveur
+  (`skills_dir` et où le poser, validation au démarrage, ensemble de fichiers figé
+  mais contenu relu, `SkillFileResource` et les octets intacts, `requires_skill`,
+  PyYAML paresseux, jamais d'URI de skill dans le texte libre). `mcp_bench` (chemins de
+  résultat D8/D9, seul serveur à publier des `instructions` et une skill exigée
+  par ses outils — consigne durable qui se nomme au lieu de se désigner, règle
+  « non contractuel » portée par la skill, et qui lui interdit de servir d'upstream muet
   dans les tests ; `sleep` et son `_SLEEP_CAP`, dont le clamp teste NaN à part parce
   qu'il traverse `max`/`min` et qu'`asyncio.sleep(NaN)` ne termine jamais),
   `mcp_weather` (`astronomy`/`hourly` séparés et pourquoi, `extract`
@@ -333,6 +356,13 @@ lots — piège déjà payé côté MIAOU.
   `aggregate_instructions` (consigne de portée serveur : les trois captures par type
   d'upstream, la section titrée par le préfixe d'outil, l'écriture différée après
   `start()`, le préambule non préfixé que le client re-préfixant doit réécrire).
+  Extension Skills agrégée : `prefix_skill_uri`/`resolve_skill_uri`,
+  `install_skills` au lifespan et seulement si une skill est servie (capacités
+  calculées à chaque `server/discover`), stdio/http sans skills (abordés en
+  legacy), `relay_tool_meta` et `miaou/requiresSkill` réécrit, `_meta` dans
+  `ToolCatalogCache`, bloc généré des instructions (forme, en-tête « pas des skills
+  locales » et la mesure qui l'a imposé), repli `read_skill` et sa marque
+  `miaou/skillsFallback`.
 - **`docs/auth.md`** — campagne AB, les deux sens sans rapport entre eux. Entrante
   (AB-1 : le proxy est Resource Server, `JwtTokenVerifier`, validation d'audience
   RFC 8707 non désactivable, `dev_auth_server.py`). Sortante (AB-2 : le proxy est
@@ -369,7 +399,10 @@ lots — piège déjà payé côté MIAOU.
   résultat, le champ `instructions` de l'`InitializeResult` que MIAOU lit et
   injecte dans le system prompt (et le préambule qu'il re-préfixe, étant seul à
   connaître son slug), le `_meta` d'un résultat `tools/call` adressé au client
-  (`miaou/web`, premier usage), et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
+  (`miaou/web`, premier usage), les skills servies par le proxy (capacités par ère,
+  URI préfixées, `skills/*`, `resources/read` et `Mcp-Name`, `miaou/requiresSkill`,
+  bloc des instructions, repli `read_skill` à masquer par sa marque, et le réflexe
+  `miaou__skills__read` mesuré avec MIAOU actuel), et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
   `ref`+`content_b64`, `session_id`, idempotence de la matérialisation, REF_UNKNOWN
   levée en `MCPError` par l'outil et donc rejouable en autonome comme derrière le
   proxy, taille d'un `content_b64` et `MAX_REQUEST_BODY_BYTES` couplé au plafond
@@ -389,7 +422,8 @@ lots — piège déjà payé côté MIAOU.
   (favicon, sonde unique par origine) et le cache de favicons vidé en fixture,
   et les bancs manuels
   non collectés : `tests/live_call.py`, qui parle le vrai transport
-  streamable-http comme MIAOU (`-H/--header`, truststore, affiche le `_meta`), et
+  streamable-http comme MIAOU (`-H/--header`, truststore, affiche le `_meta`, et
+  `--modern`/`--method` pour l'ère 2026-07-28 et une méthode JSON-RPC quelconque), et
   `tests/live_auth_probe.py`, qui mesure ce qu'un upstream répond SANS jeton
   (séquence complète avec `Mcp-Session-Id`, `--tool`/`--args`, et le filtre
   `_looks_mutating` qui interdit d'appeler un outil d'écriture pour sonder), et

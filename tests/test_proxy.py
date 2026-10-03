@@ -1136,26 +1136,28 @@ async def test_bench_instructions_survive_aggregation():
     """`mcp_bench` publie une consigne durable ; elle doit rester exploitable
     une fois agrégée, c'est-à-dire lue et rattachée au bon serveur.
 
-    Le texte se NOMME (« les outils `bench` ») au lieu de se désigner (« ce
-    serveur ») : agrégé, il vit sous un titre de section parmi N, où un
-    déictique n'a plus d'antécédent stable. `bench` reste un segment littéral du
-    nom d'outil en accès direct comme derrière le double préfixe côté MIAOU
-    (`miaou-proxy__bench__echo`)."""
+    Le texte se NOMME (« les outils `bench` », « sa skill MCP `bench` ») au lieu de
+    se désigner (« ce serveur ») : agrégé, il vit sous un titre de section parmi
+    N, où un déictique n'a plus d'antécédent stable. `bench` reste un segment
+    littéral du nom d'outil en accès direct comme derrière le double préfixe
+    côté MIAOU (`miaou-proxy__bench__echo`).
+
+    Le marqueur « non contractuel » a migré dans la skill `bench` (cf.
+    test_bench.py) : l'instruction ne fait plus que renvoyer à la skill, par son
+    nom, jamais par une URI qu'un préfixe d'upstream rendrait fausse."""
     up = InProcessUpstream("mcp_bench")
     await up.start()
     text = mcp_proxy.aggregate_instructions({"bench": up})
 
     assert "## bench" in text
-    assert "les outils `bench`" in text
-    # Le marqueur porte le mot `bench` : sa présence dans une réponse atteste
-    # que le champ a été lu ET rattaché au bon serveur. Assertion posée sur les
-    # deux fragments qui portent cette valeur, et non sur la ligne entière : le
-    # balisage markdown du marqueur relève de la présentation et peut bouger
-    # sans rien changer au témoin.
-    assert "Banc d'essai bench" in text
-    assert "non contractuel" in text
+    section = text.split("## bench", 1)[1]
+    assert "les outils `bench`" in section
+    # « skill MCP », « par son URI » : un nom nu ressemble à un slug de skill
+    # locale du client, et le modèle part la chercher là.
+    assert "lire sa skill MCP `bench`, par son URI" in section
+    assert "skill://" not in up.instructions
     # Aucun déictique non résolu : « ce serveur » redeviendrait ambigu ici.
-    assert "ce serveur" not in text.split("## bench", 1)[1]
+    assert "ce serveur" not in section
 
 
 @pytest.mark.asyncio
@@ -1264,8 +1266,10 @@ async def test_lifespan_leaves_instructions_none_without_declarations():
     Monté sur un upstream muet explicite, et non sur un serveur réel : la
     garantie porte sur le proxy (« rien à agréger → rien à publier »), pas sur
     le silence d'un serveur donné, qui peut cesser à tout moment — c'est
-    précisément ce qui est arrivé à `mcp_bench`."""
-    upstreams = {"quiet": _InstructedUpstream(None)}
+    précisément ce qui est arrivé à `mcp_bench`, deux fois : instructions,
+    puis skill (dont le bloc généré remplirait le champ). D'où le module de
+    fixture, construit sans `skills_dir`."""
+    upstreams = {"quiet": _InstructedUpstream(None, module="tests.skills_fixture_server")}
     server = build_proxy_server(upstreams, {})
     app = build_app(server, upstreams)
     async with _run_lifespan(app):

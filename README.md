@@ -8,13 +8,13 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 
 | Serveur | Port | Description |
 |---|---|---|
-| `servers/mcp_bench.py` | 8766 | Banc d'essai : echo, add, DNS, image PNG, resource JSON |
+| `servers/mcp_bench.py` | 8766 | Banc d'essai : echo, add, DNS, image PNG, resource JSON ; sert une skill exigée par ses outils |
 | `servers/mcp_weather.py` | 8767 | Météo réelle via wttr.in (resource JSON) |
 | `servers/mcp_web/` | 8768 | Téléchargement d'URL (HTML→texte, text/* et JSON/XML, binaire base64), package |
 | `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API |
 | `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) |
 | `servers/mcp_docs/` | 8771 | Extraction PDF/Office/Zip, paginée, sessions par conversation — **obsolète, désactivé par défaut** ([pourquoi](#mcp_docs--obsolète-mais-conservé-pour-le-hors-connexion)) |
-| `mcp_proxy/` | configurable | Proxy qui agrège les serveurs ci-dessus |
+| `mcp_proxy/` | configurable | Proxy qui agrège les serveurs ci-dessus, leurs outils et leurs skills (extension Skills de MCP) |
 
 ### `mcp_docs` : obsolète, mais conservé pour le hors-connexion
 
@@ -361,7 +361,7 @@ accorder.
 ```bash
 # Avec uv — commande canonique
 uv run --with pytest --with pytest-asyncio --with html2text --with pymupdf \
-  --with python-docx --with openpyxl --with python-pptx pytest tests/ -v
+  --with python-docx --with openpyxl --with python-pptx --with truststore --with pyyaml pytest tests/ -v
 
 # Avec uv — alternative via pyproject.toml (groupe dev) + uv.lock
 uv run --group dev pytest tests/ -v
@@ -406,24 +406,26 @@ miaou-mcp-servers/
 │   ├── upstream.py       # InProcess / Stdio / Http
 │   ├── config.py         # load_config, build_upstreams
 │   ├── server.py         # build_proxy_server, catalogue d'outils
+│   ├── skills.py         # skills des upstreams, agrégées (extension Skills)
 │   ├── auth_in.py        # Resource Server OAuth (entrante)
 │   ├── auth_out/         # client OAuth d'upstreams tiers (sortante), package
 │   ├── app.py            # application Starlette
 │   └── entry.py          # CLI, main()
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
-│   ├── mcp_base.py       # classe de base + make_opener() proxy-aware
+│   ├── mcp_base.py       # classe de base + make_opener() proxy-aware + extension Skills
 │   ├── mcp_bench.py      # banc d'essai (port 8766)
 │   ├── mcp_weather.py    # météo wttr.in (port 8767)
 │   ├── mcp_web/          # fetch URL (port 8768), package
 │   ├── mcp_ddg.py        # recherche DDG (port 8769)
 │   ├── mcp_brave.py      # recherche Brave (port 8770)
+│   ├── skills/           # skills des serveurs mono-fichier (bench)
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — obsolète
 ├── docs/                 # documentation par domaine, pour qui modifie le code
 │   ├── servers.md        # les six serveurs en détail (outils, contrats, env)
 │   ├── proxy.md          # upstreams, config.json, override de proxy réseau
 │   ├── auth.md           # auth OAuth entrante et sortante
-│   ├── miaou-contract.md # surface de contact avec MIAOU (transport, REF_UNKNOWN)
+│   ├── miaou-contract.md # surface de contact avec MIAOU (transport, skills, REF_UNKNOWN)
 │   ├── tls.md            # magasin de confiance système (truststore)
 │   └── tests.md          # ce que couvre chaque suite
 ├── tests/
@@ -437,6 +439,9 @@ miaou-mcp-servers/
 │   ├── test_brave.py
 │   ├── test_docs.py
 │   ├── test_proxy.py
+│   ├── test_skills.py               # extension Skills des serveurs
+│   ├── test_proxy_skills.py         # skills servies par le proxy
+│   ├── skills_fixture_server.py     # upstream de test qui sert des skills (non collecté)
 │   ├── test_proxy_auth.py           # auth OAuth entrante
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante
 │   ├── test_dev_auth_server.py      # serveur d'autorisation de développement

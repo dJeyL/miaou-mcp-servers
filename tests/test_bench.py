@@ -153,3 +153,44 @@ def test_main_legacy_positional_invalid_port_exits_clean(monkeypatch, capsys):
         bench_server.main()
     assert exc_info.value.code == 1
     assert "port invalide" in capsys.readouterr().err.lower()
+
+
+# ---------------------------------------------------------------------------
+# Skill `bench` : la règle de restitution, exigée par tous les outils
+# ---------------------------------------------------------------------------
+
+BENCH_SKILL_URI = "skill://bench/SKILL.md"
+
+
+def test_bench_serves_its_skill():
+    from mcp_base import build_skill_entry
+
+    [source] = bench_server.skills.sources
+    entry = build_skill_entry(source)
+    assert entry["uri"] == BENCH_SKILL_URI
+    assert entry["frontmatter"]["name"] == "bench"
+    assert entry["frontmatter"]["description"].strip()
+    assert [r["uri"] for r in entry["resources"]] == [BENCH_SKILL_URI, "skill://bench/dns.md"]
+
+
+@pytest.mark.asyncio
+async def test_bench_skill_carries_the_non_contractual_rule():
+    """Le marqueur porte le mot `bench` : sa présence dans une réponse atteste
+    que la skill a été lue ET rattachée au bon serveur. Assertion posée sur les
+    deux fragments qui portent cette valeur, et non sur la ligne entière : le
+    balisage markdown relève de la présentation."""
+    [content] = await bench_server.mcp.read_resource(BENCH_SKILL_URI)
+    assert "Banc d'essai bench" in content.content
+    assert "non contractuel" in content.content
+    assert "non contractuel" not in bench_server.mcp.instructions
+
+
+@pytest.mark.asyncio
+async def test_every_bench_tool_requires_the_bench_skill():
+    from mcp_base import REQUIRES_SKILL_META_KEY
+
+    tools = await bench_server.mcp.list_tools()
+    assert tools
+    assert {t.name: t.meta for t in tools} == {
+        t.name: {REQUIRES_SKILL_META_KEY: BENCH_SKILL_URI} for t in tools
+    }

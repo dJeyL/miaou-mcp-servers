@@ -11,6 +11,11 @@ il n'est donc jamais collecté malgré sa présence dans tests/. Il parle le vra
 transport streamable-http, comme MIAOU — initialize, notifications/initialized,
 tools/call — et non le stack in-process des tests unitaires.
 
+`--modern` négocie la révision 2026-07-28 (`server/discover`) au lieu de la
+poignée de main `initialize` de MIAOU ; c'est la seule ère où un serveur publie
+ses extensions (Skills). `--method` envoie une requête JSON-RPC quelconque
+(`skills/list`, `resources/read`…) et affiche le résultat brut.
+
 Lancement (le serveur visé doit déjà tourner) :
     uv run tests/live_call.py brave__brave_search '{"query": "chat"}'
     uv run tests/live_call.py --port 8769 ddg_search '{"query": "chat"}'
@@ -18,6 +23,8 @@ Lancement (le serveur visé doit déjà tourner) :
     uv run tests/live_call.py --url http://127.0.0.1:8766/mcp echo '{"text": "hi"}'
     uv run tests/live_call.py -H 'Authorization: Bearer xxx' --list
     uv run tests/live_call.py -H 'X-Tenant: acme' -H 'X-Trace: 1' --list
+    uv run tests/live_call.py --modern --method skills/list
+    uv run tests/live_call.py --method resources/read --params '{"uri": "skill://bench/bench/SKILL.md"}'
 
 Sans argument JSON, l'outil est appelé sans arguments.
 """
@@ -28,6 +35,7 @@ import argparse
 import asyncio
 import json
 import sys
+from contextlib import asynccontextmanager
 
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -94,13 +102,9 @@ def _render_content(block) -> str:
     return repr(block)
 
 
-async def run(
-    url: str,
-    tool: str | None,
-    arguments: dict,
-    list_only: bool,
-    headers: dict[str, str] | None = None,
-) -> int:
+@asynccontextmanager
+async def _session(url: str, headers: dict[str, str] | None, modern: bool):
+    """Session ouverte sur le serveur, et un résumé de la négociation."""
     import httpx2
 
     # En-têtes et délais se posent sur le client HTTP depuis le SDK 2.x. Le délai
@@ -109,42 +113,89 @@ async def run(
     http_client = httpx2.AsyncClient(
         headers=headers, timeout=httpx2.Timeout(30, read=300)
     )
-    async with http_client, streamable_http_client(url, http_client=http_client) as (
-        read,
-        write,
-    ):
-        async with ClientSession(read, write) as session:
-            init = await session.initialize()
-            print(
-                f"→ connecté à {init.server_info.name} {init.server_info.version} ({url})",
-                file=sys.stderr,
-            )
+    async with http_client:
+        if modern:
+            from mcp.client import Client
 
-            tools = (await session.list_tools()).tools
-            if list_only:
-                for t in tools:
-                    print(f"{t.name}\n    {(t.description or '').splitlines()[0]}")
-                return 0
+            # `auto` sonde `server/discover` (et retomberait sur initialize
+            # devant un serveur ancien) : la version affichée dit laquelle a
+            # été retenue.
+            transport = streamable_http_client(url, http_client=http_client)
+            async with Client(transport, mode="auto") as client:
+                info = client.server_info
+                caps = client.server_capabilities
+                summary = (
+                    f"→ connecté à {info.name if info else '?'} ({url}), "
+                    f"révision {client.protocol_version}, "
+                    f"extensions={json.dumps(caps.extensions or {}, ensure_ascii=False)}"
+                )
+                yield client.session, summary
+            return
+        async with streamable_http_client(url, http_client=http_client) as (read, write):
+            async with ClientSession(read, write) as session:
+                init = await session.initialize()
+                summary = (
+                    f"→ connecté à {init.server_info.name} {init.server_info.version} "
+                    f"({url}), révision {init.protocol_version}"
+                )
+                yield session, summary
 
-            names = [t.name for t in tools]
-            if tool not in names:
-                print(f"outil inconnu : {tool}", file=sys.stderr)
-                print(f"disponibles : {', '.join(names) or '(aucun)'}", file=sys.stderr)
-                return 2
 
-            result = await session.call_tool(tool, arguments)
-            print(f"→ isError={result.is_error}", file=sys.stderr)
-            for block in result.content:
-                print(_render_content(block))
-            if getattr(result, "structured_content", None):
-                print("--- structuredContent ---")
-                print(json.dumps(result.structured_content, indent=2, ensure_ascii=False))
-            if result.meta:
-                # Surface adressée au client, jamais au modèle (ex. `miaou/web`
-                # de fetch_url) : c'est ici qu'on vérifie qu'elle traverse le fil.
-                print("--- _meta ---")
-                print(json.dumps(result.meta, indent=2, ensure_ascii=False))
-            return 1 if result.is_error else 0
+async def run(
+    url: str,
+    tool: str | None,
+    arguments: dict,
+    list_only: bool,
+    headers: dict[str, str] | None = None,
+    modern: bool = False,
+    method: str | None = None,
+) -> int:
+    async with _session(url, headers, modern) as (session, summary):
+        print(summary, file=sys.stderr)
+
+        if method is not None:
+            from typing import Any
+
+            import mcp.types as types
+            from mcp.shared.exceptions import MCPError
+            from pydantic import TypeAdapter
+
+            request = types.Request[Any, str](method=method, params=arguments)
+            try:
+                result = await session.send_request(request, TypeAdapter(dict[str, Any]))
+            except MCPError as e:
+                print(f"→ erreur JSON-RPC {e.error.code} : {e.error.message}", file=sys.stderr)
+                return 1
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0
+
+        tools = (await session.list_tools()).tools
+        if list_only:
+            for t in tools:
+                print(f"{t.name}\n    {(t.description or '').splitlines()[0] if t.description else ''}")
+                if t.meta:
+                    print(f"    _meta {json.dumps(t.meta, ensure_ascii=False)}")
+            return 0
+
+        names = [t.name for t in tools]
+        if tool not in names:
+            print(f"outil inconnu : {tool}", file=sys.stderr)
+            print(f"disponibles : {', '.join(names) or '(aucun)'}", file=sys.stderr)
+            return 2
+
+        result = await session.call_tool(tool, arguments)
+        print(f"→ isError={result.is_error}", file=sys.stderr)
+        for block in result.content:
+            print(_render_content(block))
+        if getattr(result, "structured_content", None):
+            print("--- structuredContent ---")
+            print(json.dumps(result.structured_content, indent=2, ensure_ascii=False))
+        if result.meta:
+            # Surface adressée au client, jamais au modèle (ex. `miaou/web`
+            # de fetch_url) : c'est ici qu'on vérifie qu'elle traverse le fil.
+            print("--- _meta ---")
+            print(json.dumps(result.meta, indent=2, ensure_ascii=False))
+        return 1 if result.is_error else 0
 
 
 def _flatten(exc: BaseException) -> list[str]:
@@ -164,7 +215,14 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8765, help="port du serveur (défaut 8765, le proxy)")
     parser.add_argument("--host", default="127.0.0.1", help="hôte du serveur (défaut 127.0.0.1)")
     parser.add_argument("--url", help="URL complète du endpoint /mcp (prime sur --host/--port)")
-    parser.add_argument("--list", action="store_true", help="liste les outils exposés et sort")
+    parser.add_argument("--list", action="store_true", help="liste les outils exposés (et leur _meta) et sort")
+    parser.add_argument(
+        "--modern",
+        action="store_true",
+        help="négocie la révision 2026-07-28 (server/discover) au lieu d'initialize",
+    )
+    parser.add_argument("--method", help="méthode JSON-RPC à envoyer (ex. skills/list), au lieu d'un outil")
+    parser.add_argument("--params", default="{}", help="paramètres JSON de --method")
     parser.add_argument(
         "-H",
         "--header",
@@ -175,11 +233,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not args.list and not args.tool:
-        parser.error("préciser un outil, ou utiliser --list")
+    if not args.list and not args.tool and not args.method:
+        parser.error("préciser un outil, ou utiliser --list ou --method")
 
     try:
-        arguments = json.loads(args.arguments)
+        arguments = json.loads(args.params if args.method else args.arguments)
     except json.JSONDecodeError as exc:
         print(f"arguments JSON invalides : {exc}", file=sys.stderr)
         return 2
@@ -200,7 +258,9 @@ def main() -> int:
     enable_system_trust_store()
 
     try:
-        return asyncio.run(run(url, args.tool, arguments, args.list, headers))
+        return asyncio.run(
+            run(url, args.tool, arguments, args.list, headers, args.modern, args.method)
+        )
     except KeyboardInterrupt:
         return 130
     except BaseException as exc:  # ExceptionGroup inclus (serveur injoignable)

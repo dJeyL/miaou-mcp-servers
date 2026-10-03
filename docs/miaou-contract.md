@@ -75,6 +75,46 @@ Vérifié de bout en bout : sur un `gemma4:e4b` local, la ligne témoin de
 `get_weather`. Le marqueur portant le mot `bench`, cette asymétrie atteste que
 le champ est lu ET rattaché au bon serveur malgré le double préfixe.
 
+## Skills servies par le proxy (extension `io.modelcontextprotocol/skills`)
+
+Un serveur peut servir des skills (format Agent Skills, transport de l'extension
+SEP-2640), et en exiger une avant l'appel de ses outils. `mcp_bench` en sert une,
+obligatoire pour tous ses outils. Ce que le proxy publie (détail de mise en œuvre :
+`docs/proxy.md`) :
+
+1. **Capacités, ère 2026-07-28.** `extensions["io.modelcontextprotocol/skills"] = {}`
+   (pas de `directoryRead`) et `resources`, dans `server/discover`, dès qu'au moins un
+   upstream sert une skill. Rien sinon. En legacy, `initialize` ne publie jamais
+   `extensions` ; il annonce en revanche `resources` quand une skill est servie.
+2. **URI préfixées du nom d'upstream** : `skill://bench/SKILL.md` de l'upstream `bench`
+   devient `skill://bench/bench/SKILL.md`. Octets inchangés, empreintes valides ; le
+   dernier segment reste le `name`.
+3. **`skills/list`, `skills/get`** : entrées de tous les upstreams vivants, URI
+   réécrites dans `uri` ET chaque `resources[].uri`, `resultType: "complete"`,
+   `ttlMs: 300000`, `cacheScope: "public"`, sans pagination. URI non servie (ou
+   d'annexe) sur `skills/get` → `-32602`.
+4. **`resources/read`** d'une URI `skill://<upstream>/…` : contenu de l'upstream relayé
+   tel quel (texte si UTF-8 valide, blob sinon), sous l'URI du client ; fichier non
+   déclaré par une entrée → `-32602`. Sur le fil moderne, l'en-tête `Mcp-Name` doit
+   valoir `params.uri` (400 sinon) — `MCP_NAME_BEARING_METHODS` de MIAOU le porte déjà.
+5. **`tools/list`** : un outil dont l'upstream déclare `_meta["miaou/requiresSkill"]` le
+   garde, URI réécrite. La valeur est l'URI du `SKILL.md`, relative au serveur qui liste
+   l'outil.
+6. **`instructions`** : la section d'un upstream qui sert des skills se termine par un
+   bloc généré, une ligne par skill servie, obligatoire ou facultative : `name`, URI
+   préfixée, statut, `description`. Forme exacte : `docs/proxy.md`.
+7. **Outil de repli `read_skill(uri)`**, nom nu, publié seulement si une skill est
+   servie, marqué `_meta["miaou/skillsFallback"] = true` : un client qui lit les skills
+   lui-même le masque par cette marque, pas par son nom. Texte rendu étiqueté du serveur
+   d'origine. Aucune approbation côté serveur.
+
+Mesuré avec MIAOU actuel (qui ne parle pas l'extension) : rien de cassé, et le modèle
+lit la skill de bench par `read_skill` puis applique sa règle. Le premier réflexe d'un
+modèle était `miaou__skills__read` avec le nom `bench` — le message système de MIAOU
+apprend à lire une skill par son slug. L'instruction de bench (« sa skill MCP `bench`,
+par son URI ») et l'en-tête du bloc (« pas des skills locales : leur nom ne suffit
+pas ») ont été écrits pour ça, et la description de `read_skill` le redit.
+
 ## Contrat partagé `mcp_docs` ↔ MIAOU (dispatcher, lot A/D6)
 
 Contrat entre le dispatcher client MIAOU et `mcp_docs` (et tout futur outil inflatable) —

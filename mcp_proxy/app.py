@@ -21,6 +21,7 @@ from .auth_out import (
 )
 from .logging import _log
 from .server import aggregate_instructions, authorize_path
+from .skills import build_skills_blocks, install_skills
 from .upstream import HttpUpstream, Upstream
 
 
@@ -201,7 +202,21 @@ def build_app(
                 # construction est vue par tout `initialize` client, y compris
                 # le premier : aucun client ne peut avoir fait son handshake
                 # avant, session_manager.run() n'ayant pas encore démarré.
-                mcp_server.instructions = aggregate_instructions(upstreams)
+                try:
+                    skills_blocks = await build_skills_blocks(upstreams, authorizers)
+                except Exception as e:
+                    skills_blocks = {}
+                    _log(f"Bloc des skills non généré ({type(e).__name__}: {e}).")
+                mcp_server.instructions = aggregate_instructions(upstreams, skills_blocks)
+                # Même contrainte d'ordre : les skills d'un upstream ne sont
+                # connues qu'après son start(). Les capacités étant calculées à
+                # chaque server/discover, l'enregistrement tardif est vu par tout
+                # client. Une erreur ici prive le proxy de skills, pas d'outils.
+                try:
+                    if await install_skills(mcp_server, upstreams, authorizers):
+                        _log("Extension Skills servie.")
+                except Exception as e:
+                    _log(f"Extension Skills non servie ({type(e).__name__}: {e}).")
                 # Lancée APRÈS le démarrage : elle n'a rien à faire tant qu'un
                 # upstream n'a pas de jeton, et le premier réveil est de toute
                 # façon différé d'un intervalle. Annulée avec le task group à

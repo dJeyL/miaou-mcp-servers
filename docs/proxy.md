@@ -78,9 +78,11 @@ mcp_proxy/ (paquet, à la racine du projet)
 ├── contract.py    AUTHORIZATION_REQUIRED, authorize_path(), AuthorizationRequired
 │                  — ce que server et auth_out nomment tous deux ; posé ici, leur
 │                    dépendance reste à sens unique (pas de cycle entre eux)
-├── upstream.py    les trois types, même surface `Upstream` :
+├── upstream.py    les trois types, même surface `Upstream` (outils, et skills :
+│   │              list_skills / get_skill / read_skill_file, « aucune » par défaut) :
 │   ├── InProcessUpstream  : importlib.import_module(module) → module.mcp (MCPServer,
-│   │                        API publique list_tools / call_tool)
+│   │                        API publique list_tools / call_tool ; skills lues sur
+│   │                        l'extension du MCPServer, seul type qui en sert)
 │   ├── StdioUpstream      : stdio_client + ClientSession (subprocess MCP)
 │   └── HttpUpstream       : client httpx2 + streamable_http_client + ClientSession
 │                            (serveur distant)
@@ -89,13 +91,18 @@ mcp_proxy/ (paquet, à la racine du projet)
 ├── server.py      build_proxy_server() : mcp.server.Server, on_list_tools / on_call_tool
 │   ├── list_tools → agrège tous les upstreams, préfixe les noms avec "{name}__"
 │   ├── call_tool  → dépréfixe, route vers l'upstream concerné
-│   └── aggregate_instructions() : compose `instructions` de l'InitializeResult
+│   ├── aggregate_instructions() : compose `instructions` de l'InitializeResult
+│   └── relay_tool_meta() : `_meta` d'outil republié, `miaou/requiresSkill` réécrit
+├── skills.py      extension Skills : prefix_skill_uri / resolve_skill_uri,
+│                  install_skills() (handlers skills/* et resources/*),
+│                  build_skills_blocks() (bloc des instructions), repli read_skill
 ├── auth_in.py     auth entrante — Resource Server (docs/auth.md)
 ├── auth_out/      auth sortante — client OAuth de tiers (docs/auth.md), lui-même
 │                  découpé : debug (traces) → probe (sonde) → storage (jetons)
 │                  → authorizer (parcours, renouvellement, routes)
 ├── app.py         build_app() : Starlette + StreamableHTTPSessionManager + CORS
-│   ├── lifespan : start/stop de chaque upstream, puis écriture des instructions
+│   ├── lifespan : start/stop de chaque upstream, puis install_skills() et
+│   │              écriture des instructions (bloc des skills compris)
 │   └── auth (facultative) : routes RFC 9728 + RequireAuthMiddleware sur /mcp
 └── entry.py       main() — CLI ; et run_with_dev_auth() : --with-dev-auth, proxy
                    ET AS de développement dans ce process, sur DEUX ports
@@ -170,9 +177,12 @@ une consigne passée en position partirait sans erreur. Côté proxy, trois capt
 upstreams : un préambule, puis une section `## <nom>` par upstream qui en
 déclare. **Le titre de section est le préfixe d'outil** (`bench` pour
 `bench__echo`) — c'est ce qui rend la portée d'une consigne déductible par le
-modèle sans convention supplémentaire à lui faire connaître. Un upstream sans
-instructions n'a pas de section ; si aucun n'en a, le champ vaut `None` et
-l'`InitializeResult` est celui d'avant le lot, à l'octet près.
+modèle sans convention supplémentaire à lui faire connaître. La section d'un
+upstream qui sert des skills se TERMINE par un bloc généré (cf. « Extension
+Skills » ci-dessous), et un upstream qui en sert sans déclarer d'instructions a
+une section pour ce bloc seul. Un upstream sans instructions ni skills n'a pas
+de section ; si aucun n'en a, le champ vaut `None` et l'`InitializeResult` est
+celui d'avant le lot, à l'octet près.
 
 Trois points qui ne se devinent pas :
 
@@ -205,6 +215,93 @@ prompt : le proxy le publie correctement, mais un client qui ignore
 l'`InitializeResult` n'en transmet rien. MIAOU le fait (cf.
 `docs/miaou-contract.md`) ; un client tiers, pas forcément.
 
+
+## Extension Skills (`io.modelcontextprotocol/skills`)
+
+Le proxy sert l'extension Skills (spec : `specification/stable/skills.mdx` du dépôt
+`modelcontextprotocol/ext-skills`) avec les skills de ses upstreams. Côté serveur,
+c'est `Skills` de `servers/mcp_base.py` (cf. `docs/servers.md`) ; ici, l'agrégation.
+Contrat publié au client : `docs/miaou-contract.md`.
+
+**URI préfixées.** Le proxy insère le nom d'upstream (clé de `mcpServers`) en premier
+segment : `skill://bench/SKILL.md` de l'upstream `bench` est publiée
+`skill://bench/bench/SKILL.md`. Même axe que le préfixe `bench__` des outils, et le
+dernier segment reste le `name`, comme l'exige la spec. Seules les URI changent, jamais
+les octets : les empreintes de l'upstream restent valides. Un seul couple de fonctions
+pures réécrit, `prefix_skill_uri` / `resolve_skill_uri` ; la seconde refuse en `-32602`
+une URI hors `skill://`, sans chemin, ou dont le premier segment n'est pas un upstream
+vivant. Le message d'erreur cite toujours l'URI du client, jamais celle de l'upstream.
+
+**Enregistrement au lifespan, seulement si une skill est servie.** `install_skills()`
+pose `skills/list`, `skills/get`, `resources/list`, `resources/read` et
+`Server.extensions` APRÈS le démarrage des upstreams — `build_proxy_server()` s'exécute
+avant, et ne sait rien des skills. Ça tient parce que le SDK calcule les capacités à
+chaque `server/discover` (mesuré) : un enregistrement tardif est vu par tout client. Un
+proxy dont aucun upstream ne sert de skill ne publie RIEN de neuf — vérifié à l'octet
+contre l'ancien code. Effet de bord : avec une skill servie, l'`initialize` legacy
+annonce aussi `resources` (le SDK dérive cette capacité du handler `resources/list`).
+
+`skills/list` et `skills/get` relisent les entrées à chaque appel (empreintes, tailles,
+frontmatter) — le CONTENU de fichiers dont l'ensemble, lui, est figé au démarrage de
+l'upstream : un fichier ajouté ou supprimé exige de le redémarrer (`docs/servers.md`,
+« Fraîcheur »). Ils posent `ttlMs: 300000`, `cacheScope: "public"`. `resources/list` ne
+liste que les fichiers de skills ; `resources/read` ne lit que les fichiers déclarés par
+une entrée (liste blanche de l'upstream), même si le `MCPServer` sert d'autres
+ressources.
+
+**Upstreams stdio et http : aucune skill.** Le proxy les aborde en `initialize` (ère
+legacy), où les capacités d'extension ne sont pas publiées, et la spec n'autorise
+`skills/*` qu'après les avoir vues dans `server/discover`. L'interface `Upstream` rend
+« aucune skill » pour eux, et le journal de démarrage le dit une fois par upstream
+(« skills non relayées »). Servir leurs skills suppose que le proxy parle d'abord l'ère
+moderne à ses upstreams : dette connue.
+
+**`_meta` des outils.** Relayé en entier par `tools/list` (`relay_tool_meta`), sauf
+`miaou/requiresSkill`, dont l'URI est relative au serveur qui liste l'outil : elle reçoit
+le préfixe d'upstream. Une valeur non préfixable (pas une chaîne `skill://`) est retirée
+plutôt que relayée fausse. `ToolCatalogCache` mémorise ce `_meta` : un upstream non
+autorisé resservi depuis le cache garde sa déclaration ; un fichier de cache plus ancien,
+sans la clé, se relit sans erreur. Un `requiresSkill` qui ne désigne aucune skill servie
+par son upstream est journalisé au démarrage et relayé quand même (la garde du client
+reste ouverte dans ce cas).
+
+**Bloc généré dans les instructions.** `build_skills_blocks()` (lifespan) termine la
+section de chaque upstream qui sert des skills :
+
+```
+Skills MCP servies par `bench` — pas des skills locales : leur nom ne suffit pas, elles se lisent par leur URI complète :
+- `bench` (skill://bench/bench/SKILL.md), obligatoire avant tout appel d'un outil `bench__…` : Règle de restitution […]
+```
+
+Une ligne par skill, obligatoire ou FACULTATIVE (aucun outil ne l'exige) : sans annonce,
+une skill facultative serait inatteignable — le modèle n'a pas `skills/list`, toute
+lecture exige l'URI, et l'upstream ne peut pas l'écrire dans son texte libre, puisque le
+préfixe ajouté ici la rendrait fausse. Le statut précède la description (sinon il se
+colle à une description sans point final) ; « tout appel d'un outil `<up>__…` » quand
+TOUS les outils de l'upstream l'exigent, la liste des noms préfixés sinon. Le bloc ne
+nomme aucun outil de lecture : le repli est masqué par les clients qui lisent les skills
+eux-mêmes. Calculé une fois au démarrage, pour un message système stable : une
+description modifiée sur disque n'y apparaît qu'au redémarrage, alors que `skills/list`
+la sert à jour.
+
+L'en-tête « pas des skills locales : leur nom ne suffit pas » est une correction
+MESURÉE : un client qui a ses propres skills (MIAOU) apprend au modèle à les lire par leur
+nom ; sans cette phrase, un gros modèle (gpt-oss:120b) cherchait `bench` parmi les skills
+locales, ne la trouvait pas, et s'interdisait l'outil. « leur nom ne suffit pas » plutôt
+que « absentes de la liste locale », qui serait faux chez un hôte listant les skills MCP
+avec les siennes.
+
+**Outil de repli `read_skill(uri)`.** Pour les clients qui ne parlent pas l'extension.
+Nom NU, comme `status`, publié seulement si l'extension est servie — décidé à l'appel,
+par `SKILLS_EXTENSION_ID in server.extensions`, seule source de vérité avec les
+capacités. Marqué `_meta["miaou/skillsFallback"] = true` pour qu'un client qui lit les
+skills lui-même le masque sans dépendre de son nom. Même résolution et même liste
+blanche que `resources/read` ; tout refus est un `isError` lisible par le modèle. Le
+texte rendu est précédé de « [Fichier de skill servi par le serveur MCP `<upstream>` —
+<uri>] » (un contenu de skill MCP ne doit pas passer pour une consigne locale) ; un
+fichier binaire sort en `EmbeddedResource` après l'étiquette ; après un `SKILL.md`, une
+note liste les autres fichiers de la skill par URI absolue. Aucune approbation : c'est
+l'affaire du client.
 
 ## Configuration du proxy (`config.json`)
 

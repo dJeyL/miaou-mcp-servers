@@ -5,6 +5,61 @@ de conception. Le proxy a son propre document (`docs/proxy.md`) ; l'auth OAuth a
 (`docs/auth.md`).
 
 
+## Skills d'un serveur (`skills_dir`, extension Skills)
+
+Tout serveur peut servir des skills (format Agent Skills, extension
+`io.modelcontextprotocol/skills`) : `MiaouMCPBase(..., skills_dir=...)` installe
+l'extension `Skills` de `servers/mcp_base.py`. Défaut `None` : aucune extension, rien ne
+change sur le fil.
+
+**Où vivent les skills.** Serveur mono-fichier (`servers/mcp_bench.py`) :
+`servers/skills/<serveur>/`. Serveur en package (`servers/mcp_web/`…) :
+`servers/mcp_<serveur>/skills/`, à côté de son code. Dans les deux cas, chaque
+sous-dossier du `skills_dir` qui contient un `SKILL.md` est une skill, et le nom du
+sous-dossier est son `name` ; ses autres fichiers sont des annexes, servies avec elle.
+Servie en `skill://<name>/<fichier>`.
+
+**Validé au démarrage**, la construction échouant avec un message qui nomme la skill et
+la cause : frontmatter YAML en tête de `SKILL.md`, `name` égal au dossier et conforme à
+Agent Skills (1-64 caractères, `a-z0-9-`, ni tiret en bord ni double tiret),
+`description` non vide et d'au plus 1024 caractères, frontmatter représentable en JSON
+(une date YAML non quotée est refusée : il faut la quoter), segments de chemin limités à
+lettres, chiffres, `.`, `_`, `~`, `-`, bornes de la spec (512 fichiers, 16 Mio par
+skill). Les fichiers dont un segment commence par un point (`.DS_Store`, `.git/`) sont
+ignorés.
+
+**Fraîcheur.** L'ensemble des fichiers est figé au démarrage (chacun est une ressource
+enregistrée) ; leur contenu est relu à chaque `skills/list`, `skills/get` et
+`resources/read`. Un fichier modifié est servi sans redémarrage ; un fichier AJOUTÉ ou
+SUPPRIMÉ en demande un. Une skill devenue invalide sur disque est omise de `skills/list`
+et rend `-32603` sur `skills/get` — c'est le sort d'une skill dont un fichier a été
+supprimé à chaud, même une annexe : la relecture de l'ensemble figé échoue sur le
+fichier disparu (`SkillError` « illisible »), et la skill entière disparaît avec lui,
+`SKILL.md` compris. Serveur seul, `resources/list` (celui du SDK, qui liste les
+ressources enregistrées) annonce pourtant toujours le fichier ; derrière le proxy, qui
+dérive `resources/list` des entrées, la skill en disparaît aussi.
+
+**Octets intacts.** `SkillFileResource` relit les octets bruts et rend du texte s'ils
+sont de l'UTF-8 valide, un blob sinon. Le `FileResource` du SDK ne convient pas : il
+retire le BOM (`utf-8-sig`) et ramène CRLF à LF, ce qui ferait diverger les octets servis
+de l'empreinte publiée.
+
+**Exiger une skill.** `self.finalize_tools(requires_skill="<skill>")` pose
+`_meta["miaou/requiresSkill"]` (URI du `SKILL.md`) sur TOUS les outils ;
+`requires_skill={"outil": "<skill>"}` sur ceux qu'il nomme. Skill non servie ou outil
+inconnu : `ValueError` au démarrage. Une skill qu'aucun outil n'exige est facultative,
+servie à l'identique.
+
+**Dépendance.** Le frontmatter se lit avec PyYAML (`safe_load`, verbatim comme l'exige
+la spec), importé paresseusement : seul un serveur qui sert des skills déclare `pyyaml`
+dans son bloc PEP 723.
+
+**Un serveur ne cite jamais l'URI de sa skill dans son texte libre** (instructions,
+docstrings) : derrière le proxy elle reçoit le préfixe d'upstream. Il la nomme, en
+précisant qu'il s'agit d'une skill MCP lue par son URI ; le proxy génère la ligne qui
+donne l'URI (cf. `docs/proxy.md`).
+
+
 ## `servers/mcp_bench.py` — banc d'essai général (port 8766)
 
 Sert à exercer les différents chemins de traitement des résultats dans MIAOU :
@@ -41,12 +96,24 @@ Deux détails du clamp qui ne se devinent pas :
   clamp soit observable côté client.
 
 **Seul serveur du dépôt à publier des `instructions`** (consigne de portée serveur,
-champ de l'`InitializeResult` — cf. `docs/proxy.md`) : il demande au modèle de
-signaler chaque usage d'un outil `bench` par la ligne « *Banc d'essai bench —
-résultat **non contractuel**.* ». Durable, et non un canari à retirer : la consigne est
-vraie (résultat sans utilité en production) et sert en même temps de témoin de bout
-en bout — le marqueur porte le mot `bench`, donc sa présence dans une réponse
-atteste que le champ a été lu ET rattaché au bon serveur.
+champ de l'`InitializeResult` — cf. `docs/proxy.md`), **et à servir une skill**
+(extension Skills, `skills_dir` = `servers/skills/bench/`). Les instructions disent
+la nature de banc d'essai et renvoient à la skill `bench`, PAR SON NOM : une URI y
+serait fausse derrière le proxy, qui la préfixe du nom d'upstream (c'est le bloc
+généré par le proxy qui la donne). Le renvoi dit « sa skill MCP `bench`, par son
+URI » et non « sa skill `bench` » : un client qui a ses propres skills (MIAOU)
+apprend au modèle à les lire par leur nom, et un nom nu l'envoyait chercher une
+skill locale inexistante — observé, détour par `miaou__skills__read` ou abandon
+de l'outil. La skill
+(`servers/skills/bench/bench/SKILL.md`, servie en `skill://bench/SKILL.md`, avec
+une annexe `dns.md` sans enjeu, sur la lecture des résultats DNS) porte la
+règle : signaler chaque usage d'un outil `bench` par la ligne
+« *Banc d'essai bench — résultat **non contractuel**.* ». Tous les outils l'exigent
+(`_meta["miaou/requiresSkill"]`, posé par `finalize_tools(requires_skill="bench")`).
+Durable, et non un canari à retirer : la règle est vraie (résultat sans utilité en
+production) et sert en même temps de témoin de bout en bout — le marqueur porte le
+mot `bench`, donc sa présence dans une réponse atteste que la skill a été lue ET
+rattachée au bon serveur.
 
 Le texte se NOMME (« les outils `bench` ») au lieu de se désigner (« ce serveur ») :
 agrégé par le proxy, il vit sous un titre de section parmi N, où un déictique n'a

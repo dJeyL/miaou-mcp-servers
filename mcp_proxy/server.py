@@ -17,12 +17,15 @@ from mcp.server import Server
 from mcp.shared.exceptions import MCPError
 from mcp.types import INVALID_REQUEST
 
+from mcp_base import SKILLS_EXTENSION_ID
+
 from .contract import (
     AUTHORIZATION_REQUIRED,
     AuthorizationRequired,
     authorize_path,
 )
 from .logging import _log
+from .skills import READ_SKILL_TOOL_NAME, call_read_skill, read_skill_tool
 from .upstream import HttpUpstream, InProcessUpstream, Upstream, _unwrap_exception_group
 
 
@@ -75,11 +78,15 @@ class ToolCatalogCache:
         data = self._read()
         data[upstream_name] = {
             "known_at": time.time(),
+            # `_meta` mémorisé avec le reste : un upstream non autorisé
+            # resservi depuis le cache garde sa déclaration de skill exigée.
+            # Clé absente quand l'outil n'en a pas, comme sur le fil.
             "tools": [
                 {
                     "name": t.name,
                     "description": t.description,
                     "inputSchema": t.input_schema,
+                    **({"_meta": dict(t.meta)} if t.meta else {}),
                 }
                 for t in tools
             ],
@@ -99,11 +106,16 @@ class ToolCatalogCache:
         tools = []
         for raw in entry.get("tools", []):
             try:
+                # Lecture tolérante : un cache écrit avant que le `_meta` y
+                # soit mémorisé n'a pas la clé, et un `_meta` qui n'est pas un
+                # objet est ignoré plutôt que de faire perdre l'outil.
+                meta = raw.get("_meta")
                 tools.append(
                     types.Tool(
                         name=raw["name"],
                         description=raw.get("description"),
                         input_schema=_object_schema(raw.get("inputSchema")),
+                        **({"_meta": meta} if isinstance(meta, dict) and meta else {}),
                     )
                 )
             except Exception:
@@ -220,6 +232,30 @@ def _object_schema(schema: Any) -> dict[str, Any]:
     return {**schema, "type": "object"}
 
 
+def relay_tool_meta(upstream_name: str, meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    """`_meta` d'un outil d'upstream tel que le proxy le republie.
+
+    Relayé en entier, sauf `miaou/requiresSkill`, dont l'URI est relative au
+    serveur qui liste l'outil : elle reçoit le préfixe d'upstream, comme les
+    URI de `skills/list`. Une valeur que le préfixage ne sait pas traiter (pas
+    une chaîne `skill://`) est RETIRÉE : relayée telle quelle, elle désignerait
+    une skill du proxy qui n'existe pas."""
+    from mcp_base import REQUIRES_SKILL_META_KEY
+
+    from .skills import prefix_skill_uri
+
+    if not meta:
+        return None
+    relayed = dict(meta)
+    required = relayed.get(REQUIRES_SKILL_META_KEY)
+    if required is not None:
+        try:
+            relayed[REQUIRES_SKILL_META_KEY] = prefix_skill_uri(upstream_name, required)
+        except (TypeError, ValueError, AttributeError):
+            del relayed[REQUIRES_SKILL_META_KEY]
+    return relayed or None
+
+
 STATUS_TOOL_NAME = "status"
 """Nom NU, sans préfixe de serveur.
 
@@ -333,7 +369,9 @@ _INSTRUCTIONS_PREAMBLE = (
 )
 
 
-def aggregate_instructions(upstreams: dict[str, Upstream]) -> str | None:
+def aggregate_instructions(
+    upstreams: dict[str, Upstream], skills_blocks: dict[str, str] | None = None
+) -> str | None:
     """Compose le champ `instructions` du proxy à partir de celui de chaque
     upstream (spec MCP : `InitializeResult.instructions`, destiné au system
     prompt du modèle).
@@ -359,14 +397,25 @@ def aggregate_instructions(upstreams: dict[str, Upstream]) -> str | None:
     manquant définitivement, puisque `initialize` ne se rejoue pas après une
     autorisation obtenue en cours de route.
 
-    Renvoie None si aucun upstream n'a d'instructions — l'InitializeResult est
-    alors identique à celui d'avant ce lot, à l'octet près.
+    `skills_blocks` (cf. `skills.build_skills_blocks`) : bloc généré qui
+    TERMINE la section de l'upstream, après son texte libre ; un upstream qui
+    sert des skills sans déclarer d'instructions a une section pour son bloc
+    seul.
+
+    Renvoie None si aucun upstream n'a d'instructions ni de skills —
+    l'InitializeResult est alors identique à celui d'avant ce lot, à l'octet
+    près.
     """
-    sections = [
-        f"## {prefix}\n\n{upstream.instructions.strip()}"
-        for prefix, upstream in upstreams.items()
-        if upstream.instructions and upstream.instructions.strip()
-    ]
+    skills_blocks = skills_blocks or {}
+    sections = []
+    for prefix, upstream in upstreams.items():
+        parts = []
+        if upstream.instructions and upstream.instructions.strip():
+            parts.append(upstream.instructions.strip())
+        if skills_blocks.get(prefix):
+            parts.append(skills_blocks[prefix])
+        if parts:
+            sections.append(f"## {prefix}\n\n" + "\n\n".join(parts))
     if not sections:
         return None
     return "\n\n".join([_INSTRUCTIONS_PREAMBLE, *sections])
@@ -421,15 +470,22 @@ def build_proxy_server(
                 description = tool.description
                 if not live:
                     description = format_stale_description(description, stale_since)
+                meta = relay_tool_meta(prefix, tool.meta)
                 tools.append(
                     types.Tool(
                         name=prefixed,
                         description=description,
                         input_schema=_object_schema(tool.input_schema),
+                        **({"_meta": meta} if meta else {}),
                     )
                 )
         if authorizers:
             tools.append(_status_tool())
+        # Le repli n'existe que si l'extension est servie : `install_skills` la
+        # pose au lifespan, APRÈS cette construction — d'où la lecture à
+        # l'appel, sur le serveur lui-même, seule source de vérité.
+        if _skills_served():
+            tools.append(read_skill_tool())
 
         # `**{"_meta": ...}` et non `meta=...` : pydantic ne sérialise sous
         # l'alias que si le champ a été peuplé PAR l'alias, et la propriété qui
@@ -475,6 +531,9 @@ def build_proxy_server(
                 ]
             )
 
+        if name == READ_SKILL_TOOL_NAME and _skills_served():
+            return await call_read_skill(upstreams, authorizers, arguments)
+
         if name in tool_map:
             upstream_name, orig_name = tool_map[name]
         else:
@@ -511,8 +570,12 @@ def build_proxy_server(
                 raise UpstreamNotAuthorized(upstream_name) from e
             return _error_result(str(e))
 
-    return Server(
+    def _skills_served() -> bool:
+        return SKILLS_EXTENSION_ID in server.extensions
+
+    server = Server(
         "miaou-proxy",
         on_list_tools=handle_list_tools,
         on_call_tool=handle_call_tool,
     )
+    return server

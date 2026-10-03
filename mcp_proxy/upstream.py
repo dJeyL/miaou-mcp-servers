@@ -40,6 +40,33 @@ class Upstream(ABC):
         self, name: str, arguments: dict[str, Any]
     ) -> list[Any] | types.CallToolResult: ...
 
+    # Extension Skills. Par défaut : aucune skill. Seul l'inprocess sait les
+    # servir — stdio et http sont abordés en `initialize` (ère legacy), où les
+    # capacités d'extension ne sont pas publiées, et la spec n'autorise
+    # `skills/*` qu'après les avoir vues dans `server/discover`. Les servir
+    # suppose que le proxy parle d'abord l'ère moderne à ces upstreams.
+    serves_skills_natively: bool = False
+
+    async def list_skills(self) -> list[dict[str, Any]]:
+        """Entrées `Skill` de la spec, URI d'ORIGINE (non préfixées)."""
+        return []
+
+    async def get_skill(self, uri: str) -> dict[str, Any]:
+        """Entrée de la skill dont `uri` est le `SKILL.md`, ou `MCPError`
+        `-32602` si l'upstream ne la sert pas."""
+        raise _unserved(uri)
+
+    async def read_skill_file(self, uri: str) -> list[types.ResourceContents]:
+        """Contenu d'un fichier listé dans le `resources` d'une skill servie,
+        URI d'origine ; `MCPError` `-32602` pour toute autre URI."""
+        raise _unserved(uri)
+
+
+def _unserved(uri: str) -> Exception:
+    from mcp.shared.exceptions import MCPError
+
+    return MCPError(types.INVALID_PARAMS, f"No skill resource is served at {uri}")
+
 
 def relay_call_result(call_result: types.CallToolResult) -> types.CallToolResult:
     """Résultat d'un upstream stdio/http tel que le proxy le rend à son client.
@@ -66,6 +93,9 @@ def relay_call_result(call_result: types.CallToolResult) -> types.CallToolResult
 
 class InProcessUpstream(Upstream):
     """Appelle un MCPServer dans le même processus Python, sans subprocess."""
+
+    # Sans transport : l'extension Skills se lit sur le MCPServer lui-même.
+    serves_skills_natively = True
 
     def __init__(
         self,
@@ -118,13 +148,14 @@ class InProcessUpstream(Upstream):
         pass
 
     async def list_tools(self) -> list[types.Tool]:
-        # Les trois champs que le proxy republie, et eux seuls : c'est la forme
-        # que les upstreams ont toujours eue ici.
+        # Les champs que le proxy republie, et eux seuls : nom, description,
+        # schéma d'entrée, et `_meta` (déclaration `miaou/requiresSkill`).
         return [
             types.Tool(
                 name=t.name,
                 description=t.description,
                 input_schema=t.input_schema,
+                **({"_meta": dict(t.meta)} if t.meta else {}),
             )
             for t in await self._server.list_tools()
         ]
@@ -138,6 +169,54 @@ class InProcessUpstream(Upstream):
         # remonte en exception, que handle_call_tool rend en isError ; une
         # MCPError (REF_UNKNOWN) remonte telle quelle, et traverse.
         return await self._server.call_tool(name, arguments)
+
+    def _skills(self) -> Any:
+        # Résolu à CHAQUE appel, jamais capturé : le MCPServer n'existe
+        # qu'après start(), et build_proxy_server() s'exécute avant.
+        from mcp_base import find_skills_extension
+
+        if self._server is None:
+            return None
+        return find_skills_extension(self._server)
+
+    async def list_skills(self) -> list[dict[str, Any]]:
+        skills = self._skills()
+        return skills.list_entries() if skills is not None else []
+
+    async def get_skill(self, uri: str) -> dict[str, Any]:
+        skills = self._skills()
+        if skills is None:
+            raise _unserved(uri)
+        return skills.get_entry(uri)
+
+    async def read_skill_file(self, uri: str) -> list[types.ResourceContents]:
+        import base64
+
+        # Liste blanche : seuls les fichiers déclarés par une entrée. Le
+        # MCPServer peut servir d'autres ressources, que le proxy ne publie pas.
+        listed = {
+            resource["uri"]
+            for entry in await self.list_skills()
+            if isinstance(entry.get("resources"), list)
+            for resource in entry["resources"]
+        }
+        if uri not in listed:
+            raise _unserved(uri)
+        contents: list[types.ResourceContents] = []
+        for item in await self._server.read_resource(uri):
+            if isinstance(item.content, bytes):
+                contents.append(
+                    types.BlobResourceContents(
+                        uri=uri,
+                        mime_type=item.mime_type,
+                        blob=base64.b64encode(item.content).decode("ascii"),
+                    )
+                )
+            else:
+                contents.append(
+                    types.TextResourceContents(uri=uri, mime_type=item.mime_type, text=item.content)
+                )
+        return contents
 
 
 _STDIO_HANDSHAKE_TIMEOUT_S = 15

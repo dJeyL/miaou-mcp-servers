@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "truststore"]
+# dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "truststore", "pyyaml"]
 # ///
 """
 Serveur MCP de banc d'essai pour MIAOU (V2 — délégation distante).
@@ -35,6 +35,7 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 import asyncio
 import base64
 import socket
+from pathlib import Path
 from typing import Annotated
 
 from mcp import types
@@ -68,19 +69,32 @@ _SLEEP_CAP = 60.0
 # nom d'outil en accès direct comme derrière un ou deux niveaux de préfixe : la
 # correspondance remplace la chaîne d'inférences.
 #
-# Sert aussi de canari : le marqueur de sortie porte le mot `bench`, donc sa
-# présence atteste que le champ est lu ET rattaché au bon serveur.
+# La règle de restitution (« non contractuel ») vit dans la skill `bench`, exigée
+# par tous les outils : l'instruction la NOMME sans citer son URI, qu'un proxy
+# réécrit en préfixant le nom d'upstream — c'est lui qui génère la ligne qui la
+# donne. « skill MCP […] par son URI » et non « sa skill `bench` » tout court :
+# un client qui a ses propres skills (MIAOU) apprend au modèle à les lire par
+# leur nom, et un nom nu l'envoie chercher une skill locale qui n'existe pas
+# (observé : détour par `miaou__skills__read`, ou abandon de l'outil). Le marqueur de sortie porte le mot `bench` : sa présence dans une
+# réponse atteste que la skill a été lue ET rattachée au bon serveur.
 _INSTRUCTIONS = """\
 Banc d'essai du développement de MIAOU : les outils `bench` n'ont pas d'utilité
 en production, même quand leur effet est réel (résolution DNS, par exemple).
 
-Après avoir utilisé un outil `bench`, le signaler à l'utilisateur sur une
-dernière ligne : « *Banc d'essai bench — résultat **non contractuel**.* »."""
+Avant d'utiliser un outil `bench`, lire sa skill MCP `bench`, par son URI."""
+
+# Serveur mono-fichier : ses skills vivent dans servers/skills/<serveur>/.
+_SKILLS_DIR = Path(__file__).resolve().parent / "skills" / "bench"
 
 
 class BenchServer(MiaouMCPBase):
     def __init__(self) -> None:
-        super().__init__("miaou-bench", default_port=8766, instructions=_INSTRUCTIONS)
+        super().__init__(
+            "miaou-bench",
+            default_port=8766,
+            instructions=_INSTRUCTIONS,
+            skills_dir=_SKILLS_DIR,
+        )
 
         @self.mcp.tool()
         async def echo(text: str) -> str:
@@ -169,7 +183,8 @@ class BenchServer(MiaouMCPBase):
                 ),
             )
 
-        self.finalize_tools()
+        # La règle de la skill vaut pour chaque outil.
+        self.finalize_tools(requires_skill="bench")
 
 
 server = BenchServer()

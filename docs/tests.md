@@ -65,7 +65,19 @@ uv run tests/live_call.py --port 8769 ddg_search '{"query": "chat"}'  # serveur 
 uv run tests/live_call.py --list                                      # outils exposés
 uv run tests/live_call.py --url http://host:8765/mcp echo '{"text": "hi"}'
 uv run tests/live_call.py -H 'Authorization: Bearer xxx' --list   # header libre, répétable
+uv run tests/live_call.py --modern --list                            # ère 2026-07-28, extensions affichées
+uv run tests/live_call.py --method skills/list                       # requête JSON-RPC quelconque
+uv run tests/live_call.py --modern --method resources/read --params '{"uri": "skill://bench/bench/SKILL.md"}'
 ```
+
+`--modern` négocie la révision 2026-07-28 (`Client(mode="auto")`, qui sonde
+`server/discover`) au lieu de la poignée de main `initialize` de MIAOU, et affiche la
+révision retenue et les `extensions` publiées : c'est la seule ère où elles le sont. Sans
+lui, le script parle comme MIAOU actuel (révision affichée aussi). `--method` envoie une
+requête JSON-RPC quelconque (`skills/list`, `skills/get`, `resources/read`…) avec
+`--params`, et affiche le résultat brut ; une erreur JSON-RPC sort avec son code et son
+message, en code 1. `--list` affiche aussi le `_meta` de chaque outil qui en porte
+(`miaou/requiresSkill`, `miaou/skillsFallback`).
 
 `--port` défaut 8765 (le proxy), `--host` défaut `127.0.0.1`, `--url` prime sur les deux.
 Arguments JSON optionnels. L'outil est vérifié contre `tools/list` avant l'appel (nom

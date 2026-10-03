@@ -14,6 +14,7 @@ dependencies = [
     "openpyxl",
     "python-pptx",
     "truststore",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]

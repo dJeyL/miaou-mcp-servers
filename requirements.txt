@@ -32,6 +32,7 @@ python-docx
 openpyxl
 python-pptx
 truststore
+pyyaml
 
 # Dépendances de test
 pytest
