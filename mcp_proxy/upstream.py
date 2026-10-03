@@ -219,6 +219,7 @@ class InProcessUpstream(Upstream):
                 f"Le module '{self._module_name}' n'expose ni 'build(config)' ni 'mcp' (MCPServer)."
             )
         self._server = server
+        self._warn_on_foreign_skills_extension()
         # Pas d'`initialize` sur ce chemin (on parle au MCPServer en direct,
         # sans transport) : les instructions se lisent sur l'objet, là où les
         # deux autres upstreams les reçoivent dans leur InitializeResult.
@@ -249,6 +250,27 @@ class InProcessUpstream(Upstream):
         # remonte en exception, que handle_call_tool rend en isError ; une
         # MCPError (REF_UNKNOWN) remonte telle quelle, et traverse.
         return await self._server.call_tool(name, arguments)
+
+    def _warn_on_foreign_skills_extension(self) -> None:
+        """Signale une extension Skills que `find_skills_extension` ne reconnaît
+        pas : celle d'un `mcp_base` chargé sous un autre nom de module
+        (`servers.mcp_base`, copie dans le package…), dont la classe `Skills`
+        est une AUTRE classe. Le serveur l'a installée et ses outils exigent
+        ses skills, mais le proxy n'en voit aucune — en silence sans cette
+        ligne, le journal ne disant ensuite que « skill exigée mais non
+        servie »."""
+        from mcp_base import SKILLS_EXTENSION_ID, find_skills_extension
+
+        if find_skills_extension(self._server) is not None:
+            return
+        for extension in getattr(self._server, "_extensions", ()):
+            if getattr(extension, "identifier", None) == SKILLS_EXTENSION_ID:
+                _log(
+                    f"Extension Skills de '{self._module_name}' ignorée : sa classe vient "
+                    f"du module '{type(extension).__module__}', pas de 'mcp_base' — "
+                    f"importer la base par `from mcp_base import ...`."
+                )
+                return
 
     def _skills(self) -> Any:
         # Résolu à CHAQUE appel, jamais capturé : le MCPServer n'existe

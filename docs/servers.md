@@ -50,6 +50,15 @@ de l'empreinte publiée.
 inconnu : `ValueError` au démarrage. Une skill qu'aucun outil n'exige est facultative,
 servie à l'identique.
 
+**Importer la base par `from mcp_base import ...`, et sous aucun autre nom** — package
+compris (`servers.mcp_base`, copie locale, import relatif bricolé). Un autre nom charge
+une seconde copie du module, dont la classe `Skills` n'est pas celle que le proxy
+reconnaît (`find_skills_extension` teste `isinstance`) : le serveur démarre, ses outils
+exigent bien leur skill, `finalize_tools` ne lève rien, mais le proxy n'en voit aucune et
+ne journalise que « skill exigée mais non servie ». Payé sur un package généré par un
+autre modèle. Le démarrage d'un upstream inprocess le signale désormais par une ligne
+« `Extension Skills de '<module>' ignorée` » qui nomme le module fautif.
+
 **Dépendance.** Le frontmatter se lit avec PyYAML (`safe_load`, verbatim comme l'exige
 la spec), importé paresseusement : seul un serveur qui sert des skills déclare `pyyaml`
 dans son bloc PEP 723.

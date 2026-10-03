@@ -327,6 +327,36 @@ async def test_two_instances_of_one_module_keep_their_own_skills(tmp_path, optio
     ]
 
 
+async def test_skills_extension_from_a_second_mcp_base_is_reported(
+    monkeypatch, capsys, optional_skills_dir
+):
+    """Un package qui importe la base sous un autre nom de module charge une
+    seconde copie de `mcp_base`, et sa classe `Skills` n'est pas celle que
+    `find_skills_extension` reconnaît : le proxy ne voit aucune skill. Le
+    démarrage le dit, au lieu du seul « skill exigée mais non servie »."""
+    import importlib.util
+    import types as pytypes
+
+    import mcp_base
+
+    spec = importlib.util.spec_from_file_location("foreign_mcp_base", mcp_base.__file__)
+    foreign = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(foreign)
+    module = pytypes.ModuleType("foreign_skills_server")
+    module.mcp = foreign.MiaouMCPBase("foreign", 0, skills_dir=optional_skills_dir).mcp
+    monkeypatch.setitem(sys.modules, "foreign_skills_server", module)
+
+    upstream = InProcessUpstream("foreign_skills_server")
+    await upstream.start()
+    assert await upstream.list_skills() == []
+    err = capsys.readouterr().err
+    assert "Extension Skills de 'foreign_skills_server' ignorée" in err
+    assert "'foreign_mcp_base'" in err
+
+    await InProcessUpstream(FIXTURE, config={"skills_dir": str(optional_skills_dir)}).start()
+    assert "ignorée" not in capsys.readouterr().err
+
+
 # --- Ordre réel : le lifespan de build_app ---------------------------------------------
 
 

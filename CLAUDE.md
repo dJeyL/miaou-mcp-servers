@@ -327,7 +327,7 @@ lots — piège déjà payé côté MIAOU.
   variables d'environnement, décisions de conception. Skills d'un serveur
   (`skills_dir` et où le poser, validation au démarrage, ensemble de fichiers figé
   mais contenu relu, `SkillFileResource` et les octets intacts, `requires_skill`,
-  PyYAML paresseux, jamais d'URI de skill dans le texte libre). `mcp_bench` (chemins de
+  PyYAML paresseux, base importée par `from mcp_base` sous peine de skills invisibles au proxy, jamais d'URI de skill dans le texte libre). `mcp_bench` (chemins de
   résultat D8/D9, seul serveur à publier des `instructions` et une skill exigée
   par ses outils — consigne durable qui se nomme au lieu de se désigner, règle
   « non contractuel » portée par la skill, et qui lui interdit de servir d'upstream muet
