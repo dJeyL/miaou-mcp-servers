@@ -83,6 +83,46 @@ def test_build_upstreams_stdio():
     assert isinstance(upstreams["ext"], StdioUpstream)
 
 
+def test_build_upstreams_protocol_key():
+    """`protocol` impose l'ère d'un upstream stdio ou http : "auto" par défaut
+    (sonde puis repli), "legacy" pour `initialize` d'emblée. Passé tel quel en
+    `mode` au `Client` du SDK."""
+    cfg = {
+        "port": 8765,
+        "mcpServers": {
+            "s": {"command": "uv"},
+            "s_legacy": {"command": "uv", "protocol": "legacy"},
+            "h": {"type": "http", "url": "http://127.0.0.1:9/mcp"},
+            "h_legacy": {"type": "http", "url": "http://127.0.0.1:9/mcp", "protocol": "legacy"},
+            "i": {"type": "inprocess", "module": "mcp_bench"},
+        },
+    }
+    upstreams = build_upstreams(cfg)
+    assert {name: up.mode for name, up in upstreams.items()} == {
+        "s": "auto",
+        "s_legacy": "legacy",
+        "h": "auto",
+        "h_legacy": "legacy",
+        "i": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "entry, match",
+    [
+        ({"command": "uv", "protocol": "2026-07-28"}, "'protocol'"),
+        ({"type": "http", "url": "http://x/mcp", "protocol": "modern"}, "'protocol'"),
+        ({"type": "inprocess", "module": "mcp_bench", "protocol": "legacy"}, "inprocess"),
+    ],
+)
+def test_build_upstreams_rejects_a_misplaced_or_unknown_protocol(entry, match):
+    """Une valeur hors "auto"/"legacy" est une erreur de config signalée au
+    démarrage, pas un mode passé au SDK ; un inprocess n'a pas de fil, la clé
+    n'y a pas de sens."""
+    with pytest.raises(ValueError, match=match):
+        build_upstreams({"port": 8765, "mcpServers": {"x": entry}})
+
+
 def test_build_upstreams_unknown_type():
     cfg = {
         "port": 8765,
@@ -672,6 +712,44 @@ async def test_a_schemaless_tool_does_not_take_the_whole_listing_down():
     by_name = {t.name: t for t in result.tools}
     assert set(by_name) == {"sloppy__vague", "sound__echo"}
     assert by_name["sloppy__vague"].input_schema["type"] == "object"
+
+
+@pytest.mark.asyncio
+async def test_param_header_annotations_are_not_republished():
+    """`x-mcp-header` demande au client de recopier l'argument dans un en-tête
+    `Mcp-Param-*`. Republiée, c'est le serveur DU PROXY qui l'exigerait de son
+    client (400 `-32020` en ère moderne, mesuré), quelle que soit l'ère de
+    l'upstream. Retirée à toute profondeur — mais seulement là où c'est une
+    annotation : une propriété qui s'appelle `x-mcp-header`, ou une donnée
+    d'`enum` qui contient la clé, restent intactes."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "region": {"type": "string", "x-mcp-header": "Region"},
+            "nested": {
+                "type": "object",
+                "properties": {"zone": {"type": "string", "x-mcp-header": "Zone"}},
+            },
+            "x-mcp-header": {"type": "object", "enum": [{"x-mcp-header": "data"}]},
+        },
+        "required": ["region"],
+    }
+    upstream = MagicMock()
+    upstream.list_tools = AsyncMock(
+        return_value=[types.Tool(name="regional", description="", input_schema=schema)]
+    )
+    server = build_proxy_server({"demo": upstream}, {})
+
+    published = (await list_tools(server)).tools[0].input_schema
+    assert published == {
+        "type": "object",
+        "properties": {
+            "region": {"type": "string"},
+            "nested": {"type": "object", "properties": {"zone": {"type": "string"}}},
+            "x-mcp-header": {"type": "object", "enum": [{"x-mcp-header": "data"}]},
+        },
+        "required": ["region"],
+    }
 
 
 @pytest.mark.asyncio

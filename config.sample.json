@@ -54,9 +54,10 @@
       "disabled": true,
       "type": "http",
       "url": "http://127.0.0.1:8798/mcp",
-      "_comment": "Serveur MCP DISTANT en streamable-http. 'url' pointe l'endpoint /mcp du serveur. 'headers' (optionnel) porte des en-tetes statiques, pour un serveur tiers qui exige une clef d'API sans OAuth. 'timeout' (optionnel, defaut 30 s) borne le handshake initialize : un serveur qui accepte la connexion puis ne repond jamais bloquerait sinon le demarrage du proxy.",
+      "_comment": "Serveur MCP DISTANT en streamable-http. 'url' pointe l'endpoint /mcp du serveur. 'headers' (optionnel) porte des en-tetes statiques, pour un serveur tiers qui exige une clef d'API sans OAuth. 'timeout' (optionnel, defaut 30 s) borne la negociation MCP : un serveur qui accepte la connexion puis ne repond jamais bloquerait sinon le demarrage du proxy. 'protocol' (optionnel, stdio et http) : 'auto' par defaut, le proxy sonde la revision 2026-07-28 et se replie sur initialize ; 'legacy' impose initialize d'emblee, recours pour un serveur moderne que la validation de la revision 2026-07-28 ferait echouer.",
       "headers": {},
-      "timeout": 30
+      "timeout": 30,
+      "protocol": "auto"
     },
     "_example_http_oauth": {
       "disabled": true,

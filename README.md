@@ -156,6 +156,10 @@ Le proxy accepte en plus :
 L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'est plus celle qu'on écrit — dans ce fichier, un souligné en tête signale ailleurs (`_comment`) une clé ignorée, ce que cet interrupteur n'est justement pas. Le proxy le signale au démarrage, une ligne par bloc concerné, pour que la migration se voie plutôt que de traîner indéfiniment ; une config déjà en `disabled` ne dit rien.
 `env` sur une entrée inprocess → variables d'environnement injectées avant l'import.
 `"type": "http"` + `url` → serveur MCP **distant** en streamable-http (cf. `docs/proxy.md`).
+Avec un serveur stdio ou http, le proxy négocie la révision MCP 2026-07-28 et se replie
+sur `initialize` si le serveur ne la parle pas ; `"protocol": "legacy"` sur l'entrée
+impose `initialize` d'emblée (défaut : `"auto"`). Les skills d'un tel serveur sont
+relayées s'il négocie 2026-07-28 et déclare l'extension Skills ; `"legacy"` les coupe.
 Un bloc `auth` sur une entrée `http` → le proxy devient **client OAuth** de ce
 serveur et détient les jetons à la place de MIAOU (parcours à dérouler une fois,
 via `/authorize/<nom>` ; jetons dans un fichier séparé, jamais dans `config.json`).
@@ -374,8 +378,8 @@ Tous les tests sont unitaires et mockent les appels réseau — aucune clef API 
 
 ### Appel réel d'un outil (`tests/live_call.py`)
 
-Les tests unitaires ne touchent pas le transport HTTP. Pour appeler un outil sur un
-serveur **réellement lancé**, en parlant le vrai streamable-http comme MIAOU
+Les tests unitaires ne parlent à aucun serveur réellement lancé. Pour appeler un outil
+sur un serveur **réellement lancé**, en parlant le vrai streamable-http comme MIAOU
 (`initialize`, `notifications/initialized`, `tools/call`) :
 
 ```bash
@@ -441,6 +445,7 @@ miaou-mcp-servers/
 │   ├── test_proxy.py
 │   ├── test_skills.py               # extension Skills des serveurs
 │   ├── test_proxy_skills.py         # skills servies par le proxy
+│   ├── test_proxy_remote_skills.py  # skills relayées d'upstreams stdio et http
 │   ├── skills_fixture_server.py     # upstream de test qui sert des skills (non collecté)
 │   ├── test_proxy_auth.py           # auth OAuth entrante
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante

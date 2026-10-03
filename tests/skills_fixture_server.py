@@ -4,6 +4,10 @@
 `build(config)` : `config["skills_dir"]` désigne le dossier de skills, et
 `config["requires_skill"]` (facultatif) est passé tel quel à `finalize_tools`.
 Sans `requires_skill`, ses skills sont FACULTATIVES : aucun outil ne les exige.
+
+Lancé en script, il sert les mêmes skills sur stdio : c'est l'upstream stdio
+moderne qui déclare l'extension (et, monté en app streamable-http par
+`build()`, l'upstream http).
 """
 
 import sys
@@ -40,3 +44,11 @@ class SkillsFixtureServer(MiaouMCPBase):
 
 def build(config: dict | None = None):
     return SkillsFixtureServer(config).mcp
+
+
+if __name__ == "__main__":
+    # Le même serveur sur stdio, lancé en subprocess par `StdioUpstream` :
+    # `python skills_fixture_server.py <skills_dir> [<requires_skill>]`.
+    build(
+        {"skills_dir": sys.argv[1], **({"requires_skill": sys.argv[2]} if len(sys.argv) > 2 else {})}
+    ).run("stdio")

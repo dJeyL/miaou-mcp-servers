@@ -55,9 +55,10 @@ la spec), importé paresseusement : seul un serveur qui sert des skills déclare
 dans son bloc PEP 723.
 
 **Un serveur ne cite jamais l'URI de sa skill dans son texte libre** (instructions,
-docstrings) : derrière le proxy elle reçoit le préfixe d'upstream. Il la nomme, en
-précisant qu'il s'agit d'une skill MCP lue par son URI ; le proxy génère la ligne qui
-donne l'URI (cf. `docs/proxy.md`).
+docstrings) : derrière le proxy elle reçoit le préfixe d'upstream. Le proxy la réécrit
+dans des `instructions`, mais pas dans une docstring, et il génère déjà la ligne qui la
+donne : l'écrire en plus la doublerait au mieux, la fausserait au pire. Le serveur la
+nomme, en précisant qu'il s'agit d'une skill MCP lue par son URI (cf. `docs/proxy.md`).
 
 
 ## `servers/mcp_bench.py` — banc d'essai général (port 8766)

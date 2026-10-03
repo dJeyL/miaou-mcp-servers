@@ -162,17 +162,29 @@ async def test_no_skill_served_publishes_nothing_new():
     assert info.value.error.code == types.METHOD_NOT_FOUND
 
 
-async def test_stdio_and_http_upstreams_serve_no_skill_and_are_logged(capsys):
-    upstreams = {
-        "remote": HttpUpstream("http://127.0.0.1:9/mcp"),
-        "sub": StdioUpstream("true", []),
-    }
+async def test_unrelayed_skills_are_logged_only_when_informative(capsys):
+    """Le journal ne signale des skills non relayées que pour un upstream forcé
+    en legacy par la config (jamais interrogé en moderne, on ne peut pas savoir
+    s'il en sert). Rien pour un moderne qui déclare l'extension (relayé), ni
+    pour un moderne sans elle, ni pour un legacy constaté par la sonde, dont
+    l'ère est déjà au journal et qui ne peut pas servir l'extension."""
+    serving = HttpUpstream("http://127.0.0.1:9/mcp")
+    serving.protocol_version = "2026-07-28"
+    serving.capabilities = types.ServerCapabilities(extensions={SKILLS_EXTENSION_ID: {}})
+    plain = HttpUpstream("http://127.0.0.1:9/mcp")
+    plain.protocol_version = "2026-07-28"
+    plain.capabilities = types.ServerCapabilities(extensions={"com.example/other": {}})
+    probed_legacy = StdioUpstream("true", [])
+    probed_legacy.protocol_version = "2025-11-25"
+    probed_legacy.capabilities = types.ServerCapabilities()
+    forced = StdioUpstream("true", [], protocol="legacy")
+    upstreams = {"serving": serving, "plain": plain, "probed": probed_legacy, "forced": forced}
     server = build_proxy_server(upstreams, {})
     assert await install_skills(server, upstreams) is False
-    err = capsys.readouterr().err
-    assert "remote" in err and "skills non relayées (upstream http" in err
-    assert "sub" in err and "skills non relayées (upstream stdio" in err
-    assert await upstreams["sub"].list_skills() == []
+    lines = [line for line in capsys.readouterr().err.splitlines() if "skills" in line]
+    assert len(lines) == 1
+    assert "forced" in lines[0] and "forcé en ère legacy par la config" in lines[0]
+    assert await forced.list_skills() == []
 
 
 # --- Une skill facultative suffit --------------------------------------------------
@@ -523,7 +535,9 @@ async def test_requires_skill_of_an_unserved_skill_is_logged_and_relayed(tmp_pat
     skills.sources = [s for s in skills.sources if s.name != "rules"]
     blocks = await build_skills_blocks(upstreams)
     assert "rules" not in blocks["fx"]
-    assert "l'outil 'ping' exige skill://rules/SKILL.md, skill non servie par 'fx'" in capsys.readouterr().err
+    assert "fx           skill exigée mais non servie par 'fx' : skill://rules/SKILL.md (1 outil)" in (
+        capsys.readouterr().err
+    )
     tools = {t.name: t for t in (await list_tools(server)).tools}
     assert tools["fx__ping"].meta == {REQUIRES_SKILL_META_KEY: "skill://fx/rules/SKILL.md"}
 
@@ -659,3 +673,52 @@ async def test_fallback_rejects_malformed_arguments(optional_skills_dir, argumen
     result = await call_tool(server, "read_skill", arguments)
     assert result.is_error
     assert message in result.content[0].text
+
+
+# --- Isolation des pannes d'upstream ------------------------------------------------
+
+
+class _BrokenUpstream(InProcessUpstream):
+    """Upstream dont le listage échoue, comme un upstream distant mort."""
+
+    def __init__(self, *, skills: bool = True, tools: bool = True) -> None:
+        super().__init__(FIXTURE, config={})
+        self._skills_fail, self._tools_fail = skills, tools
+
+    async def list_skills(self):
+        if self._skills_fail:
+            raise MCPError(-32000, "Connection closed")
+        return []
+
+    async def list_tools(self):
+        if self._tools_fail:
+            raise MCPError(-32000, "Connection closed")
+        return await super().list_tools()
+
+
+async def test_a_failing_upstream_is_omitted_from_skills_listings(optional_skills_dir, capsys):
+    """`skills/list` et `resources/list` répondent pour les upstreams sains ;
+    celui dont le listage échoue est omis et signalé."""
+    upstreams = {
+        "broken": _BrokenUpstream(),
+        "fx": InProcessUpstream(FIXTURE, config={"skills_dir": str(optional_skills_dir)}),
+    }
+    server, served = await _proxy(upstreams)
+    assert served is True
+    listed = await _request(server, "skills/list", types.PaginatedRequestParams())
+    assert [e["uri"] for e in listed["skills"]] == ["skill://fx/tips/SKILL.md"]
+    resources = await _request(server, "resources/list", types.PaginatedRequestParams())
+    assert len(resources["resources"]) == 2
+    assert "Skills de 'broken' non listées (MCPError: Connection closed)" in capsys.readouterr().err
+
+
+async def test_a_failing_upstream_loses_only_its_own_skills_block(optional_skills_dir, capsys):
+    upstreams = {
+        "broken": _BrokenUpstream(skills=False),
+        "fx": InProcessUpstream(FIXTURE, config={"skills_dir": str(optional_skills_dir)}),
+    }
+    for upstream in upstreams.values():
+        await upstream.start()
+    blocks = await build_skills_blocks(upstreams)
+    assert list(blocks) == ["fx"]
+    assert "Bloc des skills de 'broken' non généré" in capsys.readouterr().err

@@ -232,6 +232,42 @@ def _object_schema(schema: Any) -> dict[str, Any]:
     return {**schema, "type": "object"}
 
 
+# Mots-clés de JSON Schema dont la valeur est une table nom → sous-schéma : les
+# NOMS y sont des données (une propriété peut s'appeler comme un mot-clé), seuls
+# les sous-schémas se parcourent. Et ceux dont la valeur est une donnée, jamais
+# parcourue.
+_SCHEMA_MAP_KEYWORDS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+_SCHEMA_DATA_KEYWORDS = ("enum", "const", "default", "examples")
+
+
+def _strip_param_headers(schema: Any) -> Any:
+    """Schéma d'entrée sans annotation `x-mcp-header`, à toute profondeur.
+
+    L'annotation demande au CLIENT de recopier un argument dans un en-tête
+    `Mcp-Param-*`, et le serveur moderne qui la publie refuse (`-32020`) un
+    appel qui ne le fait pas. Republiée par le proxy, c'est le serveur DU PROXY
+    qui l'exige de son client, quelle que soit l'ère de l'upstream — alors que
+    l'en-tête vers un upstream moderne est émis par le SDK du proxy lui-même,
+    depuis sa propre liste. Un upstream legacy n'en a pas l'usage."""
+    from mcp.shared.inbound import X_MCP_HEADER_KEY
+
+    if isinstance(schema, list):
+        return [_strip_param_headers(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    stripped: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == X_MCP_HEADER_KEY:
+            continue
+        if key in _SCHEMA_DATA_KEYWORDS:
+            stripped[key] = value
+        elif key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+            stripped[key] = {name: _strip_param_headers(sub) for name, sub in value.items()}
+        else:
+            stripped[key] = _strip_param_headers(value)
+    return stripped
+
+
 def relay_tool_meta(upstream_name: str, meta: dict[str, Any] | None) -> dict[str, Any] | None:
     """`_meta` d'un outil d'upstream tel que le proxy le republie.
 
@@ -254,6 +290,21 @@ def relay_tool_meta(upstream_name: str, meta: dict[str, Any] | None) -> dict[str
         except (TypeError, ValueError, AttributeError):
             del relayed[REQUIRES_SKILL_META_KEY]
     return relayed or None
+
+
+def published_tools(upstream: Upstream, tools: list[types.Tool]) -> list[types.Tool]:
+    """Les outils d'un upstream que le proxy republie : tous, sauf l'outil de
+    repli de skills d'un upstream dont le proxy relaie les skills.
+
+    La marque `miaou/skillsFallback` dit « un client qui lit les skills
+    lui-même me masque » : pour ses upstreams, ce client, c'est le proxy. Son
+    propre `read_skill` lit les mêmes fichiers sous les URI qu'il publie, là
+    que celui de l'upstream attendrait les URI de l'upstream."""
+    from .skills import SKILLS_FALLBACK_META_KEY
+
+    if not getattr(upstream, "serves_skills", False):
+        return tools
+    return [t for t in tools if (t.meta or {}).get(SKILLS_FALLBACK_META_KEY) is not True]
 
 
 STATUS_TOOL_NAME = "status"
@@ -361,12 +412,50 @@ def upstream_is_live(upstream: Upstream, authorizer: Any = None) -> bool:
     return True
 
 
+def _describe_failure(exc: BaseException) -> str:
+    """Une panne d'upstream en une ligne de journal : type et message de la
+    cause réelle, déballée du task group qui l'enveloppe peut-être."""
+    cause = _unwrap_exception_group(exc)
+    return f"{type(cause).__name__}: {cause}"
+
+
+def _unreachable_message(upstream_name: str, upstream: Upstream) -> str:
+    """Texte rendu au modèle pour l'appel d'un outil dont l'upstream, sans
+    authorizer, n'a plus de session. Le proxy ne se reconnecte pas tout seul :
+    le dire évite au modèle de réessayer en boucle."""
+    failure = getattr(upstream, "_failure", None)
+    cause = f" ({_describe_failure(failure)})" if failure is not None else ""
+    return (
+        f"Le serveur '{upstream_name}' est injoignable : sa session s'est "
+        f"fermée{cause}. Le proxy ne s'y reconnecte qu'à son redémarrage."
+    )
+
+
 _INSTRUCTIONS_PREAMBLE = (
     "Ce serveur agrège plusieurs serveurs MCP. Les outils sont préfixés par le "
     "nom de leur serveur d'origine (`<serveur>__<outil>`). Les sections "
     "ci-dessous portent les consignes propres à chaque serveur d'origine, "
     "titrées par ce même nom."
 )
+
+
+def prefix_free_text_skill_uris(prefix: str, upstream: Upstream, text: str) -> str:
+    """Texte libre d'un upstream, ses URI `skill://` passées dans l'espace de
+    noms du proxy — seulement si ses skills sont relayées.
+
+    La spec autorise un serveur à citer l'URI d'une skill dans ses
+    `instructions` ; republiée telle quelle, elle désignerait une skill du
+    proxy qui n'existe pas (premier segment pris pour un nom d'upstream). Un
+    proxy pris comme upstream en est le cas courant : son bloc généré cite ses
+    propres URI. Insertion du préfixe au début de chaque URI, sans analyse de
+    bornes : la ponctuation qui suit reste juste. Jamais pour un upstream dont
+    les skills ne sont pas relayées (legacy, constaté ou forcé) : ce que le
+    proxy publie pour lui ne bouge pas."""
+    from .skills import SKILL_SCHEME
+
+    if not getattr(upstream, "serves_skills", False):
+        return text
+    return text.replace(SKILL_SCHEME, f"{SKILL_SCHEME}{prefix}/")
 
 
 def aggregate_instructions(
@@ -394,8 +483,15 @@ def aggregate_instructions(
     Publie la section de TOUT upstream qui déclare des instructions, y compris
     non autorisé : c'est de la documentation, pas une capability. Une section
     décrivant un outil temporairement absent coûte moins qu'une section
-    manquant définitivement, puisque `initialize` ne se rejoue pas après une
-    autorisation obtenue en cours de route.
+    manquante, puisqu'un client déjà connecté ne refait pas son handshake après
+    une autorisation obtenue en cours de route. Le lifespan rappelle cette
+    fonction après chaque `authorize()` réussi (`app.publish_surface`) : un
+    upstream non autorisé au démarrage gagne sa section à la connexion
+    suivante.
+
+    Le texte libre d'un upstream dont les skills sont relayées voit ses URI
+    `skill://` préfixées (`prefix_free_text_skill_uris`), comme celles de ses
+    entrées.
 
     `skills_blocks` (cf. `skills.build_skills_blocks`) : bloc généré qui
     TERMINE la section de l'upstream, après son texte libre ; un upstream qui
@@ -411,7 +507,7 @@ def aggregate_instructions(
     for prefix, upstream in upstreams.items():
         parts = []
         if upstream.instructions and upstream.instructions.strip():
-            parts.append(upstream.instructions.strip())
+            parts.append(prefix_free_text_skill_uris(prefix, upstream, upstream.instructions.strip()))
         if skills_blocks.get(prefix):
             parts.append(skills_blocks[prefix])
         if parts:
@@ -453,17 +549,32 @@ def build_proxy_server(
                     {"name": prefix, "authorize_path": authorize_path(prefix)}
                 )
             if live:
-                upstream_tools = await upstream.list_tools()
+                # Isolé : un upstream qui meurt en cours de vie (subprocess
+                # stdio tué, serveur distant arrêté) fait échouer SON listage,
+                # pas celui des autres. Sans cette garde, un seul stdio mort
+                # rendait tout `tools/list` du proxy en erreur, à chaque appel :
+                # rien ne le retire de la table, et `upstream_is_live` ne voit
+                # pas la mort d'un subprocess.
+                try:
+                    upstream_tools = await upstream.list_tools()
+                except Exception as e:
+                    _log(f"Outils de '{prefix}' non listés ({_describe_failure(e)}).")
+                    continue
                 if catalog is not None:
                     catalog.remember(prefix, upstream_tools)
                 stale_since = None
-            elif catalog is not None:
+            elif catalog is not None and prefix in authorizers:
                 # Non autorisé : tools/list répondrait 401 avant de rien dire.
-                # On ressert ce qu'on sait, marqué comme tel.
+                # On ressert ce qu'on sait, marqué comme tel. Réservé à un
+                # upstream qui A un parcours d'autorisation : un upstream sans
+                # authorizer et sans session est injoignable, et ses outils
+                # resservis porteraient une mention « non autorisé » fausse.
                 upstream_tools, stale_since = catalog.recall(prefix)
             else:
                 upstream_tools, stale_since = [], None
 
+            if live:
+                upstream_tools = published_tools(upstream, upstream_tools)
             for tool in upstream_tools:
                 prefixed = f"{prefix}__{tool.name}"
                 tool_map[prefixed] = (prefix, tool.name)
@@ -475,7 +586,7 @@ def build_proxy_server(
                     types.Tool(
                         name=prefixed,
                         description=description,
-                        input_schema=_object_schema(tool.input_schema),
+                        input_schema=_object_schema(_strip_param_headers(tool.input_schema)),
                         **({"_meta": meta} if meta else {}),
                     )
                 )
@@ -544,6 +655,11 @@ def build_proxy_server(
 
         upstream = upstreams[upstream_name]
         if not upstream_is_live(upstream, authorizers.get(upstream_name)):
+            if upstream_name not in authorizers:
+                # Sans parcours d'autorisation, un upstream non vivant est
+                # injoignable : le refuser en AUTHORIZATION_REQUIRED enverrait
+                # l'utilisateur autoriser un serveur qui n'a pas d'OAuth.
+                return _error_result(_unreachable_message(upstream_name, upstream))
             # Refus AVANT l'appel : l'upstream n'a rien à dire tant qu'il n'est
             # pas autorisé.
             raise UpstreamNotAuthorized(upstream_name)

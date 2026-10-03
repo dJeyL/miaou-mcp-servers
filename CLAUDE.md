@@ -21,7 +21,7 @@ miaou-mcp-servers/
 │   ├── __main__.py       # `python -m mcp_proxy`
 │   ├── contract.py       # constantes/exceptions partagées (casse le cycle server↔auth_out)
 │   ├── logging.py        # `_log` format uvicorn
-│   ├── upstream.py       # InProcess / Stdio / Http (skills : inprocess seulement)
+│   ├── upstream.py       # InProcess / Stdio / Http (ère négociée par `Client` ; skills : inprocess seulement)
 │   ├── netproxy.py       # override --proxy / --noproxy
 │   ├── config.py         # load_config, build_upstreams
 │   ├── server.py         # build_proxy_server, catalogue, instructions, relais du `_meta` d'outil
@@ -50,7 +50,10 @@ miaou-mcp-servers/
 │   ├── live_auth_probe.py  # ce qu'un upstream répond SANS jeton (non collecté)
 │   ├── live_discovery_probe.py  # ce que la découverte OAuth du SDK 2.x conclurait (non collecté)
 │   ├── proxy_client.py   # harnais : parler au Server du proxy en JSON-RPC legacy (non collecté)
-│   ├── skills_fixture_server.py  # upstream inprocess de test qui sert des skills, build(config) (non collecté)
+│   ├── skills_fixture_server.py  # upstream de test qui sert des skills : build(config), ou stdio en script (non collecté)
+│   ├── era_fixture_server.py  # upstream 2.x de test (stdio en subprocess, app http via build()) (non collecté)
+│   ├── fabricated_skills_server.py  # upstream 2.x de test aux entrées de skills fabriquées (non collecté)
+│   ├── legacy_stdio_fixture.py  # faux upstream stdio qui ne parle que `initialize` (non collecté)
 │   ├── test_base.py
 │   ├── test_bench.py
 │   ├── test_weather.py
@@ -63,6 +66,8 @@ miaou-mcp-servers/
 │   ├── test_proxy.py
 │   ├── test_skills.py    # extension Skills de mcp_base (vecteurs d'empreinte de la spec)
 │   ├── test_proxy_skills.py  # skills servies par le proxy : URI, `_meta`, bloc, repli
+│   ├── test_proxy_era.py  # ère négociée avec les upstreams stdio/http (vrais handshakes)
+│   ├── test_proxy_remote_skills.py  # skills relayées d'upstreams stdio/http (vrais handshakes)
 │   ├── test_proxy_auth.py  # auth OAuth entrante (lot AB-1)
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante (lot AB-2)
 │   └── test_dev_auth_server.py  # serveur d'autorisation de développement (lot AB-1.3)
@@ -346,20 +351,47 @@ lots — piège déjà payé côté MIAOU.
   trois chemins d'application, le format de `config.json`, le pattern
   `build(config)` pour plusieurs instances d'un même module, ce que `call_tool`
   relaie d'un upstream stdio/http (`relay_call_result` : `content`, `isError`,
-  `_meta`, pas `structuredContent`), ce qu'il rend en erreur depuis le SDK 2.x
-  (`isError` + `str(e)` comme en 1.x, sauf les deux contrats en `MCPError` :
-  AUTHORIZATION_REQUIRED, et une `MCPError` d'upstream INPROCESS), les schémas
+  `_meta` sans le `serverInfo` de l'upstream, pas `structuredContent`), ce qu'il rend en erreur depuis le SDK 2.x
+  (`isError` + `str(e)` comme en 1.x — la `MCPError` d'un upstream http déballée
+  du task group de `call_tool` —, sauf les deux contrats en `MCPError` :
+  AUTHORIZATION_REQUIRED — réservé à un upstream qui a un authorizer, un upstream
+  sans OAuth et sans session étant « injoignable » — et une `MCPError` d'upstream
+  INPROCESS), la panne d'un upstream isolée dans `tools/list` (un stdio mort ne fait
+  plus tomber les autres), les schémas
   d'entrée complétés par `_object_schema` (un seul outil sans `type: object`
-  ferait rejeter tout `tools/list`), le gestionnaire de sessions
+  ferait rejeter tout `tools/list`) et purgés de `x-mcp-header`
+  (`_strip_param_headers`, sinon le proxy exige `Mcp-Param-*` de son client), le gestionnaire de sessions
   (`MAX_REQUEST_BODY_BYTES`, `SESSION_IDLE_TIMEOUT_S`), le client httpx2 de
   `HttpUpstream._build_http_client` sur lequel portent les tests `trust_env`, et
   `aggregate_instructions` (consigne de portée serveur : les trois captures par type
   d'upstream, la section titrée par le préfixe d'outil, l'écriture différée après
   `start()`, le préambule non préfixé que le client re-préfixant doit réécrire).
+  Ère des upstreams stdio/http : `Client(<transport>, mode, cache=None)` du SDK
+  (sonde `server/discover`, repli sur `initialize` y compris sur délai de 10 s et
+  sur 4xx nu, panne jamais prise pour un verdict d'ère), borne inchangée, session
+  legacy identique à une requête près, `protocol_version`/`capabilities` sur
+  `Upstream`, `tools/list` amorcé au démarrage d'un moderne (`Mcp-Param-*` ne
+  part que pour un outil listé sur la session), aucune capacité d'upstream
+  republiée, clé `protocol` (`auto`/`legacy`) d'une entrée stdio/http, ère au
+  journal de démarrage, ligne « skills non relayées » réservée au legacy forcé par
+  la config.
   Extension Skills agrégée : `prefix_skill_uri`/`resolve_skill_uri`,
   `install_skills` au lifespan et seulement si une skill est servie (capacités
-  calculées à chaque `server/discover`), stdio/http sans skills (abordés en
-  legacy), `relay_tool_meta` et `miaou/requiresSkill` réécrit, `_meta` dans
+  calculées à chaque `server/discover`), stdio/http relayés sous la condition
+  unique `serves_skills` (ère moderne ET extension déclarée ; un legacy ne reçoit
+  aucune requête), `send_request` brut et `read_resource` (`Mcp-Name` par le SDK),
+  requêtes bornées, garde unique `_on_session` de `HttpUpstream`, erreurs relayées
+  (`_remote_failure`, jamais de code 0), upstream en panne omis des listages,
+  extension publiée dès qu'un upstream distant la DÉCLARE (listage vide compris),
+  l'upstream distant seul juge de `resources/read` (pas de liste blanche), entrées
+  non préfixables écartées (`_unprefixable`) et le reste relayé tel quel, bloc
+  dégradé (description bornée à 1 024), indices de cache les plus restrictifs,
+  texte libre d'un upstream relayé aux URI préfixées, repli `miaou/skillsFallback`
+  d'un upstream relayé non republié (`published_tools`), compte des skills sur la
+  ligne de démarrage et une ligne par upstream pour une skill exigée non servie,
+  bloc statique qui ment pendant la panne d'un upstream, surface (instructions et
+  skills) recalculée après `authorize()` (`publish_surface`),
+  `relay_tool_meta` et `miaou/requiresSkill` réécrit, `_meta` dans
   `ToolCatalogCache`, bloc généré des instructions (forme, en-tête « pas des skills
   locales » et la mesure qui l'a imposé), repli `read_skill` et sa marque
   `miaou/skillsFallback`.
@@ -367,7 +399,8 @@ lots — piège déjà payé côté MIAOU.
   (AB-1 : le proxy est Resource Server, `JwtTokenVerifier`, validation d'audience
   RFC 8707 non désactivable, `dev_auth_server.py`). Sortante (AB-2 : le proxy est
   client OAuth d'un tiers, `UpstreamTokenStorage` et ses gardes d'écriture, parcours
-  `/authorize/{name}` + `/callback`, scopes et le 403 qui n'est pas une panne, le
+  `/authorize/{name}` + `/callback` et le recalcul de la surface publiée qui suit
+  (`on_authorized`), scopes et le 403 qui n'est pas une panne, le
   troisième état « connu mais pas autorisé » et les DEUX conditions de
   `upstream_is_live` — « transport ouvert » ne vaut pas « autorisé » —,
   `has_usable_token` qui l'amorce au boot sans requête, contrat
@@ -378,7 +411,11 @@ lots — piège déjà payé côté MIAOU.
   couvrir l'après-boot (`mcp.client.streamable_http`, et `httpx2` depuis le
   SDK 2.x ; nommer un logger muet est silencieux), le filtre qui écarte du
   journal du SDK le refus VOLONTAIRE de `_on_redirect` (`_ExpectedRefusalFilter`),
-  `HttpUpstream` et la contrainte anyio des cancel scopes). Durcissements du SDK
+  `HttpUpstream` et la contrainte anyio des cancel scopes (garde `_on_session`, et
+  sa limite : une `AuthorizationRequired` en cours de session rend « Connection
+  closed » à l'appel en vol, le contrat n'arrivant qu'au suivant), la sonde d'ère qui
+  reçoit le premier 401 sans rien changer — `AuthorizationRequired` la traverse —
+  et `_provoke_refusal`/`refresh_if_due` restés en JSON-RPC legacy). Durcissements du SDK
   2.x, éprouvés contre `dev_auth_server.py` seulement : `iss` (RFC 9207) relayé
   par `/callback` et comparé à l'issuer effectif — d'où `auth.issuer` à déclarer
   sur un realm —, issuer d'AS comparé à l'octet près (et la PRM construite depuis
@@ -399,9 +436,13 @@ lots — piège déjà payé côté MIAOU.
   résultat, le champ `instructions` de l'`InitializeResult` que MIAOU lit et
   injecte dans le system prompt (et le préambule qu'il re-préfixe, étant seul à
   connaître son slug), le `_meta` d'un résultat `tools/call` adressé au client
-  (`miaou/web`, premier usage), les skills servies par le proxy (capacités par ère,
-  URI préfixées, `skills/*`, `resources/read` et `Mcp-Name`, `miaou/requiresSkill`,
-  bloc des instructions, repli `read_skill` à masquer par sa marque, et le réflexe
+  (`miaou/web`, premier usage ; jamais le `serverInfo` d'un upstream),
+  `x-mcp-header` absent des schémas du proxy (aucun `Mcp-Param-*` à poser), les skills servies par le proxy (capacités par ère,
+  et dès qu'un upstream stdio/http moderne déclare l'extension, URI préfixées,
+  `skills/*` aux indices de cache les plus restrictifs et aux entrées tierces
+  relayées telles quelles, `resources/read` et `Mcp-Name`, `miaou/requiresSkill`,
+  bloc des instructions, repli `read_skill` à masquer par sa marque, préfixe double
+  d'un proxy chaîné et la collision d'approbations qu'il rend possible, et le réflexe
   `miaou__skills__read` mesuré avec MIAOU actuel), et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
   `ref`+`content_b64`, `session_id`, idempotence de la matérialisation, REF_UNKNOWN
   levée en `MCPError` par l'outil et donc rejouable en autonome comme derrière le
@@ -418,7 +459,9 @@ lots — piège déjà payé côté MIAOU.
   chemin JSON-RPC de MIAOU, jamais le mode par défaut), les patchs qui visent
   `httpx2` et non plus `httpx`, l'isolation filesystem par `tmp_path`, les deux pièges de fixture
   du mock de réponse de `test_web.py` (queue de remplissage compressible, garde
-  verte des deux côtés), l'opener qui route par URL de `test_web_pagemeta.py`
+  verte des deux côtés), les vrais handshakes de `test_proxy_era.py` (fixtures
+  stdio des deux ères, app http sur `httpx2.ASGITransport`, middleware qui imite
+  un serveur 1.x, identité legacy comparée au mode `legacy`), l'opener qui route par URL de `test_web_pagemeta.py`
   (favicon, sonde unique par origine) et le cache de favicons vidé en fixture,
   et les bancs manuels
   non collectés : `tests/live_call.py`, qui parle le vrai transport

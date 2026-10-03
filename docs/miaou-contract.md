@@ -53,6 +53,22 @@ Précédent neuf des deux côtés : jusque-là MIAOU ne lisait que le `_meta` de
 proxy relaie ce `_meta` quel que soit le type d'upstream (cf. `docs/proxy.md`) ; vérifié sur
 le vrai transport streamable-http, en inprocess comme derrière un upstream http.
 
+Une clé n'en est jamais relayée : `io.modelcontextprotocol/serverInfo`, la signature dont
+un upstream moderne (révision 2026-07-28) marque ses résultats. En ère moderne, le
+`serverInfo` qu'un résultat du proxy porte est donc toujours celui du proxy
+(`miaou-proxy`), posé par son propre SDK ; relayée, celle de l'upstream l'aurait
+remplacé, le SDK ne posant la sienne que si la clé est absente. MIAOU l'ignore
+aujourd'hui.
+
+### `x-mcp-header` absent des schémas publiés par le proxy
+
+Un upstream moderne peut annoter un paramètre `x-mcp-header`, qui demande au client de
+le recopier dans un en-tête `Mcp-Param-*` ; un serveur 2.x refuse en 400 `-32020` un
+`tools/call` moderne qui ne le fait pas. Le proxy retire l'annotation de tout ce qu'il
+publie : c'est son propre SDK qui émet l'en-tête vers l'upstream. MIAOU n'a donc aucun
+`Mcp-Param-*` à poser vers le proxy. Un serveur annotant `x-mcp-header` configuré EN
+DIRECT dans MIAOU le reste, lui, exigeant.
+
 ### `instructions` de l'`InitializeResult`
 
 Le proxy publie une consigne de portée serveur dans le champ `instructions` de
@@ -84,29 +100,50 @@ obligatoire pour tous ses outils. Ce que le proxy publie (détail de mise en œu
 
 1. **Capacités, ère 2026-07-28.** `extensions["io.modelcontextprotocol/skills"] = {}`
    (pas de `directoryRead`) et `resources`, dans `server/discover`, dès qu'au moins un
-   upstream sert une skill. Rien sinon. En legacy, `initialize` ne publie jamais
+   upstream inprocess sert une skill, ou qu'un upstream stdio/http négocié en moderne
+   DÉCLARE l'extension — même avec un catalogue vide. Rien sinon. En legacy, `initialize` ne publie jamais
    `extensions` ; il annonce en revanche `resources` quand une skill est servie.
 2. **URI préfixées du nom d'upstream** : `skill://bench/SKILL.md` de l'upstream `bench`
    devient `skill://bench/bench/SKILL.md`. Octets inchangés, empreintes valides ; le
    dernier segment reste le `name`.
 3. **`skills/list`, `skills/get`** : entrées de tous les upstreams vivants, URI
-   réécrites dans `uri` ET chaque `resources[].uri`, `resultType: "complete"`,
-   `ttlMs: 300000`, `cacheScope: "public"`, sans pagination. URI non servie (ou
-   d'annexe) sur `skills/get` → `-32602`.
+   réécrites dans `uri` ET chaque `resources[].uri`, `resultType: "complete"`, sans
+   pagination. `ttlMs: 300000` et `cacheScope: "public"` au plus large ; plus court et
+   `private` si un upstream relayé le dit. URI non servie (ou d'annexe) sur `skills/get`
+   → `-32602`. Une entrée d'upstream tiers est relayée telle quelle (seules celles dont
+   les URI ne sont pas `skill://` sont écartées) : elle peut être invalide, à vérifier
+   comme toute entrée (nom, dernier segment, `description`, empreintes), et `resources`
+   peut valoir `"dynamic"`. Un upstream en panne est omis, les autres répondent.
 4. **`resources/read`** d'une URI `skill://<upstream>/…` : contenu de l'upstream relayé
    tel quel (texte si UTF-8 valide, blob sinon), sous l'URI du client ; fichier non
-   déclaré par une entrée → `-32602`. Sur le fil moderne, l'en-tête `Mcp-Name` doit
+   servi → `-32602`. Pour un upstream inprocess, « servi » veut dire déclaré par une
+   entrée ; pour un upstream stdio/http, c'est lui qui juge — une skill servie mais non
+   listée se lit donc par son URI. Panne de l'upstream : `-32603` lisible, jamais une
+   erreur de code 0. Sur le fil moderne, l'en-tête `Mcp-Name` doit
    valoir `params.uri` (400 sinon) — `MCP_NAME_BEARING_METHODS` de MIAOU le porte déjà.
 5. **`tools/list`** : un outil dont l'upstream déclare `_meta["miaou/requiresSkill"]` le
    garde, URI réécrite. La valeur est l'URI du `SKILL.md`, relative au serveur qui liste
    l'outil.
 6. **`instructions`** : la section d'un upstream qui sert des skills se termine par un
    bloc généré, une ligne par skill servie, obligatoire ou facultative : `name`, URI
-   préfixée, statut, `description`. Forme exacte : `docs/proxy.md`.
+   préfixée, statut, `description` (absente ou coupée à 1 024 caractères pour un tiers).
+   Forme exacte : `docs/proxy.md`. Le texte libre d'un upstream dont les skills sont
+   relayées voit ses URI `skill://` préfixées comme les entrées ; celui d'un upstream
+   legacy est publié tel quel. Le bloc est statique : un upstream mort en cours de vie y
+   reste annoncé.
 7. **Outil de repli `read_skill(uri)`**, nom nu, publié seulement si une skill est
    servie, marqué `_meta["miaou/skillsFallback"] = true` : un client qui lit les skills
    lui-même le masque par cette marque, pas par son nom. Texte rendu étiqueté du serveur
-   d'origine. Aucune approbation côté serveur.
+   d'origine. Aucune approbation côté serveur. Le repli d'un upstream dont les skills
+   sont relayées (un proxy pris comme upstream) n'est pas republié ; celui d'un upstream
+   legacy l'est, préfixé (`<up>__read_skill`), avec sa marque.
+
+**Proxy chaîné.** Un proxy pris comme upstream d'un autre est un upstream http moderne qui
+déclare l'extension : ses skills ressortent sous un préfixe double
+(`skill://up/bench/bench/SKILL.md`), dernier segment toujours égal au `name`, empreintes
+inchangées. Deux upstreams d'un même proxy peuvent ainsi servir deux skills de même
+`name` sous la même carte serveur : la clé d'approbation (carte, `name`) de MIAOU les
+confond.
 
 Mesuré avec MIAOU actuel (qui ne parle pas l'extension) : rien de cassé, et le modèle
 lit la skill de bench par `read_skill` puis applique sa règle. Le premier réflexe d'un

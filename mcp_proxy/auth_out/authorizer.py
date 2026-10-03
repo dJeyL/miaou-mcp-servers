@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from starlette.routing import Route
 
@@ -957,8 +957,13 @@ def build_callback_route(authorizers: dict[str, UpstreamAuthorizer]) -> Any:
 def build_authorize_route(
     authorizers: dict[str, UpstreamAuthorizer],
     upstreams: dict[str, Upstream],
+    on_authorized: Callable[[], Awaitable[None]] | None = None,
 ) -> Any:
     """Route `/authorize/{name}` — déclenche le parcours, port déjà ouvert.
+
+    `on_authorized` : rappel après un parcours réussi, une fois l'upstream
+    redémarré avec son jeton — c'est par lui que le proxy recalcule ce qu'il
+    publie (instructions, skills), qu'il ne connaît pas d'ici.
 
     PUBLIQUE, comme /callback et pour la même raison (cf. build_callback_route).
     C'est ici, et pas dans le lifespan, que le parcours interactif peut vivre :
@@ -1010,6 +1015,11 @@ def build_authorize_route(
                 await authorizer.authorize(upstreams[name])
                 authorizer.last_error = None
                 _log(f"Upstream '{name}' autorisé.")
+                if on_authorized is not None:
+                    try:
+                        await on_authorized()
+                    except Exception as e:  # pragma: no cover - filet
+                        _log(f"Surface publiée non recalculée après '{name}' ({e}).")
             except Exception as e:
                 authorizer.last_error = str(e)
                 _log(f"Autorisation de '{name}' échouée : {e}")

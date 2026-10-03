@@ -2877,3 +2877,56 @@ def test_the_refusal_filter_is_installed_once(tmp_path):
     _authorizers_for({"scope": "x"}, tmp_path)
     logger = logging.getLogger("mcp.client.auth.oauth2")
     assert sum(type(f).__name__ == "_ExpectedRefusalFilter" for f in logger.filters) == 1
+
+
+# ---------------------------------------------------------------------------
+# Ce que le proxy publie, recalculé après une autorisation
+#
+# Un upstream non autorisé au démarrage n'a été ni interrogé ni démarré :
+# `instructions` sans sa section, aucune skill relayée. `authorize()` le
+# redémarre avec son jeton ; sans recalcul, rien de tout cela n'apparaissait
+# avant le redémarrage du proxy.
+# ---------------------------------------------------------------------------
+
+
+def test_published_surface_is_recomputed_after_authorization(tmp_path):
+    from starlette.testclient import TestClient
+
+    from mcp_base import SKILLS_EXTENSION_ID
+
+    skills = tmp_path / "skills" / "tips"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("---\nname: tips\ndescription: Astuces\n---\n")
+
+    class _GatedUpstream(mcp_proxy.InProcessUpstream):
+        granted = False
+
+        async def start(self):
+            if not self.granted:
+                raise mcp_proxy.AuthorizationRequired("fx")
+            await super().start()
+
+    class _GrantingAuthorizer(_SilentlyGrantedAuthorizer):
+        async def authorize(self, upstream):
+            upstream.granted = True
+            await upstream.start()
+            self.authorization_pending = False
+
+    upstream = _GatedUpstream(
+        "tests.skills_fixture_server",
+        config={"skills_dir": str(tmp_path / "skills"), "instructions": "consigne fx"},
+    )
+    upstreams = {"fx": upstream}
+    authorizers = {"fx": _GrantingAuthorizer("fx")}
+    server = mcp_proxy.build_proxy_server(upstreams, {}, authorizers=authorizers)
+    app = mcp_proxy.build_app(server, upstreams, authorizers=authorizers)
+
+    with TestClient(app) as client:
+        assert server.instructions is None
+        assert SKILLS_EXTENSION_ID not in server.extensions
+        response = client.get("/authorize/fx", follow_redirects=False)
+        assert response.status_code == 200
+
+    assert "## fx\n\nconsigne fx\n\nSkills MCP servies par `fx`" in server.instructions
+    assert "(skill://fx/tips/SKILL.md), facultative : Astuces" in server.instructions
+    assert SKILLS_EXTENSION_ID in server.extensions

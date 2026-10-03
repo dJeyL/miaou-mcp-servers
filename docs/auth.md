@@ -251,6 +251,16 @@ autonome (PEP 723) que l'import du proxy alourdirait — même arbitrage que le
 helper TLS de `live_call.py`, avec le même prix : toute évolution est à
 répercuter.
 
+**Après un parcours réussi, le proxy recalcule ce qu'il publie.** `authorize()`
+redémarre l'upstream avec son jeton (`stop()`/`start()`, sonde d'ère comprise) ; la route
+rappelle ensuite `on_authorized`, que `build_app` branche sur la même fonction que le
+lifespan (`publish_surface`) : `instructions` (section de l'upstream et bloc de ses
+skills) recomposées, extension Skills enregistrée si l'upstream en sert (enregistrement
+idempotent). Sans ce rappel, un upstream non autorisé au démarrage — dont `start()` a
+levé, donc jamais interrogé — n'avait ni section ni skills relayées avant le redémarrage
+du proxy. Visible à la prochaine connexion d'un client : les `instructions` se lisent au
+handshake, et un client déjà connecté ne le refait pas.
+
 `tests/live_auth_probe.py` (banc manuel, non collecté par pytest) pose la même
 question hors du proxy : ce qu'un upstream répond sans jeton, requête par
 requête. C'est lui qui a établi le 401 ci-dessus, après trois correctifs posés
@@ -685,11 +695,25 @@ sous les pieds de l'appelant **sans réponse ni erreur pour lui**. Un
 `session.call_tool()` nu attend donc une réponse qui n'arrivera jamais, jusqu'à
 son propre timeout — client suspendu, refus jamais rendu (payé en production le
 2026-09-07 sur un upstream dont l'AS ne réclame son jeton qu'au premier appel
-réel). `HttpUpstream.call_tool` fait donc courir l'appel CONTRE `_stopped`,
+réel). `HttpUpstream._on_session` — la garde par laquelle passent `call_tool` et
+les requêtes de skills — fait donc courir l'appel CONTRE `_stopped`,
 signalé par le `finally` de `_serve` dans tous les cas de fin de service ; la
 première des deux qui vient l'emporte, et si c'est la mort du service on relève
 `_failure`, lisible parce que le `except` la pose avant que le `finally` ne
-signale.
+signale. Revers de cette course : ce qui sort du task group sort enveloppé dans
+un `ExceptionGroup`, y compris la `MCPError` par laquelle l'upstream refuse
+l'appel. La garde la déballe avant de la relever ; sans quoi `handle_call_tool`
+ne la reconnaissait plus, et le client lisait « unhandled errors in a TaskGroup
+(1 sub-exception) » au lieu du motif (vu en chaînant deux proxys : le refus
+AUTHORIZATION_REQUIRED de l'aval arrivait sous ce texte).
+
+**Limite connue de cette course.** En SDK 2.x, la fermeture du stream n'est plus
+silencieuse : la requête en vol reçoit `MCPError(-32000, "Connection closed")`, et la
+reçoit AVANT que la garde ne voie `_stopped`. Quand c'est une `AuthorizationRequired` qui
+a tué le service, l'appel rend donc « Connection closed », pas AUTHORIZATION_REQUIRED
+(mesuré, déterministe, sur `tools/call` comme sur `skills/get`) ; `authorization_pending`
+étant posé par `_on_redirect`, c'est l'appel SUIVANT qui reçoit le contrat. Un test
+`xfail(strict=True)` de `tests/test_proxy_remote_skills.py` le tient.
 
 **Le premier appel refuse comme les suivants.** Quand l'AS ne réclame
 l'autorisation qu'à `tools/call`, le parcours OAuth du SDK démarre au milieu de
@@ -702,7 +726,9 @@ empaquetant ce qui traverse un task group).
 
 **Cache d'outils** (`ToolCatalogCache`, `<config>-tools.json`) : sans lui, un
 upstream non autorisé serait muet, `tools/list` répondant 401 avant de rien
-dire. Il couvre aussi le redémarrage du proxy. Les outils resservis depuis le
+dire. Il couvre aussi le redémarrage du proxy. Il ne sert qu'un upstream qui a un
+authorizer : un upstream sans OAuth et sans session est injoignable, ses outils sont omis
+et leur appel rend un `isError` qui le dit (`docs/proxy.md`). Les outils resservis depuis le
 cache portent une **marque explicite** dans leur description
 (`format_stale_description`), avec la date de dernière connaissance : présenter
 une liste périmée comme vivante serait mentir au modèle, qui n'a aucun autre
@@ -823,3 +849,30 @@ remonté trois fois illisible jusqu'au log. Même raison pour
 laisser l'enveloppe remonter donnerait `unhandled errors in a TaskGroup` en guise
 de diagnostic.
 
+
+## La sonde d'ère et l'OAuth sortant
+
+Un upstream http est d'abord sondé en `server/discover` (cf. `docs/proxy.md`, « Ère des
+upstreams stdio et http ») : c'est donc la sonde, et non plus `initialize`, qui reçoit le
+premier 401. Rien ne change pour autant dans `HttpUpstream`, et c'est mesuré :
+
+- l'`Auth` du client httpx2 traite ce 401 comme celui d'`initialize` avant lui
+  (découverte, jeton, rejeu de la MÊME requête) : il n'atteint jamais le transport, et ne
+  participe donc jamais au verdict d'ère ;
+- un parcours inhibé (démarrage, `interactive` faux) lève `AuthorizationRequired`, qui
+  **traverse** la sonde sans repli — le SDK ne se replie que sur une `MCPError`. Seule la
+  sonde est partie, `start()` relève l'exception telle quelle et `_start_upstreams` classe
+  l'upstream « unauthorized », comme avant ;
+- le 403 `insufficient_scope` reste l'affaire du provider ;
+- sans `Auth`, un 401/403 nu fait replier le SDK sur `initialize`, qui reçoit le même
+  refus : même erreur qu'avant, une requête de plus.
+
+Le redémarrage d'`authorize()` (`stop()` puis `start()`) refait la sonde avec le jeton :
+l'ère n'est jamais mémorisée.
+
+**`_provoke_refusal` et `refresh_if_due` restent en JSON-RPC legacy écrit à la main**
+(`initialize` → `notifications/initialized` → `tools/list` → `tools/call` ; `initialize`
+seul). Un serveur SDK 2.x accepte les deux ères — aucun réglage public ne le rend moderne
+seul — et le refus d'autorisation précède le dispatch par ère : la séquence legacy amorce
+le parcours sur un upstream moderne aussi. Un upstream qui ne parlerait QUE 2026-07-28
+n'a pas été mesuré ; à rouvrir s'il en apparaît un.

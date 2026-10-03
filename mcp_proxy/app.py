@@ -20,7 +20,7 @@ from .auth_out import (
     build_callback_route,
 )
 from .logging import _log
-from .server import aggregate_instructions, authorize_path
+from .server import aggregate_instructions, authorize_path, published_tools
 from .skills import build_skills_blocks, install_skills
 from .upstream import HttpUpstream, Upstream
 
@@ -60,6 +60,38 @@ def build_app(
         max_request_body_size=MAX_REQUEST_BODY_BYTES,
         session_idle_timeout=SESSION_IDLE_TIMEOUT_S,
     )
+
+    async def publish_surface() -> None:
+        """Calcule ce que le proxy publie d'après l'état de ses upstreams :
+        `instructions` (texte libre et bloc des skills) et extension Skills.
+
+        Au lifespan, après le démarrage des upstreams ; et de nouveau après
+        chaque `authorize()` réussi, qui redémarre un upstream avec son jeton —
+        sans quoi un upstream non autorisé au démarrage n'aurait ni section
+        d'instructions ni skills relayées avant le redémarrage du proxy. Visible
+        à la prochaine connexion d'un client : les `instructions` se lisent au
+        handshake. L'enregistrement des handlers de skills est idempotent.
+
+        Écriture différée, et non un paramètre de construction :
+        build_proxy_server() s'exécute AVANT start(), donc avant que le moindre
+        upstream ait été interrogé — les instructions y seraient vides pour tout
+        le monde, en silence. Le SDK relit `Server.instructions` à chaque
+        create_initialization_options() (lowlevel/server.py), si bien qu'une
+        écriture postérieure à la construction est vue par tout `initialize`
+        client. Les capacités étant calculées à chaque server/discover, un
+        enregistrement tardif des skills l'est aussi. Une erreur ici prive le
+        proxy de skills, pas d'outils."""
+        try:
+            skills_blocks = await build_skills_blocks(upstreams, authorizers)
+        except Exception as e:
+            skills_blocks = {}
+            _log(f"Bloc des skills non généré ({type(e).__name__}: {e}).")
+        mcp_server.instructions = aggregate_instructions(upstreams, skills_blocks)
+        try:
+            if await install_skills(mcp_server, upstreams, authorizers):
+                _log("Extension Skills servie.")
+        except Exception as e:
+            _log(f"Extension Skills non servie ({type(e).__name__}: {e}).")
 
     @asynccontextmanager
     async def lifespan(app: Starlette):
@@ -143,10 +175,23 @@ def build_app(
                 # list_tools() échoue ne doit pas empêcher le proxy de servir les
                 # autres — on le signale sans propager.
                 try:
-                    count = len(await upstream.list_tools())
+                    count = len(published_tools(upstream, await upstream.list_tools()))
                     detail = f"{count} tool{'s' if count != 1 else ''}"
                 except Exception as e:
                     detail = f"tools unavailable ({type(e).__name__})"
+                # Skills servies, quand le proxy les relaie : le journal dit
+                # ainsi d'un coup d'œil quels upstreams en fournissent.
+                if upstream.serves_skills:
+                    try:
+                        skills = len(await upstream.list_skills())
+                        if skills:
+                            detail += f", {skills} skill{'s' if skills != 1 else ''}"
+                    except Exception as e:
+                        detail += f", skills unavailable ({type(e).__name__})"
+                # Ère négociée, pour un upstream stdio ou http : c'est ici
+                # qu'on voit qu'un upstream est abordé en legacy.
+                if upstream.protocol_version:
+                    detail += f" ({upstream.protocol_version})"
                 _log(f"  {name:<12} {detail}")
             for name in failed:
                 del upstreams[name]
@@ -193,30 +238,9 @@ def build_app(
             started: list[Upstream] = []
             try:
                 started = await _start_upstreams()
-                # Écriture différée, et non un paramètre de construction :
-                # build_proxy_server() s'exécute AVANT start(), donc avant que
-                # le moindre upstream ait été interrogé — les instructions y
-                # seraient vides pour tout le monde, en silence. Le SDK relit
-                # `Server.instructions` à chaque create_initialization_options()
-                # (lowlevel/server.py), si bien qu'une écriture postérieure à la
-                # construction est vue par tout `initialize` client, y compris
-                # le premier : aucun client ne peut avoir fait son handshake
-                # avant, session_manager.run() n'ayant pas encore démarré.
-                try:
-                    skills_blocks = await build_skills_blocks(upstreams, authorizers)
-                except Exception as e:
-                    skills_blocks = {}
-                    _log(f"Bloc des skills non généré ({type(e).__name__}: {e}).")
-                mcp_server.instructions = aggregate_instructions(upstreams, skills_blocks)
-                # Même contrainte d'ordre : les skills d'un upstream ne sont
-                # connues qu'après son start(). Les capacités étant calculées à
-                # chaque server/discover, l'enregistrement tardif est vu par tout
-                # client. Une erreur ici prive le proxy de skills, pas d'outils.
-                try:
-                    if await install_skills(mcp_server, upstreams, authorizers):
-                        _log("Extension Skills servie.")
-                except Exception as e:
-                    _log(f"Extension Skills non servie ({type(e).__name__}: {e}).")
+                # Avant session_manager.run() : aucun client ne peut avoir fait
+                # son handshake avant que la surface soit publiée.
+                await publish_surface()
                 # Lancée APRÈS le démarrage : elle n'a rien à faire tant qu'un
                 # upstream n'a pas de jeton, et le premier réveil est de toute
                 # façon différé d'un intervalle. Annulée avec le task group à
@@ -311,7 +335,7 @@ def build_app(
         # avant un montage de préfixe (Starlette retient la première qui matche).
         # Publiques à dessein, cf. build_callback_route.
         routes.append(build_callback_route(authorizers))
-        routes.append(build_authorize_route(authorizers, upstreams))
+        routes.append(build_authorize_route(authorizers, upstreams, on_authorized=publish_surface))
 
     routes.append(Mount("/mcp", app=mcp_endpoint))
 

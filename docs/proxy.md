@@ -19,9 +19,10 @@ dans l'environnement.
 
 Une entrée `http` prend `url` (obligatoire, l'endpoint `/mcp` du serveur distant),
 `headers` (optionnel, en-têtes statiques — un serveur tiers peut exiger une clef d'API
-sans OAuth) et `timeout` (optionnel, défaut `_HTTP_HANDSHAKE_TIMEOUT_S` = 30 s). Le
-handshake `initialize` est **borné** : un serveur distant qui accepte la connexion puis
-ne répond jamais bloquerait sinon le démarrage du proxy entier. Cette borne est une
+sans OAuth) et `timeout` (optionnel, défaut `_HTTP_HANDSHAKE_TIMEOUT_S` = 30 s). La
+négociation MCP (sonde `server/discover`, repli éventuel sur `initialize`, cf. « Ère des
+upstreams stdio et http ») est **bornée** : un serveur distant qui accepte la connexion
+puis ne répond jamais bloquerait sinon le démarrage du proxy entier. Cette borne est une
 constante distincte de celle des subprocess stdio — les deux mesurent des choses
 différentes, et partager la constante ferait bouger l'une en croyant ne toucher qu'à
 l'autre.
@@ -82,10 +83,12 @@ mcp_proxy/ (paquet, à la racine du projet)
 │   │              list_skills / get_skill / read_skill_file, « aucune » par défaut) :
 │   ├── InProcessUpstream  : importlib.import_module(module) → module.mcp (MCPServer,
 │   │                        API publique list_tools / call_tool ; skills lues sur
-│   │                        l'extension du MCPServer, seul type qui en sert)
-│   ├── StdioUpstream      : stdio_client + ClientSession (subprocess MCP)
-│   └── HttpUpstream       : client httpx2 + streamable_http_client + ClientSession
-│                            (serveur distant)
+│   │                        l'extension du MCPServer)
+│   ├── StdioUpstream      : stdio_client + Client (négociation d'ère) (subprocess MCP)
+│   ├── HttpUpstream       : client httpx2 + streamable_http_client + Client
+│   │                        (serveur distant), garde unique `_on_session`
+│   └── _RemoteSkills      : skills de stdio/http par le fil, si `serves_skills`
+│                            (ère moderne ET extension déclarée)
 ├── netproxy.py    override --proxy / --noproxy (calcul pur, n'applique rien)
 ├── config.py      lit config.json → build_upstreams()
 ├── server.py      build_proxy_server() : mcp.server.Server, on_list_tools / on_call_tool
@@ -109,7 +112,10 @@ mcp_proxy/ (paquet, à la racine du projet)
 ```
 
 **Ce que `call_tool` relaie.** Un upstream stdio ou http rend son `CallToolResult` à travers
-`relay_call_result` (upstream.py) : `content`, `isError` et `_meta` passent, pas
+`relay_call_result` (upstream.py) : `content`, `isError` et `_meta` passent — sauf, dans
+`_meta`, la clé `io.modelcontextprotocol/serverInfo` dont un upstream moderne signe ses
+résultats : le serveur du proxy ne pose son propre `serverInfo` que si la clé est absente,
+et relayer celle de l'upstream ferait passer son identité pour celle du proxy. Pas
 `structuredContent` — par cohérence avec `tools/list`, qui ne publie pas l'`outputSchema` des
 upstreams. Jusqu'au lot AI, seul `content` passait : le SDK ré-enveloppait la liste en
 `isError=False`, si bien qu'un échec signalé par l'upstream arrivait au client comme un
@@ -126,9 +132,26 @@ deux exceptions voulues, qui sortent en erreur JSON-RPC `data` intact :
 - `UpstreamNotAuthorized` (une `MCPError`), le contrat AUTHORIZATION_REQUIRED ;
 - une `MCPError` levée par un outil **inprocess** — REF_UNKNOWN de `mcp_docs`. Celle d'un
   upstream **distant** est la réponse d'erreur de ce serveur, aplatie en `isError` comme
-  en 1.x.
+  en 1.x, son message compris : `HttpUpstream.call_tool` la déballe de l'`ExceptionGroup`
+  dont l'enveloppe son task group (`docs/auth.md`), faute de quoi le client lisait
+  « unhandled errors in a TaskGroup » au lieu du motif.
 
-« Outil inconnu » reste un `isError` textuel. En 1.x, les deux contrats passaient par un
+« Outil inconnu » reste un `isError` textuel, comme l'appel d'un outil dont l'upstream
+**sans authorizer** n'a plus de session : « injoignable », avec la cause de la fermeture,
+et la mention que le proxy ne s'y reconnecte qu'à son redémarrage. Seul un upstream qui a
+un parcours d'autorisation est refusé en AUTHORIZATION_REQUIRED — sans quoi un serveur
+sans OAuth, arrêté en cours de vie, envoyait l'utilisateur l'autoriser.
+
+**Une panne d'upstream reste la sienne.** `tools/list` liste chaque upstream vivant à
+part : celui dont le listage échoue est omis (une ligne au journal), les autres répondent.
+Le cas est celui d'un upstream mort en cours de vie — un subprocess stdio tué reste dans
+la table, et `upstream_is_live` ne voit pas sa mort ; sans l'isolation, `tools/list`
+échouait en entier, pour tous, à chaque appel. Un upstream sans authorizer et sans session
+n'est pas resservi depuis `ToolCatalogCache` : ses outils resservis porteraient la mention
+« non autorisé », fausse pour lui. Le cache reste réservé au troisième état
+(`docs/auth.md`). Aucune reconnexion automatique : l'upstream revient au redémarrage du
+proxy. Même isolation pour les listages de skills et le bloc des instructions (« Extension
+Skills »). En 1.x, les deux contrats passaient par un
 sentinel dans le texte de l'`isError`, repêché par deux wrappers qui remplaçaient le
 handler enregistré : ni l'un ni l'autre n'existe plus.
 
@@ -137,6 +160,15 @@ protocole AVANT de l'émettre : un seul outil dont l'`inputSchema` n'a pas
 `"type": "object"` ferait rejeter le `tools/list` ENTIER en INTERNAL_ERROR, les autres
 upstreams avec. `_object_schema` complète le schéma (catalogue en cache sans schéma,
 upstream tiers peu rigoureux) plutôt que de laisser un outil éteindre les autres.
+
+**`x-mcp-header` retiré des schémas publiés** (`_strip_param_headers`, à toute profondeur,
+mais jamais dans les noms de propriétés ni les données d'`enum`/`const`/`default`/`examples`).
+L'annotation demande au client de recopier un argument dans un en-tête `Mcp-Param-*`.
+Republiée, c'est le serveur DU PROXY qui l'exigeait de son client — 400 `-32020` sur un
+`tools/call` moderne sans l'en-tête (mesuré), quelle que soit l'ère de l'upstream. Vers
+un upstream moderne, l'en-tête est émis par le SDK du proxy depuis sa propre liste
+(« Ère des upstreams stdio et http ») ; un upstream legacy n'en a pas l'usage. Vaut pour
+le catalogue en cache aussi, qui repasse par le même chemin.
 
 **Gestionnaire de sessions.** `build_app` passe à `StreamableHTTPSessionManager` les deux
 réglages que partagent les serveurs autonomes (`servers/mcp_base.py`) :
@@ -151,6 +183,83 @@ l'`Origin: null` de MIAOU en `file://` exige.
 certains clients MCP ne suivent pas les redirections sur POST/DELETE. Le wrapper réécrit
 `scope["path"]` de `/mcp` vers `/mcp/` avant le routeur pour servir la requête directement,
 sans redirection.
+
+
+## Ère des upstreams stdio et http
+
+Le proxy parle à un upstream stdio ou http la révision 2026-07-28 quand celui-ci la
+parle, `initialize` sinon. Rien n'est écrit ici : `StdioUpstream.start()` et
+`HttpUpstream._serve()` ouvrent un `Client(<transport>, mode=…, cache=None)` du SDK,
+qui sonde et se replie lui-même (`mcp/client/_probe.py`, `negotiate_auto`), puis lisent
+sur `client.session` ce que les deux ères posent pareil : `instructions`,
+`protocol_version`, `server_capabilities` (recopiés sur `Upstream.instructions`,
+`protocol_version`, `capabilities`). `mode` vient de la clé `protocol` de l'entrée :
+`"auto"` par défaut, `"legacy"` pour imposer `initialize` — le recours, sans code, pour un
+upstream moderne d'un autre SDK que la validation de la révision 2026-07-28 ferait
+échouer. L'ère retenue figure dans le journal de démarrage, à la suite du nombre
+d'outils (`demo         2 tools (2026-07-28)`) ; rien pour un inprocess, sans fil. Le transport est construit par le proxy et passé
+tel quel, jamais l'URL : pour http, le client httpx2 de `_build_http_client` reste le
+seul employé (en-têtes, délais, OAuth, proxy réseau). `Client` s'ouvre et se referme dans
+la tâche de service, comme la `ClientSession` d'avant (`docs/auth.md`, « `HttpUpstream` :
+le transport vit dans sa propre tâche »). `cache=None` : le cache de réponses de `Client`
+ne sert pas les appels faits sur `client.session`, il est écarté sans ambiguïté.
+
+**Quand le SDK se replie sur `initialize`.** Sur TOUTE `MCPError` reçue en réponse à
+`server/discover` — erreur JSON-RPC d'un serveur qui ne connaît pas la méthode, 400 d'un
+serveur 1.x, mais aussi :
+
+- **délai dépassé** : la sonde a son propre délai de 10 s, et son expiration est une
+  `MCPError`. C'est ce qui donne l'ère moderne à un subprocess lent à démarrer (mesuré :
+  un serveur 2.x prêt en 12 s est abordé en moderne) ; un serveur qui aurait traité la
+  sonde trop tard répond `-32022` à l'`initialize` de repli, et le SDK re-sonde ;
+- **4xx sans corps JSON-RPC** (401/403 d'une passerelle) : le transport les convertit en
+  `MCPError(-32603)`, statut perdu. `initialize` reçoit le même refus, et l'erreur finale
+  est celle d'avant, une requête plus tard.
+
+Toute autre exception traverse la sonde sans repli (réseau, annulation,
+`AuthorizationRequired` levée par l'`Auth` OAuth) : une panne n'est jamais un verdict
+d'ère.
+
+**Bornes.** La négociation entière reste sous la borne existante (15 s stdio, `timeout`
+http), délai de sonde compris : un serveur muet échoue toujours à la borne (« n'a pas
+répondu à la négociation MCP »). Un `timeout` http configuré sous 10 s rend le repli sur
+délai inatteignable : un serveur lent échoue à la borne, comme avant. L'ère est
+recalculée à chaque `start()`, jamais mémorisée — le redémarrage d'`authorize()` refait
+la sonde, avec le jeton. Un upstream qui change d'ère en cours de vie : rien
+d'automatique, ses appels échouent jusqu'au prochain démarrage.
+
+**Upstream legacy : identique, une requête près.** Après le refus de la sonde, la
+session est exactement celle du mode legacy — `initialize` sans en-tête de version (le
+transport efface celui de la sonde), offre `2025-11-25`, puis `Mcp-Session-Id`, flux GET
+et DELETE à l'arrêt ; seul l'`id` JSON-RPC avance d'un cran. `tests/test_proxy_era.py`
+le vérifie message par message, contre le mode legacy, sur les deux transports. Coût :
+une requête par démarrage, et pour un upstream stdio SDK 1.x, une rafale de
+`Failed to validate request` sur son stderr, que le proxy hérite (le filtrer masquerait
+aussi ses vraies erreurs).
+
+**Upstream moderne : ce qui change.** Les `instructions` viennent du `DiscoverResult`
+(même contenu pour un serveur 2.x ; non garanti pour un autre SDK). Le SDK pose sur
+chaque requête l'enveloppe `_meta` (`protocolVersion`, `clientInfo`,
+`clientCapabilities`, vides) et, en http, `MCP-Protocol-Version`, `Mcp-Method`,
+`Mcp-Name` ; ni session, ni flux GET, ni DELETE. Il valide les résultats contre la
+révision 2026-07-28, et retire de `tools/list` un outil dont une annotation
+`x-mcp-header` est invalide (avertissement sur le logger nommé `"client"`).
+
+**`Mcp-Param-*` exige un listage préalable.** Le SDK n'émet ces en-têtes, pour un
+`tools/call` http, que depuis les annotations du DERNIER `tools/list` de la session
+(sur stdio, aucun en-tête : seul le `_meta` part, et le serveur ne valide les
+`Mcp-Param-*` que sur son routeur HTTP). Le proxy liste à chaque `tools/list` de son
+client, mais pas après le redémarrage d'`authorize()`, ni quand il ressert son catalogue
+en cache : un appel arrivé dans cette fenêtre partait sans en-tête et l'upstream le
+refusait (`-32020`, mesuré). `start()` liste donc les outils d'un upstream moderne dès
+l'ouverture de la session (`_prime_tool_listing`) ; une erreur de l'upstream sur ce
+listage n'empêche pas le démarrage, une panne du transport si. Rien en legacy.
+
+Le proxy ne republie AUCUNE capacité d'upstream : les siennes restent celles qu'il implémente, et
+relayer une extension inconnue promettrait au client des méthodes qu'il ne sait pas
+router. Seule l'extension Skills, qu'il implémente lui-même, se sert de celles de
+l'upstream : déclarée par un upstream moderne, elle fait relayer ses skills (« Extension
+Skills »).
 
 
 ## Consigne de portée serveur (`instructions`)
@@ -170,8 +279,8 @@ une consigne passée en position partirait sans erreur. Côté proxy, trois capt
 | Upstream | Capture |
 |---|---|
 | `InProcessUpstream` | `server.instructions` (le `MCPServer` importé) — pas d'`initialize` sur ce chemin |
-| `StdioUpstream` | retour d'`await session.initialize()` |
-| `HttpUpstream` | retour d'`await session.initialize()` |
+| `StdioUpstream` | `session.instructions` après négociation : `DiscoverResult` en ère moderne, `InitializeResult` en legacy |
+| `HttpUpstream` | `session.instructions` après négociation, idem |
 
 `aggregate_instructions()` compose le champ unique du proxy à partir des N
 upstreams : un préambule, puis une section `## <nom>` par upstream qui en
@@ -204,10 +313,13 @@ Trois points qui ne se devinent pas :
   premier renommage de carte serveur.
 
 - **Un upstream non autorisé garde sa section.** C'est de la documentation, pas
-  une capability, et `initialize` ne se rejoue pas après une autorisation
-  obtenue en cours de route : une section omise manquerait définitivement, alors
-  qu'une section décrivant un outil temporairement absent ne coûte qu'un
-  paragraphe. Observé au passage sur un upstream Jira derrière WSO2 : `tools/list`
+  une capability, et un client déjà connecté ne refait pas son handshake après une
+  autorisation obtenue en cours de route : une section omise lui manquerait jusqu'à
+  sa reconnexion, alors qu'une section décrivant un outil temporairement absent ne
+  coûte qu'un paragraphe. Après un `authorize()` réussi, le proxy recompose ses
+  `instructions` (et sa surface de skills) : la section d'un upstream non autorisé au
+  démarrage, qui n'avait jamais été interrogé, apparaît à la connexion suivante
+  (`docs/auth.md`). Observé au passage sur un upstream Jira derrière WSO2 : `tools/list`
   y répond avant autorisation, seul `tools/call` refuse.
 
 Le champ n'atteint le modèle que si le CLIENT le lit et l'injecte dans son system
@@ -236,25 +348,88 @@ vivant. Le message d'erreur cite toujours l'URI du client, jamais celle de l'ups
 pose `skills/list`, `skills/get`, `resources/list`, `resources/read` et
 `Server.extensions` APRÈS le démarrage des upstreams — `build_proxy_server()` s'exécute
 avant, et ne sait rien des skills. Ça tient parce que le SDK calcule les capacités à
-chaque `server/discover` (mesuré) : un enregistrement tardif est vu par tout client. Un
-proxy dont aucun upstream ne sert de skill ne publie RIEN de neuf — vérifié à l'octet
+chaque `server/discover` (mesuré) : un enregistrement tardif est vu par tout client.
+« Servie » : un upstream inprocess qui liste au moins une skill, OU un upstream stdio/http
+vivant qui DÉCLARE l'extension, même avec un `skills/list` vide — la spec interdit de lire
+un listage vide comme « aucune skill », et une skill servie non listée doit rester
+lisible. Un proxy sans ni l'un ni l'autre ne publie RIEN de neuf — vérifié à l'octet
 contre l'ancien code. Effet de bord : avec une skill servie, l'`initialize` legacy
 annonce aussi `resources` (le SDK dérive cette capacité du handler `resources/list`).
 
-`skills/list` et `skills/get` relisent les entrées à chaque appel (empreintes, tailles,
-frontmatter) — le CONTENU de fichiers dont l'ensemble, lui, est figé au démarrage de
-l'upstream : un fichier ajouté ou supprimé exige de le redémarrer (`docs/servers.md`,
-« Fraîcheur »). Ils posent `ttlMs: 300000`, `cacheScope: "public"`. `resources/list` ne
-liste que les fichiers de skills ; `resources/read` ne lit que les fichiers déclarés par
-une entrée (liste blanche de l'upstream), même si le `MCPServer` sert d'autres
-ressources.
+**Quand le catalogue est lu.** Au démarrage, par `install_skills` et
+`build_skills_blocks` ; puis EN DIRECT à chaque `skills/list` et `resources/list` du
+client (comme `tools/list`) ; `skills/get` et `resources/read` sont transmis à chaque
+appel. Jamais au `server/discover` du client, dont les capacités se calculent sur les
+handlers du proxy. Le proxy n'a aucun cache de skills : le `ttlMs` d'un upstream ne sert
+qu'aux indices qu'il publie. Pour un upstream inprocess, les entrées sont relues de même
+(empreintes, tailles, frontmatter) — le CONTENU de fichiers dont l'ensemble, lui, est figé
+au démarrage de l'upstream : un fichier ajouté ou supprimé exige de le redémarrer
+(`docs/servers.md`, « Fraîcheur »).
 
-**Upstreams stdio et http : aucune skill.** Le proxy les aborde en `initialize` (ère
-legacy), où les capacités d'extension ne sont pas publiées, et la spec n'autorise
-`skills/*` qu'après les avoir vues dans `server/discover`. L'interface `Upstream` rend
-« aucune skill » pour eux, et le journal de démarrage le dit une fois par upstream
-(« skills non relayées »). Servir leurs skills suppose que le proxy parle d'abord l'ère
-moderne à ses upstreams : dette connue.
+**Indices de cache** : les plus restrictifs de ceux du proxy (`ttlMs: 300000`,
+`cacheScope: "public"`) et de ceux des upstreams concernés — `ttlMs` minimal, `private`
+dès qu'un upstream le dit (un upstream OAuth peut servir des skills propres à
+l'utilisateur, qu'un cache partagé ne doit pas resservir). Toutes les pages d'un
+`skills/list` paginé comptent.
+
+**Qui juge qu'un fichier est servi.** `resources/list` ne liste que les fichiers de
+skills. `resources/read` d'un upstream INPROCESS ne lit que les fichiers déclarés par une
+entrée (liste blanche), son `MCPServer` pouvant servir d'autres ressources sous d'autres
+schémas. Pour un upstream stdio/http, c'est l'UPSTREAM qui juge : la requête lui est
+transmise, il répond `-32602` pour ce qu'il ne sert pas. Une liste blanche tirée de son
+`skills/list` refuserait les fichiers d'une skill servie mais non listée, que la spec
+exige de savoir charger depuis sa seule URI ; la liste blanche du SEP est l'affaire du
+client.
+
+**Entrées distantes : pas de confiance, mais pas de filtre.** `collect_skills` écarte,
+avec une trace par entrée et par vie de l'upstream, ce que le préfixage ne sait pas
+traiter (`_unprefixable`) : entrée qui n'est pas un objet, `uri` hors `skill://`,
+`resources` ni liste ni `"dynamic"`, fichier sans `uri` `skill://`. Tout le reste est
+relayé tel quel — nom hors règle, dernier segment ≠ `name`, `description` absente,
+`resources` vide ou `"dynamic"`, tailles et empreintes : le client vérifie, et sait dire
+pourquoi une entrée est invalide, là qu'une entrée écartée par le proxy disparaîtrait sans
+explication. `skills/get` d'une entrée non préfixable : `-32603`. `resources/list` et le
+bloc des instructions tolèrent un frontmatter absent ou incomplet.
+
+**Upstreams stdio et http : relayés en ère moderne, extension déclarée.** Les trois
+méthodes de skills de `StdioUpstream` et `HttpUpstream` (`_RemoteSkills`, upstream.py)
+passent par le fil MCP, sous UNE condition, `Upstream.serves_skills` : ère moderne
+négociée ET `io.modelcontextprotocol/skills` dans les `extensions` du `server/discover`
+de l'upstream. Faux, elles rendent « aucune skill » sans émettre de requête. Il faut les
+deux : un serveur 2.x répond à `skills/*` même abordé en `initialize` (mesuré), la
+réponse ne dit donc pas si l'on avait le droit de demander — et la spec lie l'extension
+à `server/discover`. Un upstream legacy, constaté par la sonde ou forcé par
+`protocol: "legacy"`, ne reçoit ainsi aucune requête de plus, et ce que le proxy publie
+pour lui ne change pas. L'inprocess, sans fil, sert toujours (`serves_skills` vrai, ses
+skills lues sur le `MCPServer`).
+
+Ce qui part : `skills/list` (en suivant `nextCursor`, au plus `_SKILLS_MAX_PAGES` pages,
+arrêt sur un curseur déjà vu) et `skills/get` par `session.send_request` — le SDK client
+n'a pas de verbe pour eux —, résultat lu en `dict` brut, sans modèle : le proxy relaie,
+le client vérifie (empreintes comprises). `skills/get` rend l'entrée déballée de `skill`,
+comme l'inprocess. `resources/read` par `session.read_resource`, qui pose `Mcp-Name` en
+ère moderne ; le SDK y valide le résultat contre la révision 2026-07-28 (`cacheScope` et
+`resultType` requis), ce qu'un upstream d'un autre SDK peut ne pas tenir — erreur rendue
+en `INTERNAL_ERROR`, seul recours `protocol: "legacy"`, qui coupe aussi ses skills.
+`skills/*` n'est pas validé par le SDK (méthode hors de son tableau). Le tampon moderne
+(`_meta`, en-têtes d'ère) est posé par le SDK, rien à écrire ici. Chaque requête est
+bornée par le délai de l'upstream (`timeout` http, 15 s stdio) : un upstream muet ne
+retient pas `skills/list` du proxy jusqu'au délai de lecture du transport (300 s).
+
+**`HttpUpstream` : une seule garde.** `call_tool` et les trois méthodes de skills passent
+par `_on_session`, qui fait courir la requête contre la mort de la tâche de service et
+déballe l'`ExceptionGroup` de son task group (`docs/auth.md`). Sans le déballage, une
+`MCPError` de l'upstream sur `skills/get` sortait du handler en erreur JSON-RPC de code 0.
+`StdioUpstream`, sans tâche de service, appelle la session en direct.
+
+**Erreurs relayées.** Un `-32602` de l'upstream ressort avec l'URI du client ; toute autre
+`MCPError` (un `-32603` d'une skill devenue illisible) garde code et message. Une panne
+de transport, un délai dépassé ou une réponse que le SDK refuse deviennent une
+`MCPError(INTERNAL_ERROR, "Le serveur '<up>' n'a pas pu servir <uri> (…)")`
+(`_remote_failure`), jamais une erreur de code 0 ; une `AuthorizationRequired` en cours
+d'appel, le contrat AUTHORIZATION_REQUIRED. Sur `skills/list` et `resources/list`,
+l'upstream en panne est omis (une ligne au journal) et les autres répondent. Le repli
+`read_skill` rend toutes ces issues en `isError` lisible.
 
 **`_meta` des outils.** Relayé en entier par `tools/list` (`relay_tool_meta`), sauf
 `miaou/requiresSkill`, dont l'URI est relative au serveur qui liste l'outil : elle reçoit
@@ -263,7 +438,49 @@ plutôt que relayée fausse. `ToolCatalogCache` mémorise ce `_meta` : un upstre
 autorisé resservi depuis le cache garde sa déclaration ; un fichier de cache plus ancien,
 sans la clé, se relit sans erreur. Un `requiresSkill` qui ne désigne aucune skill servie
 par son upstream est journalisé au démarrage et relayé quand même (la garde du client
-reste ouverte dans ce cas).
+reste ouverte dans ce cas). Pour un upstream relayé, il désigne désormais une skill que le
+proxy sert ; il reste « non servi » pour un upstream legacy forcé dont les outils le
+portent, ou un upstream en erreur au démarrage.
+
+**Outil de repli d'un upstream relayé : non republié** (`published_tools`). Un outil
+d'upstream marqué `_meta["miaou/skillsFallback"]` (le `read_skill` d'un proxy pris comme
+upstream) dit « un client qui lit les skills lui-même me masque » : pour ses upstreams, ce
+client, c'est le proxy, dont le propre `read_skill` lit les mêmes fichiers sous les URI
+qu'il publie — celui de l'amont attendrait les URI de l'amont. Il est retiré de
+`tools/list`, du compte d'outils du journal et de celui du bloc (sans quoi la forme « tout
+appel d'un outil `<up>__…` » ne tiendrait plus). Un upstream non relayé (legacy) garde le
+sien.
+
+**Texte libre d'un upstream relayé : URI préfixées** (`prefix_free_text_skill_uris`).
+La spec autorise un serveur à citer l'URI d'une skill dans ses `instructions` ;
+republiée telle quelle, elle désignerait une skill du proxy qui n'existe pas. Pour un
+upstream dont les skills sont relayées (inprocess compris), `skill://` devient
+`skill://<up>/` dans son texte libre : insertion au début de l'URI, sans analyse de
+bornes, la ponctuation qui suit reste juste. Cas courant : un proxy pris comme upstream,
+dont le bloc généré cite ses propres URI — sans le préfixe, le proxy aval publiait les
+URI de l'amont dans son propre espace de noms. Dans une chaîne, le bloc de l'amont,
+devenu juste, double alors celui de l'aval : artefact accepté. Jamais pour un upstream
+legacy : ce que le proxy publie pour lui ne bouge pas.
+
+**Journal de démarrage.** La ligne d'un upstream qui sert des skills relayées en donne le
+nombre (`up           7 tools, 1 skill (2026-07-28)`, inprocess compris), et le compte
+d'outils exclut le repli retiré. Une ligne par upstream, avec l'URI et le nombre
+d'outils, pour une skill exigée mais non servie (`skill exigée mais non servie par 'x' :
+skill://…/SKILL.md (7 outils)`). « skills non relayées (… forcé en ère legacy par la
+config…) » reste pour un upstream en `protocol: "legacy"` : jamais interrogé en moderne,
+il peut servir des skills que le proxy ne relaiera pas. Rien pour un legacy constaté par
+la sonde, qui ne peut pas servir l'extension.
+
+**Upstream absent.** Non autorisé (y compris resservi depuis `ToolCatalogCache`) : non
+vivant, aucune skill relayée, aucune requête ; ses outils restent listés avec leur
+`requiresSkill` préfixé, qui désigne alors une skill absente (garde ouverte côté client,
+et l'appel est de toute façon refusé). Mort en cours de vie : omis des listages ; les
+capacités du proxy restent publiées (la spec admet un `skills/list` vide) et le bloc des
+`instructions` reste en place, statique par construction — **il ment donc pendant la
+panne**, comme la section de texte libre d'un upstream dont les outils ont disparu : le
+rendre dynamique casserait la stabilité du message système. Les lectures échouent en
+`-32602` (résolution refusée, upstream non vivant) ou avec l'erreur du transport. Mort au
+démarrage : retiré de la table, rien publié pour lui.
 
 **Bloc généré dans les instructions.** `build_skills_blocks()` (lifespan) termine la
 section de chaque upstream qui sert des skills :
@@ -273,10 +490,15 @@ Skills MCP servies par `bench` — pas des skills locales : leur nom ne suffit p
 - `bench` (skill://bench/bench/SKILL.md), obligatoire avant tout appel d'un outil `bench__…` : Règle de restitution […]
 ```
 
+Dégradé pour une entrée distante incomplète : nom pris du dossier de la skill si
+`name` manque, ligne sans « : <description> » si elle manque, description coupée à
+1 024 caractères (`SKILL_DESCRIPTION_MAX_CHARS`, la borne d'Agent Skills) pour qu'un tiers
+n'allonge pas le message système sans limite.
+
 Une ligne par skill, obligatoire ou FACULTATIVE (aucun outil ne l'exige) : sans annonce,
 une skill facultative serait inatteignable — le modèle n'a pas `skills/list`, toute
-lecture exige l'URI, et l'upstream ne peut pas l'écrire dans son texte libre, puisque le
-préfixe ajouté ici la rendrait fausse. Le statut précède la description (sinon il se
+lecture exige l'URI, et nos serveurs ne l'écrivent pas dans leur texte libre
+(`docs/servers.md`) ; un tiers peut le faire, son URI y est alors préfixée (ci-dessous). Le statut précède la description (sinon il se
 colle à une description sans point final) ; « tout appel d'un outil `<up>__…` » quand
 TOUS les outils de l'upstream l'exigent, la liste des noms préfixés sinon. Le bloc ne
 nomme aucun outil de lecture : le repli est masqué par les clients qui lisent les skills
@@ -334,7 +556,11 @@ l'affaire du client.
 ```
 
 `type` absent → `stdio` (défaut). `port` est obligatoire, `host` est optionnel.
-Une entrée `http` exige `url` ; `headers` et `timeout` y sont optionnels. Un bloc
+Une entrée `http` exige `url` ; `headers` et `timeout` y sont optionnels.
+`protocol` sur une entrée stdio ou http : `"auto"` (défaut, l'ère est négociée) ou
+`"legacy"` (`initialize` d'emblée, sans sonde) — cf. « Ère des upstreams stdio et http ».
+Toute autre valeur, ou la clé sur une entrée inprocess, est une erreur de config signalée
+au démarrage. Un bloc
 `auth` sur une entrée `http` active l'auth **sortante** (le proxy devient client
 OAuth de ce serveur) ; il n'a de sens que là, et l'exiger ailleurs est une erreur
 de config signalée au démarrage.

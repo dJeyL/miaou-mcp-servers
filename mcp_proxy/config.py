@@ -17,6 +17,22 @@ from .upstream import (
 )
 
 
+# Valeurs de la clé `protocol` d'une entrée stdio ou http : l'ère est négociée
+# ("auto", défaut) ou imposée en legacy — le recours pour un upstream moderne
+# d'un autre SDK que la validation de la révision 2026-07-28 ferait échouer.
+_PROTOCOL_VALUES = ("auto", "legacy")
+
+
+def _protocol(name: str, srv: dict[str, Any]) -> str:
+    protocol = srv.get("protocol", "auto")
+    if protocol not in _PROTOCOL_VALUES:
+        raise ValueError(
+            f"Serveur '{name}' : 'protocol' vaut {protocol!r}, attendu "
+            f"{' ou '.join(repr(v) for v in _PROTOCOL_VALUES)}."
+        )
+    return protocol
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     try:
         cfg = json.loads(Path(path).read_text())
@@ -46,6 +62,11 @@ def build_upstreams(
             module = srv.get("module")
             if not module:
                 raise ValueError(f"Serveur '{name}' inprocess sans clé 'module'.")
+            if "protocol" in srv:
+                raise ValueError(
+                    f"Serveur '{name}' : la clé 'protocol' n'a de sens que sur un "
+                    f"upstream 'stdio' ou 'http' (un inprocess n'a pas de fil)."
+                )
             upstreams[name] = InProcessUpstream(
                 module, env=srv.get("env"), config=srv.get("config")
             )
@@ -59,6 +80,7 @@ def build_upstreams(
                 args=srv.get("args", []),
                 env=env,
                 cwd=srv.get("cwd"),
+                protocol=_protocol(name, srv),
             )
         elif srv_type == "http":
             url = srv.get("url")
@@ -68,6 +90,7 @@ def build_upstreams(
                 url=url,
                 headers=srv.get("headers"),
                 timeout=srv.get("timeout", _HTTP_HANDSHAKE_TIMEOUT_S),
+                protocol=_protocol(name, srv),
             )
         else:
             raise ValueError(f"Type de serveur inconnu pour '{name}': '{srv_type}'.")

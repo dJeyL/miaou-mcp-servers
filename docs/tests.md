@@ -18,6 +18,40 @@ Le harnais déballe l'`ExceptionGroup` d'anyio dont le transport en mémoire env
 l'erreur (`_single_cause`). Les tests des serveurs, eux, appellent l'outil par
 `_tool_manager.call_tool(nom, args, None)` : le contexte est obligatoire en 2.x, `None`
 suffit à un outil qui n'en déclare pas.
+`tests/test_proxy_era.py` fait, lui, de VRAIS handshakes avec des upstreams stdio et
+http, pour la négociation d'ère : sans réseau, un subprocess `sys.executable` pour stdio
+(`tests/era_fixture_server.py`, un `MCPServer` 2.x avec instructions, une extension et un
+outil annoté `x-mcp-header` ; `tests/legacy_stdio_fixture.py`, faux serveur en
+bibliothèque standard qui ne parle que `initialize` et journalise chaque message reçu —
+un vrai serveur 1.x exigerait un téléchargement) ; pour http, `_build_http_client`
+remplacé par un client `httpx2.ASGITransport` sur l'app streamable-http du même
+`MCPServer` (le flux GET SSE de l'ère legacy y passe, fermeture comprise), avec un hook
+de requête qui enregistre ce qui part. L'upstream http legacy est ce serveur 2.x derrière
+un middleware qui répond à toute requête `MCP-Protocol-Version: 2026-07-28` ce que répond
+un serveur 1.28.1 (400, `-32600`, `id: "server-error"`). L'identité legacy se vérifie en
+comparant la session du mode `auto` à celle du mode `legacy`, message par message. Un
+second middleware répond à tout `tools/call` une erreur JSON-RPC (400 avec corps) : la
+seule façon de voir l'erreur d'un upstream http traverser le VRAI `HttpUpstream.call_tool`
+et son task group — un upstream `MagicMock`, comme dans `test_proxy.py`, ne l'a jamais
+vue enveloppée.
+`tests/test_proxy_remote_skills.py` reprend cet outillage pour les skills relayées :
+`tests/skills_fixture_server.py`, lancé en script, sert l'extension Skills de `mcp_base`
+sur stdio (`python skills_fixture_server.py <skills_dir> [<requires_skill>]`), et son
+`build(config)` donne l'app http. La skill de fixture porte CRLF, BOM, emoji et un
+fichier binaire : les octets lus à travers le proxy sont comparés à ceux du disque, et
+aux empreintes que l'upstream publie. Le legacy est tenu par ce qui PART : aucune
+méthode `skills/*` ni `resources/*` dans ce qu'enregistre le hook httpx2 (2.x forcé en
+legacy, qui répondrait s'il était interrogé ; 2.x derrière le middleware 1.x) ni dans le
+journal de `legacy_stdio_fixture.py`. Un middleware refuse `skills/get` en 400 avec
+corps, ou ne répond jamais (borne de la requête) ; la mort d'un upstream stdio se
+provoque en tuant son subprocess (`pgrep -P`), sans passer par `stop()`.
+Les formes que nos serveurs n'émettent jamais viennent de `tests/fabricated_skills_server.py`
+(un `MCPServer` dont l'extension Skills rend des entrées FABRIQUÉES) : deux pages dont la
+seconde répète son curseur et dit `private`, `"dynamic"`, URI hors `skill://`, fichier
+sans `uri`, `name` ou `description` absents, description trop longue, entrée qui n'est
+pas un objet, skill servie non listée ; `build("empty")`, extension déclarée et listage
+vide. Ce qu'ils couvrent est jugé sur NOTRE lecture de la spec, aucun upstream tiers ne
+servant encore l'extension.
 Les tests qui interceptent le client HTTP du SDK patchent **`httpx2`** (`AsyncClient`,
 `MockTransport`, `Response`) : le SDK 2.x n'emploie plus `httpx`, et un patch resté sur
 l'ancien nom ne lève rien — il ne patche plus rien, et le test part sur le réseau.
