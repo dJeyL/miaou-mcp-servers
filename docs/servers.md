@@ -365,6 +365,31 @@ Un seul outil `ddg_search(query, max_results=5)`. POST sur l'endpoint HTML de DD
 `result__snippet`). Renvoie `TextResourceContents` `application/json` — tableau
 `[{title, url, snippet}]`. Fragile si DDG change son markup.
 
+L'autre mode de panne, plus fréquent que le markup : DDG remplace les résultats
+par un défi anti-bot (HTTP 202, captcha « select the ducks », formulaire vers
+`anomaly.js?cc=botnet`) dès qu'une IP sortante enchaîne quelques requêtes —
+mesuré le 2026-10-05, curl compris, après une poignée d'appels en quelques
+minutes. Le blocage a duré 2 h 15 à 2 h 30 (sonde d'une requête par quart
+d'heure, qui ne l'a ni prolongé indéfiniment ni relancé une fois levé) ; seuil
+et durée pour une autre IP inconnus. Le parser n'y trouvait aucun `result__a` et
+l'outil rendait `[]`, indiscernable d'une recherche vide. La page est reconnue à
+sa classe `anomaly-modal` (seulement quand aucun résultat n'a été extrait) et
+l'outil rend un message explicite à la place. Le défi n'est pas contourné : la
+seule issue est d'attendre, ou de passer par `mcp_brave`.
+
+Pour ne pas le déclencher soi-même, les requêtes sortantes d'un processus sont
+espacées d'au moins `_MIN_INTERVAL_S` (15 s) : un appel attend son créneau,
+réservé sans verrou (aucun `await` entre lecture et écriture de `_next_slot`),
+et il est refusé sans requête si l'attente dépasserait `_MAX_WAIT_S` (15 s).
+Plafond imposé par le timeout MIAOU→MCP suggéré par défaut, 30 s, à ne pas
+atteindre : `_MAX_WAIT_S + _FETCH_TIMEOUT_S` doit rester en dessous (test
+dédié). Attendre plutôt que refuser d'emblée : un refus pousse le modèle à
+relancer aussitôt. Les valeurs sont calibrées à l'aveugle, le seuil de DDG
+n'ayant pas été mesuré (chaque essai coûte deux heures de blocage). L'espacement
+ne protège qu'un processus : plusieurs instances derrière la même IP de sortie
+(collègues sur le même réseau) ne se coordonnent pas, seul un proxy partagé les
+couvre.
+
 ## `servers/mcp_brave.py` — recherche Brave Search (port 8770)
 
 Deux outils. Requièrent une clef d'API, résolue par `resolve_api_key()` dans cet

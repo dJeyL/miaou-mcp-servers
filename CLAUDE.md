@@ -341,8 +341,10 @@ lots — piège déjà payé côté MIAOU.
   sur les octets reçus qu'elle impose ; `_meta["miaou/web"]` de `fetch_url` — titre,
   `site_name`, URL finale, favicon reconnue aux octets et plafonnée, ICO réduit à
   une image de 32 px (`shrink_ico`), cache par origine —, la `HTTPError` fermée
-  par `_guarded_fetch`, et le retour `CallToolResult` qui l'impose), `mcp_ddg`,
-  `mcp_brave` (`resolve_api_key`, refus d'init sans clef), `mcp_docs` (obsolète mais
+  par `_guarded_fetch`, et le retour `CallToolResult` qui l'impose), `mcp_ddg`
+  (défi anti-bot reconnu à `anomaly-modal` au lieu d'un `[]` muet, blocage d'IP
+  de plus de 2 h mesuré, espacement `_MIN_INTERVAL_S`/`_MAX_WAIT_S` borné par
+  les 30 s de timeout MIAOU, sans effet entre instances), `mcp_brave` (`resolve_api_key`, refus d'init sans clef), `mcp_docs` (obsolète mais
   conservé pour le hors-connexion : sessions, pagination, `search`, `extract` hors
   `READ_CAP`, sécurité archives, locales des headings docx).
 - **`docs/proxy.md`** — `mcp_proxy/` hors auth : les trois types d'upstream
