@@ -286,6 +286,20 @@ async def test_http_upstream_bare_refusal_fails_as_before(status):
     assert failures["auto"] == failures["legacy"]
 
 
+@pytest.mark.parametrize("mode", ["auto", "legacy"])
+async def test_http_upstream_401_without_auth_block_names_the_fix(mode):
+    """Un 401 sur un upstream sans bloc `auth` : le SDK n'en rend que « Server
+    returned an error response », code perdu. L'erreur doit nommer le correctif
+    — un 403 non, ce n'est pas une autorisation manquante."""
+    async with _hosted(_http_upstream(_status_app(401), _Recorder(), protocol_era=mode)) as upstream:
+        with pytest.raises(RuntimeError, match=r'HTTP 401.*bloc "auth"'):
+            await upstream.start()
+    async with _hosted(_http_upstream(_status_app(403), _Recorder(), protocol_era=mode)) as upstream:
+        with pytest.raises(Exception) as excinfo:
+            await upstream.start()
+        assert '"auth"' not in str(excinfo.value)
+
+
 async def test_http_upstream_authorization_refusal_crosses_the_probe():
     """Avec l'OAuth sortant, le 401 est absorbé par l'`Auth` httpx2 : un parcours
     inhibé lève `AuthorizationRequired`, qui traverse la sonde sans repli —

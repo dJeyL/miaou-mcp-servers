@@ -20,7 +20,13 @@ déprécié, fait de même avec `config.api_key`.
 
 Une entrée `http` prend `url` (obligatoire, l'endpoint `/mcp` du serveur distant),
 `headers` (optionnel, en-têtes statiques — un serveur tiers peut exiger une clef d'API
-sans OAuth) et `timeout` (optionnel, défaut `_HTTP_HANDSHAKE_TIMEOUT_S` = 30 s). La
+sans OAuth), `auth` (le proxy devient client OAuth de l'upstream, cf. `docs/auth.md`)
+et `timeout` (optionnel, défaut `_HTTP_HANDSHAKE_TIMEOUT_S` = 30 s). Un upstream qui
+exige OAuth, déclaré sans `auth`, échoue au démarrage : le transport du SDK ne rend
+de ce 401 que « Server returned an error response », sans le code. Un hook de réponse
+posé par `_serve` sur le client httpx2 (`_note_refusal`, uniquement en l'absence
+d'`auth`) retient ce 401, et `start()` complète alors le message avec le correctif à
+apporter. La
 négociation MCP (sonde `server/discover`, repli éventuel sur `initialize`, cf. « Ère des
 upstreams stdio et http ») est **bornée** : un serveur distant qui accepte la connexion
 puis ne répond jamais bloquerait sinon le démarrage du proxy entier. Cette borne est une

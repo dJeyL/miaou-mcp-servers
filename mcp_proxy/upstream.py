@@ -598,6 +598,18 @@ class HttpUpstream(_RemoteSkills, Upstream):
         self._stopped: Any = None
         self._serving = False
         self._failure: BaseException | None = None
+        self._refused_401 = False
+
+    async def _note_refusal(self, response: Any) -> None:
+        """Hook de réponse httpx2 : retient un 401 reçu SANS OAuth configuré.
+
+        Le transport du SDK convertit tout non-2xx sans corps JSON-RPC en
+        « Server returned an error response », code HTTP perdu : sans cette
+        trace, un upstream OAuth déclaré sans bloc `auth` échoue sur un message
+        qui ne dit pas quoi corriger.
+        """
+        if response.status_code == 401:
+            self._refused_401 = True
 
     def _build_http_client(self) -> Any:
         """Le client HTTP de la session amont — le SEUL que l'upstream emploie.
@@ -627,6 +639,10 @@ class HttpUpstream(_RemoteSkills, Upstream):
 
         try:
             http_client = self._build_http_client()
+            # Posé ici et non dans _build_http_client, que les tests remplacent.
+            # Avec un bloc `auth`, le 401 est l'affaire de l'Auth httpx2.
+            if self._auth is None:
+                http_client.event_hooks["response"].append(self._note_refusal)
             # Transport construit ici, pas l'URL passée à `Client` : le client
             # httpx2 de _build_http_client reste le seul employé (en-têtes,
             # délais, auth OAuth, proxy réseau). `Client` négocie l'ère comme
@@ -679,6 +695,7 @@ class HttpUpstream(_RemoteSkills, Upstream):
         self._ready = anyio.Event()
         self._stopped = anyio.Event()
         self._failure = None
+        self._refused_401 = False
         self._serving = True
         self._host_task_group.start_soon(self._serve)
 
@@ -691,6 +708,12 @@ class HttpUpstream(_RemoteSkills, Upstream):
             # handshake, où l'événement d'arrêt n'est pas encore attendu : on
             # la réveille par l'événement, la borne du serve() fera le reste.
             await self.stop()
+            if failure is not None and self._refused_401:
+                raise RuntimeError(
+                    f"{failure} (HTTP 401) — ce serveur exige une autorisation "
+                    f"OAuth : ajouter un bloc \"auth\" à son entrée (cf. "
+                    f"_example_http_oauth de config.sample.json)."
+                ) from failure
             if failure is not None:
                 raise failure
             raise RuntimeError(
