@@ -10,7 +10,7 @@ réponses JSON ou SSE `event:message`/`data:`). C'est le transport implémenté 
 
 Pour connecter les serveurs depuis MIAOU → Paramètres → Serveurs MCP :
 
-| Champ | bench | weather | web | ddg | brave | docs | proxy |
+| Champ | bench | weather | web | ddg (déprécié) | brave (déprécié) | docs | proxy |
 |---|---|---|---|---|---|---|---|
 | Nom | `bench` | `weather` | `web` | `duckduckgo` | `brave` | `docs` | `proxy` |
 | URL | `:8766/mcp` | `:8767/mcp` | `:8768/mcp` | `:8769/mcp` | `:8770/mcp` | `:8771/mcp` | `:8765/mcp` |
@@ -47,6 +47,13 @@ que MIAOU affiche la source d'une citation (libellé, favicon) sans rien payer e
 Détail des champs et de leur validation : `docs/servers.md`, section `mcp_web`. `favicon`
 est une data-URL dont le type a été reconnu aux octets (PNG, ICO, GIF, JPEG, WebP ; jamais
 SVG), plafonnée à 16 384 caractères : le client la revalide quand même avant de la poser.
+
+Second usage : `search` et `image_search` de `mcp_web` posent
+`_meta["miaou/search"] = {"engine": "<nom>"}` (`brave`, `ollama`, `ddg`), le moteur
+qui a répondu dans la chaîne de repli. La clé est distincte de `miaou/web` pour ne pas
+passer pour un en-tête de page vide. Elle est absente quand aucun moteur n'a répondu :
+le résultat n'est alors qu'un texte d'échec. Le même `engine` figure dans le JSON
+servi au modèle, mais c'est la clé `_meta` qui fait foi pour l'affichage.
 
 Précédent neuf des deux côtés : jusque-là MIAOU ne lisait que le `_meta` de `tools/list`
 (`miaou/unauthorized_upstreams`), et aucun serveur de ce dépôt n'en posait sur un appel. Le

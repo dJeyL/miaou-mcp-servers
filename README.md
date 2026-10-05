@@ -10,9 +10,9 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 |---|---|---|
 | `servers/mcp_bench.py` | 8766 | Banc d'essai : echo, add, DNS, image PNG, resource JSON ; sert une skill exigée par ses outils |
 | `servers/mcp_weather.py` | 8767 | Météo réelle via wttr.in (resource JSON) |
-| `servers/mcp_web/` | 8768 | Téléchargement d'URL (HTML→texte, text/* et JSON/XML, binaire base64), package |
-| `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API |
-| `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) |
+| `servers/mcp_web/` | 8768 | Téléchargement d'URL (HTML→texte, text/* et JSON/XML, binaire base64) et recherche web/images multi-moteurs (Brave → Ollama → DuckDuckGo, ordre configurable), package |
+| `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API — **déprécié** (remplacé par `search` de `mcp_web`) |
+| `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) — **déprécié** (remplacé par `search`/`image_search` de `mcp_web`) |
 | `servers/mcp_docs/` | 8771 | Extraction PDF/Office/Zip, paginée, sessions par conversation — **obsolète, désactivé par défaut** ([pourquoi](#mcp_docs--obsolète-mais-conservé-pour-le-hors-connexion)) |
 | `mcp_proxy/` | configurable | Proxy qui agrège les serveurs ci-dessus, leurs outils et leurs skills (extension Skills de MCP) |
 
@@ -75,15 +75,19 @@ uv run servers/mcp_bench.py --transport stdio # mode stdio
 
 ```bash
 cp config.sample.json config.json
-# Éditer config.json : BRAVE_API_KEY, activer/désactiver des serveurs
+# Éditer config.json : clefs de recherche (web → config.search), activer/désactiver des serveurs
 uv run mcp_proxy
 ```
 
-`config.sample.json` active bench, weather, web et duckduckgo par défaut en
-inprocess. brave est désactivé jusqu'à ce qu'une clef d'API soit renseignée : sans
-clef il refuse de démarrer, et le proxy l'écarte en servant les autres serveurs.
-docs est désactivé lui aussi, mais pour une autre raison : il est devenu obsolète
-(voir plus bas). Dans les deux cas, retirer `disabled` suffit à le réveiller.
+`config.sample.json` active bench, weather et web par défaut en inprocess. La
+recherche de web (`search`, `image_search`) essaie Brave, Ollama puis DuckDuckGo
+dans l'ordre de `config.search.order` ; un moteur à clef sans clef
+(`config.search.brave.api_key` / `BRAVE_API_KEY`, `config.search.ollama.api_key` /
+`OLLAMA_API_KEY`) est écarté au démarrage, DuckDuckGo n'en demande pas. Si l'ordre
+ne cite que des moteurs non configurés, web refuse de démarrer et le proxy l'écarte
+en servant les autres serveurs. duckduckgo et brave, dépréciés au profit de cette
+recherche, sont désactivés ; docs l'est aussi, parce qu'il est devenu obsolète
+(voir plus bas). Retirer `disabled` suffit à réveiller chacun.
 
 ## Configuration MIAOU
 
@@ -93,14 +97,14 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 bench       → http://127.0.0.1:8766/mcp   (streamable-http)
 weather     → http://127.0.0.1:8767/mcp   (streamable-http)
 web         → http://127.0.0.1:8768/mcp   (streamable-http)
-duckduckgo  → http://127.0.0.1:8769/mcp   (streamable-http)
-brave       → http://127.0.0.1:8770/mcp   (streamable-http)
+duckduckgo  → http://127.0.0.1:8769/mcp   (streamable-http)   — déprécié
+brave       → http://127.0.0.1:8770/mcp   (streamable-http)   — déprécié
 docs        → http://127.0.0.1:8771/mcp   (streamable-http, obsolète — voir plus bas)
 proxy       → http://127.0.0.1:8765/mcp   (streamable-http)
 ```
 
 Via le proxy, les outils apparaissent préfixés : `bench__echo`, `web__fetch_url`,
-`duckduckgo__ddg_search`, `brave__brave_search`, `docs__list`, `docs__read`, etc.
+`web__search`, `web__image_search`, `docs__list`, `docs__read`, etc.
 
 ## Options CLI
 
@@ -139,12 +143,16 @@ Le proxy accepte en plus :
   "host": "127.0.0.1",
   "mcpServers": {
     "bench":      { "type": "inprocess", "module": "mcp_bench" },
-    "web":        { "type": "inprocess", "module": "mcp_web" },
-    "duckduckgo": { "type": "inprocess", "module": "mcp_ddg" },
-    "brave": {
+    "web": {
       "type": "inprocess",
-      "module": "mcp_brave",
-      "config": { "api_key": "your-key-here" }
+      "module": "mcp_web",
+      "config": {
+        "search": {
+          "order": ["brave", "ollama", "ddg"],
+          "brave":  { "api_key": "your-key-here" },
+          "ollama": { "api_key": "your-key-here" }
+        }
+      }
     },
     "docs": { "type": "inprocess", "module": "mcp_docs" }
   }
@@ -383,8 +391,8 @@ sur un serveur **réellement lancé**, en parlant le vrai streamable-http comme 
 (`initialize`, `notifications/initialized`, `tools/call`) :
 
 ```bash
-uv run tests/live_call.py brave__brave_search '{"query": "blabla"}'   # proxy, port 8765
-uv run tests/live_call.py --port 8769 ddg_search '{"query": "chat"}'  # serveur unitaire
+uv run tests/live_call.py web__search '{"query": "blabla"}'           # proxy, port 8765
+uv run tests/live_call.py --port 8768 search '{"query": "chat"}'      # serveur unitaire
 uv run tests/live_call.py --list                                      # outils exposés
 uv run tests/live_call.py --url http://192.168.42.10:8765/mcp echo '{"text": "hi"}'
 ```
@@ -420,9 +428,9 @@ miaou-mcp-servers/
 │   ├── mcp_base.py       # classe de base + make_opener() proxy-aware + extension Skills
 │   ├── mcp_bench.py      # banc d'essai (port 8766)
 │   ├── mcp_weather.py    # météo wttr.in (port 8767)
-│   ├── mcp_web/          # fetch URL (port 8768), package
-│   ├── mcp_ddg.py        # recherche DDG (port 8769)
-│   ├── mcp_brave.py      # recherche Brave (port 8770)
+│   ├── mcp_web/          # fetch URL et recherche multi-moteurs (port 8768), package
+│   ├── mcp_ddg.py        # recherche DDG (port 8769) — déprécié
+│   ├── mcp_brave.py      # recherche Brave (port 8770) — déprécié
 │   ├── skills/           # skills des serveurs mono-fichier (bench)
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — obsolète
 ├── docs/                 # documentation par domaine, pour qui modifie le code
@@ -439,6 +447,7 @@ miaou-mcp-servers/
 │   ├── test_weather.py
 │   ├── test_web.py
 │   ├── test_web_structure.py
+│   ├── test_web_search.py           # recherche multi-moteurs de mcp_web
 │   ├── test_ddg.py
 │   ├── test_brave.py
 │   ├── test_docs.py

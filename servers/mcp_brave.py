@@ -4,7 +4,9 @@
 # dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "truststore"]
 # ///
 """
-Serveur MCP Brave Search pour MIAOU.
+Serveur MCP Brave Search pour MIAOU — DÉPRÉCIÉ : la recherche passe par les
+outils `search` et `image_search` de mcp_web (moteur `brave`). Conservé le
+temps de la transition, il le signale à chaque démarrage.
 
 Transport streamable-http (single endpoint POST, réponses en SSE). CORS ouvert
 pour permettre au navigateur de l'atteindre directement depuis dist/miaou.html.
@@ -105,6 +107,12 @@ async def _brave_call(
         return f"Timeout (10 s) — {label}"
     except Exception as e:
         return f"Erreur inattendue ({type(e).__name__}: {e}) — {label}"
+
+
+DEPRECATION_NOTICE = (
+    "Attention : mcp_brave est déprécié — la recherche passe par les outils search "
+    "et image_search de mcp_web (moteur brave)."
+)
 
 
 class MissingAPIKeyError(RuntimeError):
@@ -224,7 +232,9 @@ def build(config: dict | None = None) -> MCPServer:
     appel. Le proxy rattrape cette erreur au démarrage et continue de servir les
     autres upstreams.
     """
-    return BraveServer(config).mcp
+    brave = BraveServer(config)
+    print(DEPRECATION_NOTICE, file=sys.stderr)
+    return brave.mcp
 
 
 # Singleton de compatibilité (import direct, mode standalone, tests). Contrairement
@@ -243,4 +253,5 @@ if __name__ == "__main__":
             file=sys.stderr,
         )
         raise SystemExit(1)
+    print(DEPRECATION_NOTICE, file=sys.stderr)
     server.main()

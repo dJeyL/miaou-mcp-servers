@@ -6,6 +6,14 @@ et le script d'appel réel.
 Les tests de bench mockent `asyncio.sleep` pour éviter les délais de 2 s.
 Les tests de weather, fetch, ddg et brave mockent `urllib.request.OpenerDirector.open`.
 Les tests de brave mockent aussi `os.environ` — aucun appel réseau réel, aucune clef requise.
+`test_web_search.py` (recherche multi-moteurs de `mcp_web`) mocke le même `open` avec un
+routeur par fragment d'URL (`_Router`) : chaque moteur reçoit sa réponse, les requêtes
+sont comptées par moteur pour prouver qu'un moteur en pause ou après une réponse vide
+n'est pas interrogé, et les `HTTPError` levées sont gardées pour vérifier leur
+fermeture. L'état DDG étant celui du processus (`ddg.ENGINE`), une fixture le remet à
+zéro et coupe l'espacement ; une autre retire `BRAVE_API_KEY`/`OLLAMA_API_KEY` de
+l'environnement, sans quoi la chaîne construite dépendrait du shell. Le corps du 422
+de Brave sur clef invalide y est celui mesuré le 2026-10-05.
 Les tests du proxy mockent les upstreams ou utilisent InProcessUpstream sur mcp_bench réel.
 Ils parlent au `Server` du proxy par `tests/proxy_client.py` (`list_tools`, `call_tool`) :
 un `Client(server, mode="legacy")` du SDK, donc le vrai chemin JSON-RPC de la poignée de
@@ -94,8 +102,8 @@ vrai transport streamable-http, comme MIAOU (`initialize`, `notifications/initia
 (cf. mémoire « Vérifier le transport HTTP réel »). Le serveur visé doit déjà tourner.
 
 ```bash
-uv run tests/live_call.py brave__brave_search '{"query": "blabla"}'   # proxy, port 8765
-uv run tests/live_call.py --port 8769 ddg_search '{"query": "chat"}'  # serveur unitaire
+uv run tests/live_call.py web__search '{"query": "blabla"}'           # proxy, port 8765
+uv run tests/live_call.py --port 8768 search '{"query": "chat"}'      # serveur unitaire
 uv run tests/live_call.py --list                                      # outils exposés
 uv run tests/live_call.py --url http://host:8765/mcp echo '{"text": "hi"}'
 uv run tests/live_call.py -H 'Authorization: Bearer xxx' --list   # header libre, répétable

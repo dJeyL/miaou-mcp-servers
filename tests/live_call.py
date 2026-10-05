@@ -17,8 +17,8 @@ ses extensions (Skills). `--method` envoie une requête JSON-RPC quelconque
 (`skills/list`, `resources/read`…) et affiche le résultat brut.
 
 Lancement (le serveur visé doit déjà tourner) :
-    uv run tests/live_call.py brave__brave_search '{"query": "chat"}'
-    uv run tests/live_call.py --port 8769 ddg_search '{"query": "chat"}'
+    uv run tests/live_call.py web__search '{"query": "chat"}'
+    uv run tests/live_call.py --port 8768 search '{"query": "chat"}'
     uv run tests/live_call.py --list                       # liste les outils
     uv run tests/live_call.py --url http://127.0.0.1:8766/mcp echo '{"text": "hi"}'
     uv run tests/live_call.py -H 'Authorization: Bearer xxx' --list
@@ -210,7 +210,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Appelle un outil sur un serveur MCP en streamable-http.",
     )
-    parser.add_argument("tool", nargs="?", help='nom de l\'outil (ex. "brave__brave_search")')
+    parser.add_argument("tool", nargs="?", help='nom de l\'outil (ex. "web__search")')
     parser.add_argument("arguments", nargs="?", default="{}", help='arguments JSON (ex. \'{"query": "chat"}\')')
     parser.add_argument("--port", type=int, default=8765, help="port du serveur (défaut 8765, le proxy)")
     parser.add_argument("--host", default="127.0.0.1", help="hôte du serveur (défaut 127.0.0.1)")

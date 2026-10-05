@@ -26,6 +26,14 @@ Outils exposés :
 fetch_url pose en plus, hors du contenu servi au modèle, un `_meta` destiné au
 client (clé `miaou/web` : titre, nom de site, URL finale, favicon) — cf. pagemeta.py.
 
+  - search(query, max_results=5) : recherche web multi-moteurs, repli d'un moteur
+    au suivant (Brave → Ollama → DuckDuckGo par défaut) — cf. search/.
+  - image_search(query, max_results=5) : recherche d'images, listée seulement si un
+    moteur de la chaîne sait en chercher (Brave).
+
+Config (bloc `config` de l'entrée config.json, clé `search`) : ordre des moteurs
+et clefs d'API, sinon BRAVE_API_KEY / OLLAMA_API_KEY dans l'environnement.
+
 Variables d'environnement (toutes optionnelles, défauts constants) :
     MIAOU_WEB_WORKDIR      (défaut : "./miaou-web", relatif au répertoire de travail)
     MIAOU_WEB_CACHE_TTL_H  (défaut : 24, sweep opportuniste comme mcp_docs)
@@ -34,7 +42,8 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
 
 Module éclaté en package (servers/mcp_web/) : cache.py (cache disque par checksum
 d'URL), structure.py (extraction stdlib html.parser des headings/liens), pagemeta.py
-(métadonnées de page et favicon du `_meta` de fetch_url). Ce fichier
+(métadonnées de page et favicon du `_meta` de fetch_url), search/ (moteurs de
+recherche et chaîne de repli). Ce fichier
 ne porte que le serveur MCP et ses outils.
 
 Lancement (package, pas un script plat — `uv run servers/mcp_web.py` ne s'applique
@@ -54,6 +63,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -62,6 +73,7 @@ from typing import Annotated
 
 import html2text
 from mcp import types
+from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from mcp_base import MiaouMCPBase, make_opener
@@ -77,6 +89,9 @@ from .pagemeta import (
     origin_of,
     resolve_favicon_blocking,
 )
+from .search import MAX_RESULTS, SEARCH_META_KEY, build_chain
+from .search import ddg as search_ddg
+from .search.common import SNIPPET_MAX_CHARS
 from .structure import extract_structure
 
 _DEFAULT_MAX_BYTES = 5 * 1024 * 1024  # 5 Mo
@@ -279,9 +294,12 @@ async def _favicon_for(page_url: str, icons: list[tuple[str, str]]) -> str | Non
 
 
 def _tool_result(
-    block: str | types.EmbeddedResource, web_meta: dict | None = None
+    block: str | types.EmbeddedResource,
+    web_meta: dict | None = None,
+    meta_key: str = META_KEY,
 ) -> types.CallToolResult:
-    """Résultat de fetch_url, `_meta` compris quand il y a quelque chose à dire.
+    """Résultat de fetch_url (ou de search, sous `meta_key`), `_meta` compris
+    quand il y a quelque chose à dire.
 
     `**{"_meta": ...}` et non `meta=...`, comme côté proxy : pydantic ne
     sérialise sous l'alias que si le champ a été peuplé PAR l'alias. Un texte
@@ -292,7 +310,7 @@ def _tool_result(
     )
     if not web_meta:
         return types.CallToolResult(content=content)
-    return types.CallToolResult(content=content, **{"_meta": {META_KEY: web_meta}})
+    return types.CallToolResult(content=content, **{"_meta": {meta_key: web_meta}})
 
 
 def _format_entry(index: int, entry: dict) -> str:
@@ -302,9 +320,33 @@ def _format_entry(index: int, entry: dict) -> str:
     return f"{index}. -> [{entry['text']}]({entry['url']})"
 
 
+def _search_result(query: str, kind: str, outcome: dict) -> types.CallToolResult:
+    """Résultat de search/image_search : le JSON du moteur qui a répondu, avec
+    `_meta["miaou/search"] = {"engine"}` pour le client, ou un message qui nomme
+    chaque moteur écarté et pourquoi (sans `_meta` : aucun moteur à afficher).
+    CallToolResult pour la même raison que fetch_url : seule forme qui laisse
+    poser le `_meta` d'un résultat."""
+    if outcome["engine"] is None:
+        reasons = "; ".join(f"{f['engine']} : {f['reason']}" for f in outcome["fallback"])
+        return _tool_result(f"Aucun moteur de recherche n'a répondu — {reasons}")
+    return _tool_result(
+        types.EmbeddedResource(
+            type="resource",
+            resource=types.TextResourceContents(
+                uri=f"miaou://web-{kind}/{urllib.parse.quote(query)}",  # type: ignore[arg-type]
+                mimeType="application/json",
+                text=json.dumps(outcome, ensure_ascii=False),
+            ),
+        ),
+        {"engine": outcome["engine"]},
+        SEARCH_META_KEY,
+    )
+
+
 class WebServer(MiaouMCPBase):
-    def __init__(self) -> None:
-        super().__init__("miaou-web", default_port=8768)
+    def __init__(self, config: dict | None = None) -> None:
+        super().__init__("miaou-web", default_port=8768, config=config)
+        self.search_chain = build_chain(self.config)
 
         async def fetch_url(
             url: str,
@@ -546,11 +588,88 @@ class WebServer(MiaouMCPBase):
         {web_cache.RESOURCE_MAX_BYTES} octets)."""
         self.mcp.tool(name="fetch_resource")(fetch_resource)
 
+        self._register_search_tools()
         self.finalize_tools()
 
+    def _register_search_tools(self) -> None:
+        """`search` si la chaîne a au moins un moteur web, `image_search` si
+        l'un d'eux sait chercher des images — décidé ICI, sur la config, jamais
+        sur les pannes du moment : la liste d'outils ne bouge pas en cours de
+        session. Un outil visible est un outil configuré."""
+        chain = self.search_chain
+        web_names = chain.names("web")
+        image_names = chain.names("images")
+        fallback_doc = (
+            "Moteurs, essayés dans cet ordre : {order}. Un moteur en échec ou en pause fait "
+            "passer au suivant ; `engine` nomme celui qui a répondu, `fallback` (présent "
+            "seulement s'il y en a) liste les moteurs écartés et pourquoi, et un message les "
+            "énumère si aucun n'a répondu. Un résultat vide est une réponse : il ne fait pas "
+            "passer au moteur suivant."
+        )
 
+        if web_names:
+            async def search(
+                query: str,
+                max_results: Annotated[
+                    int,
+                    Field(description=f"Nombre maximal de résultats, silencieusement ramené dans [1, {MAX_RESULTS}]."),
+                ] = 5,
+            ) -> types.CallToolResult:
+                n = max(1, min(max_results, MAX_RESULTS))
+                return _search_result(query, "search", await chain.run("web", query, n))
+
+            doc = (
+                f"Recherche web. Renvoie un objet JSON {{engine, results: [{{title, url, snippet}}], "
+                f"fallback?}} ; snippet est un extrait plafonné à {SNIPPET_MAX_CHARS} caractères — "
+                f"lire la page avec fetch_url. max_results borné à [1, {MAX_RESULTS}]. "
+                + fallback_doc.format(order=" → ".join(web_names))
+            )
+            if "ddg" in web_names:
+                doc += (
+                    f" Le moteur ddg espace ses requêtes d'au moins {search_ddg._MIN_INTERVAL_S:.0f} s : "
+                    "lancer les recherches une par une plutôt qu'en rafale."
+                )
+            search.__doc__ = doc
+            self.mcp.tool(name="search")(search)
+
+        if image_names:
+            async def image_search(
+                query: str,
+                max_results: Annotated[
+                    int,
+                    Field(description=f"Nombre maximal de résultats, silencieusement ramené dans [1, {MAX_RESULTS}]."),
+                ] = 5,
+            ) -> types.CallToolResult:
+                n = max(1, min(max_results, MAX_RESULTS))
+                return _search_result(query, "image_search", await chain.run("images", query, n))
+
+            image_search.__doc__ = (
+                f"Recherche d'images. Renvoie un objet JSON {{engine, results: [{{title, page_url, "
+                f"image_url, thumbnail_url, source}}], fallback?}} — index d'URLs seulement, pas les "
+                f"données binaires. max_results borné à [1, {MAX_RESULTS}]. "
+                + fallback_doc.format(order=" → ".join(image_names))
+            )
+            self.mcp.tool(name="image_search")(image_search)
+
+    def announce_search(self) -> None:
+        """Ligne de démarrage : chaîne de moteurs active et moteurs écartés."""
+        print(f"{self.mcp.name} : {self.search_chain.summary()}", file=sys.stderr)
+
+
+def build(config: dict | None = None) -> MCPServer:
+    """Factory appelée par InProcessUpstream.start() du proxy : une instance
+    par entrée config.json, chacune avec sa config `search` (clefs, ordre).
+    Lève SearchConfigError sur une config `search` invalide."""
+    web = WebServer(config)
+    web.announce_search()
+    return web.mcp
+
+
+# Singleton de compatibilité (import direct, mode standalone, tests) : config
+# vide, donc ordre par défaut et clefs lues dans l'environnement.
 server = WebServer()
 mcp = server.mcp  # exposé pour le proxy in-process
 
 if __name__ == "__main__":
+    server.announce_search()
     server.main()

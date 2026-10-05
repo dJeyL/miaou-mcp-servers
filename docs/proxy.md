@@ -13,9 +13,10 @@ Trois types d'upstream supportés :
 - **http** : serveur MCP distant en streamable-http (lot AB-2.1)
 
 Les entrées inprocess acceptent un champ `env` pour injecter des variables d'environnement
-avant l'import du module (`os.environ.setdefault`). `mcp_brave` lit sa clef en priorité
-dans le bloc `config` de son entrée (cf. `docs/servers.md`), et retombe sur `BRAVE_API_KEY`
-dans l'environnement.
+avant l'import du module (`os.environ.setdefault`). `mcp_web` lit les clefs de ses moteurs
+de recherche en priorité dans le bloc `config.search` de son entrée (cf. `docs/servers.md`),
+et retombe sur `BRAVE_API_KEY` / `OLLAMA_API_KEY` dans l'environnement ; `mcp_brave`,
+déprécié, fait de même avec `config.api_key`.
 
 Une entrée `http` prend `url` (obligatoire, l'endpoint `/mcp` du serveur distant),
 `headers` (optionnel, en-têtes statiques — un serveur tiers peut exiger une clef d'API
@@ -533,12 +534,10 @@ l'affaire du client.
   "host": "127.0.0.1",
   "mcpServers": {
     "bench": { "type": "inprocess", "module": "mcp_bench" },
-    "web":   { "type": "inprocess", "module": "mcp_web" },
-    "duckduckgo": { "type": "inprocess", "module": "mcp_ddg" },
-    "brave": {
+    "web": {
       "type": "inprocess",
-      "module": "mcp_brave",
-      "config": { "api_key": "your-key-here" }
+      "module": "mcp_web",
+      "config": { "search": { "order": ["brave", "ollama", "ddg"], "brave": { "api_key": "your-key-here" } } }
     },
     "docs": { "type": "inprocess", "module": "mcp_docs" },
     "_example_http": {

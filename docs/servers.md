@@ -190,10 +190,17 @@ servers/mcp_web/
 ├── __main__.py    # point d'entrée `python -m mcp_web` / `uv run servers/mcp_web`
 ├── cache.py        # cache disque par checksum d'URL (texte, HTML brut, structure JSON)
 ├── pagemeta.py     # `_meta` de fetch_url : en-tête de page, favicon validée, cache par origine
-└── structure.py    # extraction stdlib (html.parser) des headings/liens, sans dépendance tierce
+├── structure.py    # extraction stdlib (html.parser) des headings/liens, sans dépendance tierce
+└── search/         # recherche multi-moteurs (search, image_search) — section « Recherche » plus bas
+    ├── __init__.py # config `search`, build_chain, SearchChain (repli, pauses, budget)
+    ├── common.py   # EngineFailure, http_read, clean_snippet, resolve_api_key, constantes de pause
+    ├── brave.py    # Brave Search (clef ; web et images)
+    ├── ollama.py   # recherche web d'Ollama (clef ; web)
+    └── ddg.py      # DuckDuckGo HTML (sans clef ; web), espacement et défi anti-bot, ENGINE unique
 ```
 
-Quatre outils. `fetch_url(url, max_bytes=5242880)` branch sur le `Content-Type` :
+Quatre outils de téléchargement, plus deux de recherche décrits dans la section
+« Recherche » ci-dessous. `fetch_url(url, max_bytes=5242880)` branch sur le `Content-Type` :
 
 | Content-Type | Traitement | Résultat |
 |---|---|---|
@@ -357,8 +364,136 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
 | `MIAOU_WEB_READ_CAP` | `20000` | Cap de caractères en sortie de `fetch_url`/`fetch_read` |
 | `MIAOU_WEB_LIST_CAP` | `100` | Cap du nombre d'entrées en sortie de `fetch_list` |
 | `MIAOU_WEB_RESOURCE_MAX_BYTES` | `5242880` (5 Mo) | Plafond de téléchargement de `fetch_resource` (octets transférés au client) |
+| `BRAVE_API_KEY` | — | Clef du moteur `brave`, si le bloc `config` n'en donne pas |
+| `OLLAMA_API_KEY` | — | Clef du moteur `ollama`, si le bloc `config` n'en donne pas |
+
+### Recherche (`search`, `image_search`)
+
+Ces deux outils remplacent `mcp_ddg` et `mcp_brave`, dépréciés. Un seul outil par
+type de recherche, qui choisit lui-même son moteur : `search` essaie les moteurs dans
+l'ordre configuré et s'arrête au premier qui **répond**. `image_search` fait de même
+parmi les moteurs qui savent chercher des images (aujourd'hui Brave seul).
+
+**Config.** Bloc `config` de l'entrée `web` de `config.json`, clé `search` :
+`order` (défaut `["brave", "ollama", "ddg"]`), et un bloc par moteur à clef
+(`brave.api_key`, `ollama.api_key`, sinon `BRAVE_API_KEY` / `OLLAMA_API_KEY`). Le
+bloc prime sur l'environnement pour la même raison que `mcp_brave` : plusieurs
+entrées `web` peuvent porter des clefs différentes (`build(config)`, une instance par
+entrée). Règles de `build_chain` :
+
+- un moteur absent de `order` est désactivé ; `order: []` coupe la recherche ;
+- un moteur à clef sans clef est écarté, avec une ligne au démarrage ;
+- si `order` cite des moteurs et qu'**aucun** n'est utilisable, la construction
+  lève `SearchConfigError`, comme `mcp_brave` sans clef. Le proxy écarte alors
+  l'upstream entier, outils `fetch_*` compris, avec la cause sur sa ligne
+  « unavailable » ;
+- un nom inconnu ou répété lève aussi `SearchConfigError` : une faute de frappe qui
+  désactiverait un moteur en silence serait pire.
+
+`build()` imprime sur stderr la chaîne active et les moteurs écartés
+(`miaou-web : recherche via brave → ddg ; images via brave; ollama écarté (…)`), de
+même que le lancement standalone. Le singleton du module, construit sans config,
+lit l'ordre par défaut et les clefs de l'environnement ; il ne peut pas lever, `ddg`
+n'ayant pas de clef.
+
+**Listage figé à la construction.** `search` n'est enregistré que si la chaîne a un
+moteur web, `image_search` que si l'un sait chercher des images. C'est décidé sur la
+config, jamais sur les pannes du moment : la liste d'outils ne bouge pas en cours de
+session (`ToolCatalogCache` du proxy). Un moteur en panne laisse son outil listé, qui
+rend l'échec. La description de `search` cite l'ordre actif, et l'espacement DDG
+seulement si `ddg` est dans la chaîne.
+
+**Repli.** Un résultat vide est une réponse et arrête la chaîne. Replier dessus ferait
+finir sur DDG chaque requête sans résultat, alors que c'est le moteur à ménager. Un
+échec (`EngineFailure`) fait passer au suivant. Le résultat est un
+`TextResourceContents` `application/json`, URI `miaou://web-search/{query}` ou
+`miaou://web-image_search/{query}` :
+
+```json
+{"engine": "ollama", "results": [{"title": "…", "url": "…", "snippet": "…"}],
+ "fallback": [{"engine": "brave", "reason": "quota dépassé (HTTP 429)"}]}
+```
+
+`fallback` n'apparaît que si un moteur a été écarté pendant l'appel ; il dit pourquoi,
+pour le modèle comme pour l'humain qui lit la trace. Si aucun moteur n'a répondu, un
+texte énumère chacun et sa raison.
+
+Le moteur qui a répondu est aussi posé pour le **client**, hors contenu :
+`_meta["miaou/search"] = {"engine": "<nom>"}` (`SEARCH_META_KEY`). MIAOU peut ainsi
+l'afficher sans deviner, depuis le JSON, quel résultat vient d'une recherche. La clé
+est distincte de `miaou/web`, que MIAOU lit comme l'en-tête de page de `fetch_url` :
+ses champs y sont tous facultatifs, donc un `{engine}` passerait pour une source
+vide. Pas de `_meta` quand aucun moteur n'a répondu. Comme pour `fetch_url`, d'où
+`_tool_result(..., meta_key=)` partagé, le `_meta` impose de rendre un
+`CallToolResult` : pas d'`outputSchema` ni de `structuredContent`. Les résultats image ont la forme de l'ancien
+`brave_image_search` (`title, page_url, image_url, thumbnail_url, source`).
+
+**Normalisation.** Les trois moteurs rendent `{title, url, snippet}`.
+`clean_snippet` retire les balises (Brave surligne en `<strong>`), décode les
+entités, et coupe à `SNIPPET_MAX_CHARS` (400) avec « … ». C'est surtout pour Ollama,
+dont `content` est du contenu de page (« des milliers de tokens » selon sa doc). Sans
+cette coupe, le coût en tokens d'un appel dépendrait du moteur qui a répondu.
+`max_results` est ramené dans [1, `MAX_RESULTS`] = [1, 10] pour tous les moteurs
+(l'API Ollama plafonne d'ailleurs à 10).
+
+**Pauses d'un appel à l'autre.** Selon sa cause, un échec met le moteur en pause
+(`down_until`, `down_reason`). Pendant la pause, le moteur est sauté sans requête et
+apparaît dans `fallback` avec le temps restant :
+
+| Cause | Pause | Constante |
+|---|---|---|
+| Clef refusée | jusqu'au redémarrage | `KEY_REJECTED_COOLDOWN_S` (`inf`) |
+| HTTP 429 | 10 min | `QUOTA_COOLDOWN_S` |
+| Réseau, timeout, 5xx, autre 4xx, JSON illisible | 1 min | `TRANSIENT_COOLDOWN_S` |
+| Défi anti-bot DDG | 2 h 30 | `ddg.ANOMALY_COOLDOWN_S` |
+| Refus d'espacement DDG | aucune | — |
+
+Seule la pause DDG est calibrée sur une mesure (le blocage du 2026-10-05). Les autres
+sont choisies à l'aveugle, aucun quota n'ayant été mesuré.
+
+« Clef refusée » se décide par moteur (`key_rejected` passé à `http_read`), sur des
+réponses mesurées le 2026-10-05. **Ollama** répond 401, que la clef soit fausse ou
+absente. **Brave** répond **422**, pas 401, avec
+`{"error": {"code": "SUBSCRIPTION_TOKEN_INVALID", "meta": {"component":
+"authentication"}}}`. Comme Brave sert aussi le 422 pour des paramètres invalides,
+seul le composant `authentication` désigne la clef. Le corps de l'erreur est lu (au
+plus 4 Ko) avant la fermeture de la `HTTPError`. NB : `mcp_brave`, déprécié, n'a
+jamais vu ce 422 et rend « HTTP 422 » nu sur une clef invalide.
+
+**Budget de temps.** Un appel `search` dispose de `SEARCH_BUDGET_S` (25 s) pour toute
+la chaîne : il faut rester sous les 30 s de timeout MIAOU→MCP suggérés par défaut. Or
+Brave et Ollama en timeout (10 s chacun), plus l'attente puis la requête DDG,
+dépasseraient ce délai. Chaque moteur reçoit donc le temps restant, son timeout est
+raboté d'autant (`min(ENGINE_TIMEOUT_S, restant)`), et en dessous de 2 s il n'est
+même pas tenté. Le timeout urllib porte sur chaque opération socket : c'est une
+marge, pas une garantie.
+
+**Moteur DDG.** C'est le code de `mcp_ddg` repris tel quel (parser, défi
+`anomaly-modal`, espacement `_MIN_INTERVAL_S` / `_MAX_WAIT_S`), avec deux différences.
+D'abord, l'attente du créneau est aussi bornée par le budget restant : un appel
+arrivé en fin de chaîne refuse sans requête s'il ne reste pas `_MIN_FETCH_S` (3 s) de
+requête après l'attente. Ensuite, l'état (créneau, pause) est celui de l'**adresse
+IP** : un seul `ddg.ENGINE` par processus, partagé par toutes les instances de
+`mcp_web`. Il ne l'est **pas** avec `mcp_ddg`. Si les deux tournent, DuckDuckGo
+reçoit deux flux espacés chacun de son côté, d'où l'avertissement de `mcp_ddg` au
+démarrage. Le parser est dupliqué plutôt qu'importé : importer `mcp_ddg` construirait
+son serveur, et `mcp_ddg` ne peut pas importer `mcp_web` (html2text absent de son
+bloc PEP 723). La copie disparaîtra avec `mcp_ddg`.
+
+**Ajouter un moteur** (ddgs, envisagé entre Ollama et DDG) : un module dans
+`search/` avec `name`, `kinds`, `down_until`/`down_reason` et
+`async search(kind, query, n, budget_s)`, qui rend une liste normalisée ou lève
+`EngineFailure`. Puis son entrée dans `ENGINE_NAMES`/`DEFAULT_ORDER`, et dans
+`_KEYED` s'il prend une clef. Pour ddgs en particulier, avant de l'intégrer : son
+backend `duckduckgo` frappe le même DDG hors de notre espacement, et `primp` a sa
+propre pile TLS, a priori hors de portée de `truststore` (non mesuré).
 
 ## `servers/mcp_ddg.py` — recherche DuckDuckGo (port 8769)
+
+> **Déprécié** : remplacé par `search` de `mcp_web` (moteur `ddg`, mêmes protections),
+> `disabled: true` dans `config.sample.json`. Il imprime un avertissement à chaque
+> démarrage (`build()`, qui rend le singleton, et le lancement standalone). Actif à
+> côté de `mcp_web`, il ne partage pas son espacement vers DuckDuckGo.
 
 Un seul outil `ddg_search(query, max_results=5)`. POST sur l'endpoint HTML de DDG
 (`html.duckduckgo.com/html/`), parsing stdlib uniquement (classes `result__a` /
@@ -375,7 +510,7 @@ et durée pour une autre IP inconnus. Le parser n'y trouvait aucun `result__a` e
 l'outil rendait `[]`, indiscernable d'une recherche vide. La page est reconnue à
 sa classe `anomaly-modal` (seulement quand aucun résultat n'a été extrait) et
 l'outil rend un message explicite à la place. Le défi n'est pas contourné : la
-seule issue est d'attendre, ou de passer par `mcp_brave`.
+seule issue est d'attendre, ou de passer par un autre moteur (`search` de `mcp_web`).
 
 Pour ne pas le déclencher soi-même, les requêtes sortantes d'un processus sont
 espacées d'au moins `_MIN_INTERVAL_S` (15 s) : un appel attend son créneau,
@@ -391,6 +526,10 @@ ne protège qu'un processus : plusieurs instances derrière la même IP de sorti
 couvre.
 
 ## `servers/mcp_brave.py` — recherche Brave Search (port 8770)
+
+> **Déprécié** : remplacé par `search` / `image_search` de `mcp_web` (moteur `brave`),
+> `disabled: true` dans `config.sample.json`. Il imprime un avertissement à chaque
+> démarrage (`build()` et le lancement standalone).
 
 Deux outils. Requièrent une clef d'API, résolue par `resolve_api_key()` dans cet
 ordre : clé `api_key` du bloc `config` de l'entrée `config.json` (mode inprocess),

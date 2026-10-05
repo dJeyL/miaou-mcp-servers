@@ -39,9 +39,9 @@ miaou-mcp-servers/
 │   ├── mcp_base.py       # classe de base partagée (MiaouMCPBase + make_opener + extension Skills)
 │   ├── mcp_bench.py      # banc d'essai général (port 8766)
 │   ├── mcp_weather.py    # météo réelle via wttr.in (port 8767)
-│   ├── mcp_web/          # téléchargement d'URL (port 8768), package — `_meta` client sur fetch_url
-│   ├── mcp_ddg.py        # recherche DuckDuckGo HTML (port 8769)
-│   ├── mcp_brave.py      # recherche Brave Search API (port 8770)
+│   ├── mcp_web/          # téléchargement d'URL et recherche multi-moteurs (port 8768), package — `_meta` client sur fetch_url, `search/` = un module par moteur
+│   ├── mcp_ddg.py        # recherche DuckDuckGo HTML (port 8769) — DÉPRÉCIÉ, désactivé par défaut
+│   ├── mcp_brave.py      # recherche Brave Search API (port 8770) — DÉPRÉCIÉ, désactivé par défaut
 │   ├── skills/           # skills des serveurs mono-fichier : skills/<serveur>/<skill>/SKILL.md
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — OBSOLÈTE, désactivé par défaut
 ├── docs/                 # domaines détaillés, lus à la demande (voir index en fin de fichier)
@@ -60,6 +60,7 @@ miaou-mcp-servers/
 │   ├── test_web.py
 │   ├── test_web_structure.py
 │   ├── test_web_pagemeta.py  # `_meta` de fetch_url : titre, site, URL finale, favicon (lot AI)
+│   ├── test_web_search.py  # search/image_search : chaîne de repli, pauses, budget, config
 │   ├── test_ddg.py
 │   ├── test_brave.py
 │   ├── test_docs.py
@@ -91,9 +92,9 @@ Six serveurs de banc d'essai plus un proxy qui les agrège. Le détail de chacun
 |---|---|---|---|
 | `mcp_bench.py` | 8766 | Banc d'essai général : exerce les chemins de résultat de MIAOU (texte, image, resource) | `echo`, `add`, `sleep`, `dns_lookup`, `reverse_dns`, `get_image`, `get_json_resource` |
 | `mcp_weather.py` | 8767 | Météo réelle via wttr.in | `get_weather` (`astronomy`, `hourly`, `extract`) |
-| `mcp_web/` | 8768 | Téléchargement d'URL, cache disque par checksum, pagination | `fetch_url`, `fetch_read`, `fetch_list`, `fetch_resource` |
-| `mcp_ddg.py` | 8769 | Recherche DuckDuckGo (HTML scrapé) | `ddg_search` |
-| `mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) | `brave_search`, `brave_image_search` |
+| `mcp_web/` | 8768 | Téléchargement d'URL, cache disque par checksum, pagination ; recherche multi-moteurs (Brave → Ollama → DDG, ordre en config) | `fetch_url`, `fetch_read`, `fetch_list`, `fetch_resource`, `search`, `image_search` (si un moteur sait chercher des images) |
+| `mcp_ddg.py` | 8769 | Recherche DuckDuckGo (HTML scrapé) — **déprécié** | `ddg_search` |
+| `mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) — **déprécié** | `brave_search`, `brave_image_search` |
 | `mcp_docs/` | 8771 | Extraction PDF/Office/Zip — **obsolète, désactivé par défaut** | `list`, `read`, `search`, `extract`, `drop_session` |
 | `mcp_proxy/` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) et les skills | (+ `status` si auth sortante, `read_skill` si une skill est servie) |
 
@@ -103,9 +104,14 @@ Deux points qu'on ne devine pas depuis le tableau :
   Il reste pour le travail **hors connexion** (l'ouverture native télécharge ses
   moteurs depuis un CDN). Ne pas « faire le ménage » dans ce package au motif qu'il
   ne sert plus par défaut.
-- **`mcp_brave` refuse de s'initialiser sans clef** — plutôt qu'exposer deux outils
-  qui échoueraient à chaque appel. Côté proxy, l'upstream est retiré de la table de
-  routage et les autres démarrent normalement.
+- **`mcp_ddg` et `mcp_brave` sont dépréciés** — remplacés par `search`/`image_search`
+  de `mcp_web`, désactivés dans `config.sample.json`, conservés le temps de la
+  transition (avertissement à chaque démarrage). `mcp_ddg` actif à côté de `mcp_web`
+  ne partage pas son espacement vers DuckDuckGo.
+- **Pas d'outil sans config fonctionnelle** — `mcp_brave` refuse de s'initialiser sans
+  clef, et `mcp_web` refuse de même si `config.search.order` ne cite que des moteurs
+  non configurés (ce qui emporte aussi ses `fetch_*`). Côté proxy, l'upstream est
+  retiré de la table de routage et les autres démarrent normalement.
 
 ## Lancement
 
@@ -122,14 +128,14 @@ uv run servers/mcp_bench.py --host 0.0.0.0           # toutes interfaces
 
 uv run servers/mcp_weather.py                        # HTTP 127.0.0.1:8767
 uv run servers/mcp_ddg.py                            # HTTP 127.0.0.1:8769
-BRAVE_API_KEY=<key> uv run servers/mcp_brave.py      # HTTP 127.0.0.1:8770
+BRAVE_API_KEY=<key> uv run servers/mcp_brave.py      # HTTP 127.0.0.1:8770 (déprécié, comme mcp_ddg)
 
 # mcp_web et mcp_docs sont des packages (pas des scripts plats) — lancement différent :
 uv run --directory servers python -m mcp_web         # HTTP 127.0.0.1:8768
 uv run --directory servers python -m mcp_docs        # HTTP 127.0.0.1:8771
 
 # Proxy (agrège tout sur un seul port)
-cp config.sample.json config.json     # puis éditer config.json (BRAVE_API_KEY, etc.)
+cp config.sample.json config.json     # puis éditer config.json (clefs de config.search de web, etc.)
 uv run mcp_proxy                        # port défini dans config.json
 uv run mcp_proxy --port 8765            # override port
 uv run mcp_proxy --config autre.json
@@ -341,10 +347,17 @@ lots — piège déjà payé côté MIAOU.
   sur les octets reçus qu'elle impose ; `_meta["miaou/web"]` de `fetch_url` — titre,
   `site_name`, URL finale, favicon reconnue aux octets et plafonnée, ICO réduit à
   une image de 32 px (`shrink_ico`), cache par origine —, la `HTTPError` fermée
-  par `_guarded_fetch`, et le retour `CallToolResult` qui l'impose), `mcp_ddg`
-  (défi anti-bot reconnu à `anomaly-modal` au lieu d'un `[]` muet, blocage d'IP
+  par `_guarded_fetch`, et le retour `CallToolResult` qui l'impose ; recherche
+  `search`/`image_search` — config `search` et `build_chain` (`order`, clefs, refus
+  `SearchConfigError` si aucun moteur cité n'est utilisable), listage figé à la
+  construction, vide = réponse, `fallback`, `_meta["miaou/search"]` = moteur
+  pour le client, `clean_snippet` et `MAX_RESULTS` = 10,
+  pauses par cause dont la clef refusée de Brave en 422 mesurée, budget
+  `SEARCH_BUDGET_S` raboté par moteur, `ddg.ENGINE` unique par processus et non
+  partagé avec `mcp_ddg`, ajout d'un moteur et réserves sur ddgs), `mcp_ddg`
+  — déprécié — (défi anti-bot reconnu à `anomaly-modal` au lieu d'un `[]` muet, blocage d'IP
   de plus de 2 h mesuré, espacement `_MIN_INTERVAL_S`/`_MAX_WAIT_S` borné par
-  les 30 s de timeout MIAOU, sans effet entre instances), `mcp_brave` (`resolve_api_key`, refus d'init sans clef), `mcp_docs` (obsolète mais
+  les 30 s de timeout MIAOU, sans effet entre instances), `mcp_brave` — déprécié — (`resolve_api_key`, refus d'init sans clef), `mcp_docs` (obsolète mais
   conservé pour le hors-connexion : sessions, pagination, `search`, `extract` hors
   `READ_CAP`, sécurité archives, locales des headings docx).
 - **`docs/proxy.md`** — `mcp_proxy/` hors auth : les trois types d'upstream
@@ -438,7 +451,8 @@ lots — piège déjà payé côté MIAOU.
   résultat, le champ `instructions` de l'`InitializeResult` que MIAOU lit et
   injecte dans le system prompt (et le préambule qu'il re-préfixe, étant seul à
   connaître son slug), le `_meta` d'un résultat `tools/call` adressé au client
-  (`miaou/web`, premier usage ; jamais le `serverInfo` d'un upstream),
+  (`miaou/web` de `fetch_url`, premier usage ; `miaou/search` = moteur de
+  `search`/`image_search` ; jamais le `serverInfo` d'un upstream),
   `x-mcp-header` absent des schémas du proxy (aucun `Mcp-Param-*` à poser), les skills servies par le proxy (capacités par ère,
   et dès qu'un upstream stdio/http moderne déclare l'extension, URI préfixées,
   `skills/*` aux indices de cache les plus restrictifs et aux entrées tierces

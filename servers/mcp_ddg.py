@@ -4,7 +4,9 @@
 # dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "truststore"]
 # ///
 """
-Serveur MCP DuckDuckGo pour MIAOU.
+Serveur MCP DuckDuckGo pour MIAOU — DÉPRÉCIÉ : la recherche passe par l'outil
+`search` de mcp_web (moteur `ddg`, mêmes protections). Conservé le temps de la
+transition, il le signale à chaque démarrage.
 
 Transport streamable-http (single endpoint POST, réponses en SSE). CORS ouvert
 pour permettre au navigateur de l'atteindre directement depuis dist/miaou.html.
@@ -31,6 +33,7 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 import asyncio
 import json
 import math
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -39,6 +42,7 @@ from html.parser import HTMLParser
 from typing import Annotated
 
 from mcp import types
+from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from mcp_base import MiaouMCPBase, make_opener
@@ -198,8 +202,24 @@ class DDGServer(MiaouMCPBase):
         self.finalize_tools()
 
 
+DEPRECATION_NOTICE = (
+    "Attention : mcp_ddg est déprécié — la recherche passe par l'outil search de "
+    "mcp_web (moteur ddg). Actif en même temps que lui, il ne partage pas son "
+    "espacement des requêtes : DuckDuckGo reçoit les deux flux depuis la même adresse IP."
+)
+
+
+def build(config: dict | None = None) -> MCPServer:
+    """Factory appelée par InProcessUpstream.start() du proxy : signale la
+    dépréciation et rend le singleton — une seule instance, donc un seul
+    espacement, quel que soit le nombre d'entrées."""
+    print(DEPRECATION_NOTICE, file=sys.stderr)
+    return server.mcp
+
+
 server = DDGServer()
 mcp = server.mcp  # exposé pour le proxy in-process
 
 if __name__ == "__main__":
+    print(DEPRECATION_NOTICE, file=sys.stderr)
     server.main()
