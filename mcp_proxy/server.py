@@ -493,6 +493,11 @@ def aggregate_instructions(
     `skill://` préfixées (`prefix_free_text_skill_uris`), comme celles de ses
     entrées.
 
+    La consigne posée par la config du proxy (`config_instructions`) suit
+    celle de l'upstream, et a une section à elle seule s'il n'en déclare pas.
+    Ses URI `skill://` ne sont PAS préfixées : écrite par l'opérateur du proxy,
+    elle est réputée viser déjà l'espace de noms publié.
+
     `skills_blocks` (cf. `skills.build_skills_blocks`) : bloc généré qui
     TERMINE la section de l'upstream, après son texte libre ; un upstream qui
     sert des skills sans déclarer d'instructions a une section pour son bloc
@@ -508,6 +513,8 @@ def aggregate_instructions(
         parts = []
         if upstream.instructions and upstream.instructions.strip():
             parts.append(prefix_free_text_skill_uris(prefix, upstream, upstream.instructions.strip()))
+        if upstream.config_instructions and upstream.config_instructions.strip():
+            parts.append(upstream.config_instructions.strip())
         if skills_blocks.get(prefix):
             parts.append(skills_blocks[prefix])
         if parts:

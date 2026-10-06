@@ -296,11 +296,14 @@ déclare. **Le titre de section est le préfixe d'outil** (`bench` pour
 modèle sans convention supplémentaire à lui faire connaître. La section d'un
 upstream qui sert des skills se TERMINE par un bloc généré (cf. « Extension
 Skills » ci-dessous), et un upstream qui en sert sans déclarer d'instructions a
-une section pour ce bloc seul. Un upstream sans instructions ni skills n'a pas
+une section pour ce bloc seul. La clé `instructions` d'une entrée `config.json`
+ajoute une consigne de l'opérateur (`Upstream.config_instructions`, posée par
+`build_upstreams()`) : elle suit le texte de l'upstream et précède le bloc des skills,
+ou ouvre seule la section d'un upstream muet. Un upstream sans instructions ni skills n'a pas
 de section ; si aucun n'en a, le champ vaut `None` et l'`InitializeResult` est
 celui d'avant le lot, à l'octet près.
 
-Trois points qui ne se devinent pas :
+Quatre points qui ne se devinent pas :
 
 - **Écriture différée, pas paramètre de construction.** `build_proxy_server()`
   s'exécute AVANT `start()` : les instructions y seraient vides pour tout le
@@ -328,6 +331,13 @@ Trois points qui ne se devinent pas :
   démarrage, qui n'avait jamais été interrogé, apparaît à la connexion suivante
   (`docs/auth.md`). Observé au passage sur un upstream Jira derrière WSO2 : `tools/list`
   y répond avant autorisation, seul `tools/call` refuse.
+
+- **La consigne de la config n'est pas re-préfixée.** Le texte d'un upstream dont
+  les skills sont relayées voit ses URI `skill://` passées dans l'espace de noms du
+  proxy ; celle de l'opérateur, non : écrite pour la surface publiée, elle est réputée
+  la viser déjà. Elle vit dans la section de son upstream et en partage le sort : gardée
+  pour un upstream non autorisé, emportée avec lui quand `start()` échoue et qu'il est
+  retiré de la table.
 
 Le champ n'atteint le modèle que si le CLIENT le lit et l'injecte dans son system
 prompt : le proxy le publie correctement, mais un client qui ignore
@@ -572,6 +582,10 @@ de config signalée au démarrage.
 `"disabled": true` sur une entrée `mcpServers` → upstream ignoré au démarrage.
 L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'est plus celle qu'on écrit — dans ce fichier, un souligné en tête signale ailleurs (`_comment`) une clé ignorée, ce que cet interrupteur n'est justement pas. Le proxy le signale au démarrage, une ligne par bloc concerné, pour que la migration se voie plutôt que de traîner indéfiniment ; une config déjà en `disabled` ne dit rien.
 `env` sur une entrée inprocess → variables posées via `os.environ.setdefault` avant l'import.
+`instructions` (chaîne, tout type d'entrée) → consigne ajoutée par l'opérateur à la
+section de cet upstream dans les `instructions` du proxy, après celle que l'upstream
+publie — cf. « Consigne de portée serveur ». Une valeur qui n'est pas une chaîne est
+une erreur de config signalée au démarrage.
 
 ### Multi-instance inprocess (clé `config`)
 

@@ -33,6 +33,16 @@ def _protocol_era(name: str, srv: dict[str, Any]) -> str:
     return era
 
 
+def _config_instructions(name: str, srv: dict[str, Any]) -> str | None:
+    text = srv.get("instructions")
+    if text is not None and not isinstance(text, str):
+        raise ValueError(
+            f"Serveur '{name}' : 'instructions' doit être une chaîne, "
+            f"reçu {type(text).__name__}."
+        )
+    return text
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     try:
         cfg = json.loads(Path(path).read_text())
@@ -94,4 +104,5 @@ def build_upstreams(
             )
         else:
             raise ValueError(f"Type de serveur inconnu pour '{name}': '{srv_type}'.")
+        upstreams[name].config_instructions = _config_instructions(name, srv)
     return upstreams

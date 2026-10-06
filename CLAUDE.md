@@ -381,7 +381,9 @@ lots — piège déjà payé côté MIAOU.
   `HttpUpstream._build_http_client` sur lequel portent les tests `trust_env`, et
   `aggregate_instructions` (consigne de portée serveur : les trois captures par type
   d'upstream, la section titrée par le préfixe d'outil, l'écriture différée après
-  `start()`, le préambule non préfixé que le client re-préfixant doit réécrire).
+  `start()`, le préambule non préfixé que le client re-préfixant doit réécrire, la
+  clé `instructions` d'une entrée `config.json` ajoutée après le texte de
+  l'upstream et avant le bloc des skills, sans re-préfixage de ses URI).
   Ère des upstreams stdio/http : `Client(<transport>, mode, cache=None)` du SDK
   (sonde `server/discover`, repli sur `initialize` y compris sur délai de 10 s et
   sur 4xx nu, panne jamais prise pour un verdict d'ère), borne inchangée, session

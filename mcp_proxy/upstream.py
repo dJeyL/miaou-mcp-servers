@@ -27,6 +27,12 @@ class Upstream(ABC):
     # aggregate_instructions().
     instructions: str | None = None
 
+    # Consigne ajoutée par la config du proxy (clé `instructions` de l'entrée
+    # `mcpServers`), publiée APRÈS celle de l'upstream dans sa section. Posée
+    # par build_upstreams(), jamais par start() : elle ne dépend d'aucun
+    # échange avec l'upstream.
+    config_instructions: str | None = None
+
     # Ère et capacités négociées avec un upstream stdio ou http : version de
     # protocole retenue (`2026-07-28` pour l'ère moderne, `2025-11-25` pour un
     # serveur qui ne parle que `initialize`) et `ServerCapabilities` de

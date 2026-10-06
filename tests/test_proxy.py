@@ -123,6 +123,35 @@ def test_build_upstreams_rejects_a_misplaced_or_unknown_protocol_era(entry, matc
         build_upstreams({"port": 8765, "mcpServers": {"x": entry}})
 
 
+def test_build_upstreams_config_instructions_key():
+    """`instructions` d'une entrée est posée sur l'upstream, quel que soit son
+    type, sans attendre start() : elle ne dépend d'aucun échange avec lui."""
+    cfg = {
+        "port": 8765,
+        "mcpServers": {
+            "s": {"command": "uv", "instructions": "consigne stdio"},
+            "h": {"type": "http", "url": "http://127.0.0.1:9/mcp", "instructions": "consigne http"},
+            "i": {"type": "inprocess", "module": "mcp_bench", "instructions": "consigne inprocess"},
+            "n": {"command": "uv"},
+        },
+    }
+    upstreams = build_upstreams(cfg)
+    assert {name: up.config_instructions for name, up in upstreams.items()} == {
+        "s": "consigne stdio",
+        "h": "consigne http",
+        "i": "consigne inprocess",
+        "n": None,
+    }
+
+
+@pytest.mark.parametrize("value", [["ligne"], {"a": 1}, 42])
+def test_build_upstreams_rejects_non_string_instructions(value):
+    """Une consigne qui n'est pas une chaîne est une erreur de config signalée au
+    démarrage, pas un objet rendu par str() dans le system prompt du client."""
+    with pytest.raises(ValueError, match="'instructions'"):
+        build_upstreams({"port": 8765, "mcpServers": {"x": {"command": "uv", "instructions": value}}})
+
+
 def test_build_upstreams_unknown_type():
     cfg = {
         "port": 8765,
@@ -1313,6 +1342,55 @@ def test_aggregate_instructions_publishes_unauthorized_upstream():
     assert "Consigne d'un upstream pas encore autorisé." in text
 
 
+def test_aggregate_instructions_appends_config_instructions():
+    """La consigne de la config suit celle de l'upstream, dans SA section — et
+    ne la remplace pas."""
+    up = _InstructedUpstream("Consigne du serveur.")
+    up.instructions = up._text
+    up.config_instructions = "  Consigne de l'opérateur.\n"
+    text = mcp_proxy.aggregate_instructions({"bench": up})
+    assert text.endswith("## bench\n\nConsigne du serveur.\n\nConsigne de l'opérateur.")
+
+
+def test_aggregate_instructions_config_instructions_alone_opens_a_section():
+    """Un upstream muet reçoit une section pour la seule consigne de la config ;
+    une consigne blanche n'en ouvre pas."""
+    ups = {"quiet": _InstructedUpstream(None), "blank": _InstructedUpstream(None)}
+    ups["quiet"].config_instructions = "Consigne de l'opérateur."
+    ups["blank"].config_instructions = "  \n "
+    text = mcp_proxy.aggregate_instructions(ups)
+    assert text.endswith("## quiet\n\nConsigne de l'opérateur.")
+    assert "## blank" not in text
+
+
+def test_aggregate_instructions_config_instructions_precede_skills_block():
+    """Le bloc généré des skills TERMINE la section : la consigne de la config
+    s'insère avant lui, après le texte de l'upstream."""
+    up = _InstructedUpstream("Consigne du serveur.")
+    up.instructions = up._text
+    up.config_instructions = "Consigne de l'opérateur."
+    text = mcp_proxy.aggregate_instructions({"bench": up}, {"bench": "BLOC SKILLS"})
+    assert text.endswith(
+        "## bench\n\nConsigne du serveur.\n\nConsigne de l'opérateur.\n\nBLOC SKILLS"
+    )
+
+
+def test_aggregate_instructions_config_instructions_keep_skill_uris():
+    """Écrite par l'opérateur du proxy, la consigne de la config vise déjà
+    l'espace de noms publié : ses URI `skill://` ne sont pas re-préfixées,
+    même pour un upstream dont les skills sont relayées."""
+
+    class _Relaying(_InstructedUpstream):
+        serves_skills = True
+
+    up = _Relaying("Lire skill://usage/SKILL.md.")
+    up.instructions = up._text
+    up.config_instructions = "Lire aussi skill://remote/usage/SKILL.md."
+    text = mcp_proxy.aggregate_instructions({"remote": up})
+    assert "Lire skill://remote/usage/SKILL.md." in text
+    assert "Lire aussi skill://remote/usage/SKILL.md." in text
+
+
 @pytest.mark.asyncio
 async def test_lifespan_publishes_instructions_after_start():
     """La construction du Server précède start() : les instructions y seraient
@@ -1334,6 +1412,28 @@ async def test_lifespan_publishes_instructions_after_start():
         # Ce que verra le client, via le même chemin que le SDK.
         opts = server.create_initialization_options()
         assert opts.instructions == server.instructions
+
+
+@pytest.mark.asyncio
+async def test_lifespan_publishes_config_instructions():
+    """Chemin complet depuis la config : la consigne de l'entrée arrive dans
+    l'InitializeResult, après celle que l'upstream publie lui-même."""
+    upstreams = build_upstreams({
+        "port": 8765,
+        "mcpServers": {
+            "bench": {"type": "inprocess", "module": "mcp_bench", "instructions": "Consigne de l'opérateur."},
+        },
+    })
+    server = build_proxy_server(upstreams, {})
+    app = build_app(server, upstreams)
+    async with _run_lifespan(app):
+        import mcp_bench
+
+        text = server.create_initialization_options().instructions
+        section = text.split("## bench\n\n", 1)[1]
+        own = mcp_bench.mcp.instructions.strip()
+        assert section.startswith(own)
+        assert section.index(own) < section.index("Consigne de l'opérateur.")
 
 
 @pytest.mark.asyncio
