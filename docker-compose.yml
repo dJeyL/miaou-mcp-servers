@@ -4,7 +4,9 @@ services:
     image: miaou-mcp
     container_name: miaou-mcp
     ports:
-      - "8765:8765"
+      # MIAOU_MCP_BIND=127.0.0.1 publie le port sur la boucle locale seulement
+      # (derrière un reverse proxy de l'hôte) ; par défaut, toutes les interfaces.
+      - "${MIAOU_MCP_BIND:-0.0.0.0}:8765:8765"
     environment:
       # Dossiers de travail des upstreams inprocess qui font du cache disque —
       # sans ça, ils écrivent dans le répertoire de travail du conteneur
