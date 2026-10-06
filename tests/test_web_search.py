@@ -391,6 +391,49 @@ def test_search_not_listed_without_any_engine():
     assert "fetch_url" in names
 
 
+def test_search_false_disables_search_like_empty_order(capsys):
+    server = mcp_web.WebServer({"search": False})
+    names = _tool_names(server)
+    assert "search" not in names and "image_search" not in names
+    assert "fetch_url" in names
+    server.announce_search()
+    assert "miaou-web : recherche désactivée" in capsys.readouterr().err
+
+
+def test_search_true_means_default_config():
+    assert mcp_web.WebServer({"search": True}).search_chain.names("web") == \
+        mcp_web.WebServer({}).search_chain.names("web")
+
+
+def test_fetch_false_removes_every_fetch_tool(capsys):
+    server = mcp_web.WebServer({"fetch": False, "search": {"order": ["ddg"]}})
+    assert _tool_names(server) == {"search"}
+    # La description de search ne renvoie plus vers un fetch_url absent.
+    tools = {t.name: t for t in server.mcp._tool_manager.list_tools()}
+    assert "fetch_url" not in tools["search"].description
+    server.announce_search()
+    assert "fetch_* désactivés (config fetch: false)" in capsys.readouterr().err
+
+
+def test_fetch_true_or_absent_keeps_fetch_tools():
+    fetch_tools = {"fetch_url", "fetch_read", "fetch_list", "fetch_resource"}
+    assert fetch_tools <= _tool_names(mcp_web.WebServer({"fetch": True, "search": False}))
+    assert fetch_tools <= _tool_names(_server())
+    tools = {t.name: t for t in _server().mcp._tool_manager.list_tools()}
+    assert "lire la page avec fetch_url" in tools["search"].description
+
+
+@pytest.mark.parametrize("search_cfg", [False, {"order": []}])
+def test_fetch_and_search_both_off_fails_construction(search_cfg):
+    with pytest.raises(mcp_web.WebConfigError, match="aucun outil"):
+        mcp_web.build({"fetch": False, "search": search_cfg})
+
+
+def test_non_boolean_fetch_fails_construction():
+    with pytest.raises(mcp_web.WebConfigError, match="booléen"):
+        mcp_web.build({"fetch": "no"})
+
+
 def test_no_usable_engine_refuses_construction_like_brave():
     """Moteurs demandés mais aucun configuré : refus, avec la cause de chacun."""
     with pytest.raises(web_search.SearchConfigError) as exc:
@@ -425,7 +468,7 @@ def test_config_key_takes_precedence_over_env(monkeypatch):
         ({"order": ["brave", "bing"]}, "moteur inconnu « bing »"),
         ({"order": ["ddg", "ddg"]}, "« ddg » répété"),
         ({"order": "ddg"}, "liste"),
-        ("ddg", "objet attendu"),
+        ("ddg", "objet ou booléen attendu"),
     ],
 )
 def test_invalid_search_config_fails_construction(search_cfg, fragment):

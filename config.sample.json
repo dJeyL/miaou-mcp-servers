@@ -28,13 +28,14 @@
       "type": "inprocess",
       "module": "mcp_web",
       "config": {
+        "fetch": true,
         "search": {
           "order": ["brave", "ollama", "ddg"],
           "brave": { "api_key": "" },
           "ollama": { "api_key": "" }
         }
       },
-      "_comment": "Télécharge des URLs (fetch_*) et cherche sur le web (search, image_search). La recherche essaie les moteurs dans l'ordre de search.order et passe au suivant sur un échec. Un moteur à clef sans clef (ici vide, ni BRAVE_API_KEY / OLLAMA_API_KEY dans l'environnement) est écarté au démarrage ; ddg n'en demande pas. Retirer un nom de 'order' désactive le moteur ; un nom inconnu fait échouer le démarrage de l'upstream. image_search n'est listé que si un moteur de la chaîne sait chercher des images (brave)."
+      "_comment": "Télécharge des URLs (fetch_*) et cherche sur le web (search, image_search). La recherche essaie les moteurs dans l'ordre de search.order et passe au suivant sur un échec. Un moteur à clef sans clef (ici vide, ni BRAVE_API_KEY / OLLAMA_API_KEY dans l'environnement) est écarté au démarrage ; ddg n'en demande pas. Retirer un nom de 'order' désactive le moteur ; un nom inconnu fait échouer le démarrage de l'upstream. image_search n'est listé que si un moteur de la chaîne sait chercher des images (brave). 'fetch': false retire les outils fetch_* ; 'search': false (ou 'order' vide) retire la recherche."
     },
     "duckduckgo": {
       "disabled": true,

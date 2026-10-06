@@ -347,8 +347,9 @@ lots — piège déjà payé côté MIAOU.
   sur les octets reçus qu'elle impose ; `_meta["miaou/web"]` de `fetch_url` — titre,
   `site_name`, URL finale, favicon reconnue aux octets et plafonnée, ICO réduit à
   une image de 32 px (`shrink_ico`), cache par origine —, la `HTTPError` fermée
-  par `_guarded_fetch`, et le retour `CallToolResult` qui l'impose ; recherche
-  `search`/`image_search` — config `search` et `build_chain` (`order`, clefs, refus
+  par `_guarded_fetch`, et le retour `CallToolResult` qui l'impose ; `"fetch": false` qui
+  retire les quatre `fetch_*` ; recherche
+  `search`/`image_search` — config `search` et `build_chain` (`order`, `false`, clefs, refus
   `SearchConfigError` si aucun moteur cité n'est utilisable), listage figé à la
   construction, vide = réponse, `fallback`, `_meta["miaou/search"]` = moteur
   pour le client, `clean_snippet` et `MAX_RESULTS` = 10,

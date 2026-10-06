@@ -31,8 +31,9 @@ client (clé `miaou/web` : titre, nom de site, URL finale, favicon) — cf. page
   - image_search(query, max_results=5) : recherche d'images, listée seulement si un
     moteur de la chaîne sait en chercher (Brave).
 
-Config (bloc `config` de l'entrée config.json, clé `search`) : ordre des moteurs
-et clefs d'API, sinon BRAVE_API_KEY / OLLAMA_API_KEY dans l'environnement.
+Config (bloc `config` de l'entrée config.json) : clé `search`, ordre des moteurs
+et clefs d'API, sinon BRAVE_API_KEY / OLLAMA_API_KEY dans l'environnement, ou
+`false` pour couper la recherche ; clé `fetch`, `false` pour retirer les fetch_*.
 
 Variables d'environnement (toutes optionnelles, défauts constants) :
     MIAOU_WEB_WORKDIR      (défaut : "./miaou-web", relatif au répertoire de travail)
@@ -343,10 +344,34 @@ def _search_result(query: str, kind: str, outcome: dict) -> types.CallToolResult
     )
 
 
+class WebConfigError(ValueError):
+    """Config de mcp_web invalide hors du bloc `search` (cf. SearchConfigError)."""
+
+
 class WebServer(MiaouMCPBase):
     def __init__(self, config: dict | None = None) -> None:
         super().__init__("miaou-web", default_port=8768, config=config)
+        fetch = self.config.get("fetch", True)
+        if not isinstance(fetch, bool):
+            raise WebConfigError("config « fetch » : booléen attendu")
+        self.fetch_enabled = fetch
         self.search_chain = build_chain(self.config)
+        if not self.fetch_enabled and not self.search_chain.engines:
+            # Une entrée active sans aucun outil est une config à corriger, à
+            # dire au boot ; `"disabled": true` est le moyen de la couper.
+            raise WebConfigError(
+                "aucun outil : fetch et recherche désactivés par la config "
+                "(« disabled »: true sur l'entrée pour la couper)"
+            )
+        if self.fetch_enabled:
+            self._register_fetch_tools()
+        self._register_search_tools()
+        self.finalize_tools()
+
+    def _register_fetch_tools(self) -> None:
+        """fetch_url, fetch_read, fetch_list, fetch_resource : tous ou aucun
+        (`config.fetch`), les trois derniers n'ayant de sens qu'avec le premier
+        ou à côté de lui."""
 
         async def fetch_url(
             url: str,
@@ -588,9 +613,6 @@ class WebServer(MiaouMCPBase):
         {web_cache.RESOURCE_MAX_BYTES} octets)."""
         self.mcp.tool(name="fetch_resource")(fetch_resource)
 
-        self._register_search_tools()
-        self.finalize_tools()
-
     def _register_search_tools(self) -> None:
         """`search` si la chaîne a au moins un moteur web, `image_search` si
         l'un d'eux sait chercher des images — décidé ICI, sur la config, jamais
@@ -620,8 +642,9 @@ class WebServer(MiaouMCPBase):
 
             doc = (
                 f"Recherche web. Renvoie un objet JSON {{engine, results: [{{title, url, snippet}}], "
-                f"fallback?}} ; snippet est un extrait plafonné à {SNIPPET_MAX_CHARS} caractères — "
-                f"lire la page avec fetch_url. max_results borné à [1, {MAX_RESULTS}]. "
+                f"fallback?}} ; snippet est un extrait plafonné à {SNIPPET_MAX_CHARS} caractères"
+                + (" — lire la page avec fetch_url" if self.fetch_enabled else "")
+                + f". max_results borné à [1, {MAX_RESULTS}]. "
                 + fallback_doc.format(order=" → ".join(web_names))
             )
             if "ddg" in web_names:
@@ -652,14 +675,20 @@ class WebServer(MiaouMCPBase):
             self.mcp.tool(name="image_search")(image_search)
 
     def announce_search(self) -> None:
-        """Ligne de démarrage : chaîne de moteurs active et moteurs écartés."""
-        print(f"{self.mcp.name} : {self.search_chain.summary()}", file=sys.stderr)
+        """Ligne de démarrage : chaîne de moteurs active et moteurs écartés,
+        et les fetch_* s'ils sont coupés par la config."""
+        line = self.search_chain.summary()
+        if not self.fetch_enabled:
+            line += "; fetch_* désactivés (config fetch: false)"
+        print(f"{self.mcp.name} : {line}", file=sys.stderr)
 
 
 def build(config: dict | None = None) -> MCPServer:
     """Factory appelée par InProcessUpstream.start() du proxy : une instance
-    par entrée config.json, chacune avec sa config `search` (clefs, ordre).
-    Lève SearchConfigError sur une config `search` invalide."""
+    par entrée config.json, chacune avec sa config `search` (clefs, ordre) et
+    `fetch`. Lève SearchConfigError sur une config `search` invalide,
+    WebConfigError sur une clé `fetch` qui n'est pas un booléen ou si fetch
+    et recherche sont tous deux coupés."""
     web = WebServer(config)
     web.announce_search()
     return web.mcp

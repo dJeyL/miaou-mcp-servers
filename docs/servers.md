@@ -200,7 +200,10 @@ servers/mcp_web/
 ```
 
 Quatre outils de téléchargement, plus deux de recherche décrits dans la section
-« Recherche » ci-dessous. `fetch_url(url, max_bytes=5242880)` branch sur le `Content-Type` :
+« Recherche » ci-dessous. `"fetch": false` dans le bloc `config` de l'entrée retire
+les quatre `fetch_*` d'un coup (`WebConfigError` si la valeur n'est pas un booléen) :
+la description de `search` cesse alors de renvoyer vers `fetch_url`, et la ligne de
+démarrage le signale. `fetch_url(url, max_bytes=5242880)` branch sur le `Content-Type` :
 
 | Content-Type | Traitement | Résultat |
 |---|---|---|
@@ -381,7 +384,8 @@ bloc prime sur l'environnement pour la même raison que `mcp_brave` : plusieurs
 entrées `web` peuvent porter des clefs différentes (`build(config)`, une instance par
 entrée). Règles de `build_chain` :
 
-- un moteur absent de `order` est désactivé ; `order: []` coupe la recherche ;
+- un moteur absent de `order` est désactivé ; `order: []` ou `"search": false`
+  coupe la recherche (`"search": true` vaut l'absence de la clé) ;
 - un moteur à clef sans clef est écarté, avec une ligne au démarrage ;
 - si `order` cite des moteurs et qu'**aucun** n'est utilisable, la construction
   lève `SearchConfigError`, comme `mcp_brave` sans clef. Le proxy écarte alors
@@ -394,7 +398,12 @@ entrée). Règles de `build_chain` :
 (`miaou-web : recherche via brave → ddg ; images via brave; ollama écarté (…)`), de
 même que le lancement standalone. Le singleton du module, construit sans config,
 lit l'ordre par défaut et les clefs de l'environnement ; il ne peut pas lever, `ddg`
-n'ayant pas de clef.
+n'ayant pas de clef. Recherche coupée, la ligne dit « recherche désactivée ».
+
+`"fetch": false` et recherche coupée ensemble lèvent `WebConfigError` : une entrée
+active sans aucun outil est une config à corriger, que le proxy signale sur la
+ligne « unavailable » au démarrage — à la différence de `"disabled": true`, qui
+coupe l'entrée exprès et en silence.
 
 **Listage figé à la construction.** `search` n'est enregistré que si la chaîne a un
 moteur web, `image_search` que si l'un sait chercher des images. C'est décidé sur la

@@ -16,7 +16,8 @@ pas de serveur qui démarre sans la recherche qu'on lui a demandée — et le pr
 écarte alors l'upstream ENTIER, outils fetch_* compris. `order: []` coupe la
 recherche exprès et ne lève pas. Un nom inconnu ou répété fait aussi échouer la
 construction : une faute de frappe qui désactiverait un moteur en silence serait
-pire.
+pire. `"search": false` coupe aussi la recherche (comme `order: []`) ; `true`
+vaut l'absence de la clé.
 
 Un appel essaie les moteurs dans l'ordre et s'arrête au premier qui RÉPOND,
 liste vide comprise : un vide est une réponse, et replier dessus ferait finir
@@ -73,8 +74,8 @@ class SearchChain:
         return [e.name for e in self.engines if kind in e.kinds]
 
     def summary(self) -> str:
-        web = " → ".join(self.names("web")) or "aucun moteur"
-        line = f"recherche via {web}"
+        web = " → ".join(self.names("web"))
+        line = f"recherche via {web}" if web else "recherche désactivée"
         images = self.names("images")
         if images:
             line += f" ; images via {' → '.join(images)}"
@@ -119,9 +120,13 @@ class SearchChain:
 def build_chain(config: dict | None) -> SearchChain:
     """Chaîne de moteurs depuis le bloc `config` de l'entrée `web`.
     Lève SearchConfigError sur une config `search` invalide."""
-    search_cfg = (config or {}).get("search", {})
+    search_cfg = (config or {}).get("search", True)
+    if search_cfg is False:
+        return SearchChain([], [])
+    if search_cfg is True:
+        search_cfg = {}
     if not isinstance(search_cfg, dict):
-        raise SearchConfigError("config « search » : objet attendu")
+        raise SearchConfigError("config « search » : objet ou booléen attendu")
     order = search_cfg.get("order", DEFAULT_ORDER)
     if not isinstance(order, (list, tuple)) or not all(isinstance(x, str) for x in order):
         raise SearchConfigError("config « search.order » : liste de noms de moteurs attendue")
