@@ -1,7 +1,8 @@
 # `mcp_proxy/` — proxy MCP
 
-Agrégation des upstreams, configuration, override du proxy réseau. L'auth OAuth
-(entrante et sortante) est dans `docs/auth.md`.
+Agrégation des upstreams, configuration, override du proxy réseau, et MIAOU servi
+sous `/app/` (clé `miaou_dist`). L'auth OAuth (entrante et sortante) est dans
+`docs/auth.md`.
 
 
 Agrège plusieurs serveurs MCP upstream et expose leurs outils préfixés :
@@ -113,7 +114,10 @@ mcp_proxy/ (paquet, à la racine du projet)
 ├── app.py         build_app() : Starlette + StreamableHTTPSessionManager + CORS
 │   ├── lifespan : start/stop de chaque upstream, puis install_skills() et
 │   │              écriture des instructions (bloc des skills compris)
-│   └── auth (facultative) : routes RFC 9728 + RequireAuthMiddleware sur /mcp
+│   ├── auth (facultative) : routes RFC 9728 + RequireAuthMiddleware sur /mcp
+│   └── MIAOU (facultatif) : routes de webapp.py, posées après /mcp
+├── webapp.py      clé `miaou_dist` : resolve_miaou_dist(), miaou_dist_warnings(),
+│                  MiaouStaticFiles et build_miaou_routes() (/app/ et /)
 └── entry.py       main() — CLI ; et run_with_dev_auth() : --with-dev-auth, proxy
                    ET AS de développement dans ce process, sur DEUX ports
 ```
@@ -586,6 +590,8 @@ L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'
 section de cet upstream dans les `instructions` du proxy, après celle que l'upstream
 publie — cf. « Consigne de portée serveur ». Une valeur qui n'est pas une chaîne est
 une erreur de config signalée au démarrage.
+`miaou_dist` (clé racine, chaîne) → dossier `dist/` de MIAOU servi sous `/app/` — cf.
+« MIAOU servi sous `/app/` ». Absente, `null` ou `""` : rien n'est servi.
 
 ### Multi-instance inprocess (clé `config`)
 
@@ -619,4 +625,76 @@ mcp = server.mcp  # toujours exposé, pour compat avec le chemin sans build()
 serveur lit ce qu'il veut dedans, aucune validation de schéma imposée par la
 base. `env` reste le mécanisme pour stdio ou pour un serveur inprocess qui
 préfère réellement lire `os.environ` (un seul jeu de valeurs par process).
+
+## MIAOU servi sous `/app/` (clé `miaou_dist`)
+
+Une clé racine de `config.json` désigne le **dossier** `dist/` d'un clone de MIAOU.
+Le proxy le sert alors, à côté de `/mcp`, pour que MIAOU puisse être ouvert en
+`http://127.0.0.1:<port>/app/` plutôt qu'en `file://` — condition pour l'installer
+comme application (une PWA ne s'installe pas depuis un fichier). Code : `webapp.py`.
+
+```json
+{ "port": 8765, "miaou_dist": "../miaou/dist", "mcpServers": { … } }
+```
+
+**Résolution.** Chemin relatif au fichier `config.json`, pas au répertoire courant
+(qui dépend de la façon de lancer) ; `~` est développé ; absolu accepté. `null` ou `""`
+valent absence. Une valeur qui n'est pas une chaîne est une erreur de config.
+
+**Routes.** `/app/` rend `miaou.html` — qui ne s'appelle pas `index.html`, d'où une
+sous-classe de `StaticFiles` (`MiaouStaticFiles`) plutôt que son mode `html`, qui ne
+connaît qu'`index.html`. Le reste du dossier est servi sous `/app/` : manifeste,
+icônes, service worker (portée `/app/`) et `version.json` que MIAOU y dépose. `/app`
+sans slash est redirigé par le routeur de Starlette ; `/` redirige vers `/app/` en
+**302** (un 301 resterait dans le cache du navigateur après le retrait de la clé). Ces
+routes sont posées APRÈS `/mcp` et les routes OAuth, qui gardent la priorité, et HORS
+de `RequireAuthMiddleware` : `/app/` reste public quand l'auth entrante est active —
+l'appli doit pouvoir charger pour lancer son propre parcours. Lecture seule (405 sur
+tout autre verbe que GET/HEAD). Clé absente : aucune de ces routes, `/` reste un 404.
+
+**Revalidation.** `StaticFiles` pose `ETag` (mtime + taille) et `Last-Modified`, et
+répond 304 sur `If-None-Match`/`If-Modified-Since`, mais ne pose AUCUN
+`Cache-Control`. Le navigateur applique alors une fraîcheur heuristique (~10 % de l'âge
+depuis `Last-Modified`) et peut resservir un vieux HTML sans revalider : un `git pull`
+de MIAOU ne serait pas vu au rechargement. D'où `Cache-Control: no-cache` sur TOUTE
+réponse de `/app/`, 304 compris (c'est `file_response` qui le pose, avant le test
+conditionnel, pour que `NotModifiedResponse` le recopie). Pas seulement sur le HTML :
+le service worker et `version.json` en ont besoin aussi, et une icône revalidée ne
+coûte qu'un 304.
+
+**Types de contenu.** Table explicite (`_MEDIA_TYPES` : `.html`, `.js`, `.json`,
+`.webmanifest`, `.png`, `.svg`, `.ico`), repli sur `mimetypes` pour le reste. Le
+module ne suffit pas : sous Windows il lit le registre, dont les entrées remplacent
+ses valeurs par défaut (`.js` en `text/plain` sur certains postes), sous Linux
+`/etc/mime.types` s'il existe — et un navigateur refuse d'enregistrer un service
+worker servi sous un type qui n'est pas JavaScript.
+
+**Ce qui n'est jamais servi.** Rien hors du dossier (garde `realpath`/`commonpath` de
+`StaticFiles`, un `..` résiduel étant de toute façon refusé avec les fichiers cachés),
+aucun fichier caché (`.gitkeep`, `.DS_Store`).
+
+**Démarrage : un refus, des avertissements.**
+- **Refus** (`ValueError`, sortie en erreur) si le dossier contient `config.json` ou
+  `.git` (`_FORBIDDEN_ENTRIES`) : c'est la racine du dépôt MIAOU, pas son `dist/`, et la
+  servir exposerait sa config au réseau dès que `host` vaut `0.0.0.0`.
+- **Avertissements** (`miaou_dist_warnings`, au journal), le proxy démarrant quand
+  même — une indisponibilité de MIAOU n'éteint pas les outils MCP : dossier
+  introuvable ou `miaou.html` absent (`/app/` répond 404) ; `manifest.webmanifest`
+  absent, illisible, sans icône, ou icône citée introuvable (MIAOU servi, mais pas
+  installable). Les noms d'icônes sont lus dans `icons[].src` du manifeste, résolus
+  contre son URL comme le ferait le navigateur : seul le nom du manifeste est figé
+  dans le proxy. Une icône d'une autre origine n'est pas vérifiée.
+- Les routes relisent le disque à chaque requête : un dossier rempli après le
+  démarrage est servi sans redémarrage. `check_config` de `StaticFiles` est
+  neutralisé, sans quoi un dossier absent lèverait à la première requête (500).
+
+**Docker.** Le dossier `miaou_dist/` du dépôt est versionné vide (`.gitkeep`, son
+contenu gitignoré) et le `Dockerfile` le copie toujours : copier le `dist/` de MIAOU
+dedans AVANT le build, et poser `"miaou_dist": "miaou_dist"` dans le `config.json`
+copié dans l'image. Sans copie préalable, l'image se construit quand même ; le proxy
+avertit alors au démarrage si la clé est posée, et ne sert rien si elle ne l'est pas.
+
+**Pas de compression.** `miaou.html` pèse ~1,5 Mo et part tel quel : sans enjeu en
+local ; derrière un reverse proxy, c'est à lui de compresser (Caddy : directive
+`encode`).
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
@@ -23,6 +24,7 @@ from .logging import _log
 from .server import aggregate_instructions, authorize_path, published_tools
 from .skills import build_skills_blocks, install_skills
 from .upstream import HttpUpstream, Upstream
+from .webapp import build_miaou_routes
 
 
 def build_app(
@@ -31,6 +33,7 @@ def build_app(
     auth: dict[str, Any] | None = None,
     token_verifier: Any = None,
     authorizers: dict[str, UpstreamAuthorizer] | None = None,
+    miaou_dist: Path | None = None,
 ) -> Any:
     """`auth` : sortie de resolve_auth_config(), ou None (auth désactivée —
     comportement d'avant le lot AB-1, à l'octet près).
@@ -42,6 +45,10 @@ def build_app(
     AB-2). Non vide → la route /callback est servie. Rien à voir avec `auth`,
     qui gouverne l'auth entrante : un proxy peut faire l'une, l'autre, les deux
     ou aucune.
+
+    `miaou_dist` : sortie de resolve_miaou_dist(), ou None (rien d'autre que
+    `/mcp` et les routes OAuth n'est servi). Sinon MIAOU est servi sous `/app/`
+    et `/` y redirige — cf. webapp.py.
     """
     from contextlib import asynccontextmanager
 
@@ -338,6 +345,11 @@ def build_app(
         routes.append(build_authorize_route(authorizers, upstreams, on_authorized=publish_surface))
 
     routes.append(Mount("/mcp", app=mcp_endpoint))
+
+    # Après /mcp et les routes OAuth : elles gardent la priorité. Hors de
+    # `mcp_endpoint`, donc publiques même quand l'auth entrante est active.
+    if miaou_dist is not None:
+        routes.extend(build_miaou_routes(miaou_dist))
 
     app = Starlette(
         routes=routes,

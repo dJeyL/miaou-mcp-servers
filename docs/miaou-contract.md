@@ -22,6 +22,26 @@ En pratique : passer par le **proxy** expose tous les outils préfixés sur un s
 Les noms exposés côté proxy dépendent des clés dans `config.json` (`mcpServers`).
 
 
+## MIAOU servi par le proxy (`/app/`, lot AO)
+
+Quand `config.json` porte `miaou_dist` (dossier `dist/` d'un clone de MIAOU), le proxy
+sert MIAOU à `http://<hôte>:<port>/app/` et redirige `/` vers `/app/` (détail :
+`docs/proxy.md`, « MIAOU servi sous `/app/` »). Ce que ça engage côté MIAOU :
+
+- `/app/` rend `miaou.html` ; tout autre fichier du dossier est servi sous `/app/<chemin>`.
+  La portée naturelle d'un service worker posé dans `dist/` est donc `/app/`, qui
+  n'englobe ni `/mcp` ni les routes OAuth.
+- Le manifeste s'appelle **`manifest.webmanifest`**, à la racine du dossier : c'est le
+  seul nom figé côté proxy (avertissement au démarrage s'il manque). Les icônes, elles,
+  sont lues dans son `icons[].src` — les nommer et les ranger est l'affaire de MIAOU.
+- Tout part en `Cache-Control: no-cache` avec `ETag`/`Last-Modified` : chaque
+  chargement revalide, un `git pull` est vu au rechargement suivant.
+- Types fixés par le proxy pour `.html`, `.js`, `.json`, `.webmanifest`, `.png`,
+  `.svg`, `.ico` ; une autre extension dépend du `mimetypes` de la machine.
+- Aucun fichier caché n'est servi, et un `dist/` qui contient `config.json` ou `.git`
+  est refusé au démarrage.
+- `/app/` reste public quand l'auth entrante du proxy est active.
+
 ## Ce que MIAOU attend d'un serveur MCP
 
 1. `initialize` (handshake JSON-RPC) → capte `Mcp-Session-Id`

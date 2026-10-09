@@ -60,6 +60,16 @@ sans `uri`, `name` ou `description` absents, description trop longue, entrée qu
 pas un objet, skill servie non listée ; `build("empty")`, extension déclarée et listage
 vide. Ce qu'ils couvrent est jugé sur NOTRE lecture de la spec, aucun upstream tiers ne
 servant encore l'extension.
+`tests/test_proxy_webapp.py` (MIAOU servi sous `/app/`) monte un `dist/` factice dans
+`tmp_path` et l'interroge à trois niveaux : les purs de `webapp.py`, l'app de
+`build_app` sur `httpx2.ASGITransport` (wrapper ASGI compris), et un **vrai uvicorn**
+sur un port éphémère (`port=0`, lancé dans un thread, port relu sur sa socket),
+interrogé par `http.client` — le seul niveau qui montre les en-têtes réellement émis
+et la revalidation après un `git pull` simulé (fichier réécrit, mtime avancé). Le cas
+Windows (registre qui type `.js` en `text/plain`) se simule en remplaçant
+**`starlette.responses.guess_type`** : Starlette importe la fonction par son nom, et
+remplacer `mimetypes.guess_type` laisse le test vert même sans la table de types —
+vérifié en retirant la table.
 Les tests qui interceptent le client HTTP du SDK patchent **`httpx2`** (`AsyncClient`,
 `MockTransport`, `Response`) : le SDK 2.x n'emploie plus `httpx`, et un patch resté sur
 l'ancien nom ne lève rien — il ne patche plus rien, et le test part sur le réseau.

@@ -1,6 +1,8 @@
 {
   "port": 8765,
   "host": "127.0.0.1",
+  "_comment_miaou_dist": "FACULTATIF (vide ou absent = rien de plus que /mcp n'est servi). Chemin du DOSSIER dist/ d'un clone de MIAOU, relatif à ce fichier (p. ex. '../miaou/dist', barres obliques même sous Windows). Le proxy sert alors MIAOU à http://<host>:<port>/app/ et redirige / vers /app/ ; /app/ reste public même avec le bloc 'auth'. Un dossier introuvable est signalé au démarrage sans l'empêcher ; un dossier qui contient config.json ou .git (la racine du dépôt MIAOU au lieu de son dist/) est refusé. Image Docker : copier dist/ dans le dossier miaou_dist/ du dépôt avant le build, et mettre ici 'miaou_dist'.",
+  "miaou_dist": "",
   "_comment_auth": "Bloc 'auth' FACULTATIF (absent = aucune authentification exigée, comportement par défaut). Le renseigner fait du proxy un Resource Server OAuth 2.1 : il refuse les appels sans jeton valide et indique où s'authentifier. Il VÉRIFIE des jetons, il n'en émet jamais — cela appartient à un serveur d'autorisation distinct. Seul 'issuer_url' est obligatoire ; 'resource_url' (identité publique de ce proxy, ce à quoi le jeton doit être destiné) est dérivé de l'adresse d'écoute si omis. 'disabled': true neutralise le bloc sans le supprimer ; --no-auth fait de même à la volée.",
   "_auth_example": {
     "disabled": true,

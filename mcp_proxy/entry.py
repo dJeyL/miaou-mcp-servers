@@ -21,6 +21,7 @@ from .config import build_upstreams, load_config
 from .logging import _log
 from .netproxy import apply_proxy_env_overrides_to_process, compute_proxy_env_overrides
 from .server import ToolCatalogCache, build_proxy_server
+from .webapp import APP_PREFIX, miaou_dist_warnings, resolve_miaou_dist
 
 
 def run_with_dev_auth(
@@ -240,6 +241,7 @@ def main() -> None:
         cfg = load_config(config_path)
         host = args.host or cfg.get("host", "127.0.0.1")
         port = args.port or int(cfg["port"])
+        miaou_dist = resolve_miaou_dist(cfg, config_path)
     except ValueError as e:
         print(f"Erreur : {e}", file=sys.stderr)
         sys.exit(1)
@@ -296,7 +298,9 @@ def main() -> None:
     mcp_server = build_proxy_server(
         upstreams, tool_map, authorizers=authorizers, catalog=catalog
     )
-    app = build_app(mcp_server, upstreams, auth=auth, authorizers=authorizers)
+    app = build_app(
+        mcp_server, upstreams, auth=auth, authorizers=authorizers, miaou_dist=miaou_dist
+    )
 
     import uvicorn
 
@@ -310,6 +314,11 @@ def main() -> None:
         )
         _log(f"  jetons : {tokens_path}")
         _log(f"  redirection : {build_callback_url(host, port)}")
+    if miaou_dist is not None:
+        _log(f"MIAOU servi depuis {miaou_dist}")
+        for warning in miaou_dist_warnings(miaou_dist):
+            _log(f"  attention : {warning}")
+        print(f"MIAOU      → http://{host}:{port}{APP_PREFIX}/")
     print(f"miaou-proxy → http://{host}:{port}/mcp  (Ctrl-C pour arrêter)")
 
     if args.with_dev_auth is None:

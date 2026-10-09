@@ -160,6 +160,7 @@ Le proxy accepte en plus :
 ```
 
 `type` absent → `stdio`. `port` est obligatoire, `host` optionnel.
+`miaou_dist` (clé racine, facultative) → le proxy sert MIAOU sous `/app/` (voir plus bas).
 `"disabled": true` sur une entrée → upstream ignoré au démarrage.
 L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'est plus celle qu'on écrit — dans ce fichier, un souligné en tête signale ailleurs (`_comment`) une clé ignorée, ce que cet interrupteur n'est justement pas. Le proxy le signale au démarrage, une ligne par bloc concerné, pour que la migration se voie plutôt que de traîner indéfiniment ; une config déjà en `disabled` ne dit rien.
 `env` sur une entrée inprocess → variables d'environnement injectées avant l'import.
@@ -234,6 +235,29 @@ module n'existe plus, et le subprocess meurt au démarrage (le proxy le signale 
 Rappel de périmètre : un subprocess stdio n'hérite qu'une whitelist restreinte de
 variables d'environnement (`HOME`, `PATH`, `SHELL`, …). Tout ce dont le serveur externe
 a besoin — clefs d'API, `MIAOU_*_WORKDIR` — doit être posé explicitement dans son `env`.
+
+### Servir MIAOU (clé `miaou_dist`)
+
+Le proxy peut servir MIAOU lui-même, à `http://127.0.0.1:8765/app/` (`/` y redirige) :
+c'est ce qui permet de l'installer comme une application, ce qu'un fichier ouvert en
+`file://` ne permet pas. La clé désigne le **dossier** `dist/` d'un clone de MIAOU,
+relatif au fichier `config.json` :
+
+```json
+{ "port": 8765, "miaou_dist": "../miaou/dist", "mcpServers": { … } }
+```
+
+Seul ce dossier est servi (un dossier qui contient `config.json` ou `.git` est refusé),
+`/app/` reste public même avec le bloc `auth`, et chaque chargement revalide le fichier :
+un `git pull` de MIAOU est vu au rechargement suivant. Un dossier introuvable est signalé
+au démarrage sans l'empêcher. Attention, l'adresse compte : `file://`,
+`http://127.0.0.1:8765` et `http://localhost:8765` sont trois origines distinctes pour le
+navigateur, chacune avec ses propres réglages et conversations (l'export/import de MIAOU
+fait passer de l'une à l'autre).
+
+Image Docker : copier le `dist/` de MIAOU dans le dossier `miaou_dist/` du dépôt
+(versionné vide) avant `docker compose build`, et poser `"miaou_dist": "miaou_dist"` dans
+`config.json`. Sans copie, l'image se construit quand même. Détail : `docs/proxy.md`.
 
 ### Exiger une autorisation OAuth (clé `auth`)
 
@@ -422,7 +446,9 @@ miaou-mcp-servers/
 │   ├── auth_in.py        # Resource Server OAuth (entrante)
 │   ├── auth_out/         # client OAuth d'upstreams tiers (sortante), package
 │   ├── app.py            # application Starlette
+│   ├── webapp.py         # MIAOU servi sous /app/ (clé miaou_dist)
 │   └── entry.py          # CLI, main()
+├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker (versionné vide)
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
 │   ├── mcp_base.py       # classe de base + make_opener() proxy-aware + extension Skills
@@ -435,7 +461,7 @@ miaou-mcp-servers/
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — obsolète
 ├── docs/                 # documentation par domaine, pour qui modifie le code
 │   ├── servers.md        # les six serveurs en détail (outils, contrats, env)
-│   ├── proxy.md          # upstreams, config.json, override de proxy réseau
+│   ├── proxy.md          # upstreams, config.json, override de proxy réseau, /app/
 │   ├── auth.md           # auth OAuth entrante et sortante
 │   ├── miaou-contract.md # surface de contact avec MIAOU (transport, skills, REF_UNKNOWN)
 │   ├── tls.md            # magasin de confiance système (truststore)
@@ -458,6 +484,7 @@ miaou-mcp-servers/
 │   ├── skills_fixture_server.py     # upstream de test qui sert des skills (non collecté)
 │   ├── test_proxy_auth.py           # auth OAuth entrante
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante
+│   ├── test_proxy_webapp.py         # MIAOU servi sous /app/ (dont un vrai uvicorn)
 │   ├── test_dev_auth_server.py      # serveur d'autorisation de développement
 │   └── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
 ├── config.sample.json

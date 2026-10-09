@@ -15,6 +15,10 @@ RUN uv sync --frozen --no-dev
 # nécessaire (--with-dev-auth n'est pas utilisé ici).
 COPY servers ./servers
 COPY config.json ./config.json
+# Copie du dist/ de MIAOU, servie sous /app/ si config.json porte
+# "miaou_dist": "miaou_dist". Le dossier est versionné vide (.gitkeep) : l'image
+# se construit sans copie préalable, et le proxy ne sert alors rien.
+COPY miaou_dist ./miaou_dist
 
 EXPOSE 8765
 

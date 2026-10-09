@@ -13,3 +13,7 @@ untracked/
 dist/
 /miaou-docs/
 /miaou-web/
+# Copie du dist/ de MIAOU pour l'image Docker (clé miaou_dist) : seul le
+# dossier vide est versionné, pour que le COPY du Dockerfile trouve sa source.
+/miaou_dist/*
+!/miaou_dist/.gitkeep

@@ -33,7 +33,9 @@ miaou-mcp-servers/
 │   │   ├── storage.py    # UpstreamTokenStorage, gardes d'écriture
 │   │   └── authorizer.py # parcours, renouvellement, routes Starlette
 │   ├── app.py            # build_app (Starlette)
+│   ├── webapp.py         # MIAOU servi sous /app/ : clé miaou_dist, MiaouStaticFiles, garde et avertissements
 │   └── entry.py          # CLI, main()
+├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker — versionné VIDE (.gitkeep), contenu gitignoré
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
 │   ├── mcp_base.py       # classe de base partagée (MiaouMCPBase + make_opener + extension Skills)
@@ -71,6 +73,7 @@ miaou-mcp-servers/
 │   ├── test_proxy_remote_skills.py  # skills relayées d'upstreams stdio/http (vrais handshakes)
 │   ├── test_proxy_auth.py  # auth OAuth entrante (lot AB-1)
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante (lot AB-2)
+│   ├── test_proxy_webapp.py  # MIAOU servi sous /app/ (lot AO-1) : purs, ASGI, vrai uvicorn
 │   └── test_dev_auth_server.py  # serveur d'autorisation de développement (lot AB-1.3)
 ├── config.sample.json    # template de config pour le proxy
 ├── config.json           # (gitignored) config active du proxy
@@ -96,7 +99,7 @@ Six serveurs de banc d'essai plus un proxy qui les agrège. Le détail de chacun
 | `mcp_ddg.py` | 8769 | Recherche DuckDuckGo (HTML scrapé) — **déprécié** | `ddg_search` |
 | `mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) — **déprécié** | `brave_search`, `brave_image_search` |
 | `mcp_docs/` | 8771 | Extraction PDF/Office/Zip — **obsolète, désactivé par défaut** | `list`, `read`, `search`, `extract`, `drop_session` |
-| `mcp_proxy/` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) et les skills | (+ `status` si auth sortante, `read_skill` si une skill est servie) |
+| `mcp_proxy/` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) et les skills ; sert MIAOU sous `/app/` si `miaou_dist` est posée | (+ `status` si auth sortante, `read_skill` si une skill est servie) |
 
 Deux points qu'on ne devine pas depuis le tableau :
 
@@ -413,6 +416,14 @@ lots — piège déjà payé côté MIAOU.
   `ToolCatalogCache`, bloc généré des instructions (forme, en-tête « pas des skills
   locales » et la mesure qui l'a imposé), repli `read_skill` et sa marque
   `miaou/skillsFallback`.
+  MIAOU servi sous `/app/` (`webapp.py`, clé `miaou_dist` relative au fichier de
+  config) : `miaou.html` à `/app/` hors du mode `html` de `StaticFiles`, `/` en 302,
+  routes après `/mcp` et OAuth et hors auth, `Cache-Control: no-cache` partout (304
+  compris) faute de quoi la fraîcheur heuristique masque un `git pull`, table de types
+  `_MEDIA_TYPES` contre le registre Windows, fichiers cachés refusés, `check_config`
+  neutralisé (404 et non 500 sur dossier absent), refus de démarrer sur `config.json`/
+  `.git` dans le dossier, avertissements sur `miaou.html`/manifeste/icônes lues dans
+  `icons[].src`, et `miaou_dist/` versionné vide pour le `COPY` du `Dockerfile`.
 - **`docs/auth.md`** — campagne AB, les deux sens sans rapport entre eux. Entrante
   (AB-1 : le proxy est Resource Server, `JwtTokenVerifier`, validation d'audience
   RFC 8707 non désactivable, `dev_auth_server.py`). Sortante (AB-2 : le proxy est
@@ -462,7 +473,9 @@ lots — piège déjà payé côté MIAOU.
   relayées telles quelles, `resources/read` et `Mcp-Name`, `miaou/requiresSkill`,
   bloc des instructions, repli `read_skill` à masquer par sa marque, préfixe double
   d'un proxy chaîné et la collision d'approbations qu'il rend possible, et le réflexe
-  `miaou__skills__read` mesuré avec MIAOU actuel), et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
+  `miaou__skills__read` mesuré avec MIAOU actuel), MIAOU servi sous `/app/` (portée,
+  `manifest.webmanifest` seul nom figé, icônes lues dans le manifeste, `no-cache`,
+  types fixés), et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
   `ref`+`content_b64`, `session_id`, idempotence de la matérialisation, REF_UNKNOWN
   levée en `MCPError` par l'outil et donc rejouable en autonome comme derrière le
   proxy, taille d'un `content_b64` et `MAX_REQUEST_BODY_BYTES` couplé au plafond
@@ -478,7 +491,9 @@ lots — piège déjà payé côté MIAOU.
   chemin JSON-RPC de MIAOU, jamais le mode par défaut), les patchs qui visent
   `httpx2` et non plus `httpx`, l'isolation filesystem par `tmp_path`, les deux pièges de fixture
   du mock de réponse de `test_web.py` (queue de remplissage compressible, garde
-  verte des deux côtés), les vrais handshakes de `test_proxy_era.py` (fixtures
+  verte des deux côtés), `test_proxy_webapp.py` et son vrai uvicorn sur port
+  éphémère (en-têtes émis, revalidation après `git pull` ; `guess_type` à remplacer
+  dans `starlette.responses`, pas dans `mimetypes`), les vrais handshakes de `test_proxy_era.py` (fixtures
   stdio des deux ères, app http sur `httpx2.ASGITransport`, middleware qui imite
   un serveur 1.x, identité legacy comparée au mode `legacy`), l'opener qui route par URL de `test_web_pagemeta.py`
   (favicon, sonde unique par origine) et le cache de favicons vidé en fixture,
