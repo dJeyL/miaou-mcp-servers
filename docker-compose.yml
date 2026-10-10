@@ -7,6 +7,11 @@ services:
       # MIAOU_MCP_BIND=127.0.0.1 publie le port sur la boucle locale seulement
       # (derrière un reverse proxy de l'hôte) ; par défaut, toutes les interfaces.
       - "${MIAOU_MCP_BIND:-0.0.0.0}:8765:8765"
+    # Variables citées par la config en ${VAR} (clefs, mots de passe) : un .env
+    # facultatif à côté de ce fichier, gitignoré. Exige docker compose 2.24+.
+    env_file:
+      - path: .env
+        required: false
     environment:
       # Dossiers de travail des upstreams inprocess qui font du cache disque —
       # sans ça, ils écrivent dans le répertoire de travail du conteneur
@@ -16,8 +21,12 @@ services:
     volumes:
       - miaou-web:/data/miaou-web
       - miaou-docs:/data/miaou-docs
+      # Jetons OAuth des upstreams et cache d'outils : sans volume, chaque
+      # recréation du conteneur les perd, et chaque autorisation est à refaire.
+      - miaou-state:/app/state
     restart: unless-stopped
 
 volumes:
   miaou-web:
   miaou-docs:
+  miaou-state:

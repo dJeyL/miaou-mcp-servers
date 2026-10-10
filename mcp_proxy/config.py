@@ -1,12 +1,13 @@
-"""Lecture de `config.json` et construction de la table d'upstreams."""
+"""Lecture de la config (couches : `layers.py`) et construction de la table
+d'upstreams."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 from .contract import is_disabled
+from .layers import load_layers
 from .netproxy import merge_proxy_env_overrides
 from .upstream import (
     HttpUpstream,
@@ -44,13 +45,8 @@ def _config_instructions(name: str, srv: dict[str, Any]) -> str | None:
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
-    try:
-        cfg = json.loads(Path(path).read_text())
-    except json.JSONDecodeError as e:
-        raise ValueError(f"La config '{path}' n'est pas un JSON valide : {e}") from e
-    if "port" not in cfg:
-        raise ValueError(f"La config '{path}' doit contenir la clé 'port'.")
-    return cfg
+    """Config effective d'un fichier seul (fusion et chaîne : `layers`)."""
+    return load_layers([Path(path)]).cfg
 
 
 def build_upstreams(

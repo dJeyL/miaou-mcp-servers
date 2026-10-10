@@ -1,4 +1,9 @@
 config.json
+config.json.bak
+.env
+# Jetons OAuth et cache d'outils (state/), et leurs anciens noms d'avant ce
+# dossier, que le proxy y déplace au démarrage.
+/state/
 *-tokens.json
 *-tools.json
 __pycache__/
@@ -13,7 +18,3 @@ untracked/
 dist/
 /miaou-docs/
 /miaou-web/
-# Copie du dist/ de MIAOU pour l'image Docker (clé miaou_dist) : seul le
-# dossier vide est versionné, pour que le COPY du Dockerfile trouve sa source.
-/miaou_dist/*
-!/miaou_dist/.gitkeep

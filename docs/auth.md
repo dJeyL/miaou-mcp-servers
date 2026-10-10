@@ -154,8 +154,8 @@ découverte, DCR, PKCE S256, échange de code, refresh). Ce qui est à nous est 
 **stockage**, parce qu'il touche au disque et aux secrets — `UpstreamTokenStorage`
 implémente le protocol `mcp.client.auth.TokenStorage`.
 
-Un fichier **distinct de `config.json`** (`<config>-tokens.json` par défaut,
-ajouté au `.gitignore`) : `config.json` est ouvert et édité à la main, un refresh
+Un fichier **distinct de `config.json`** (`state/tokens.json` par défaut, dossier
+gitignoré — cf. `docs/proxy.md`, « `state/` ») : `config.json` est ouvert et édité à la main, un refresh
 token n'y a rien à faire. Un seul fichier pour tous les upstreams, une entrée par
 nom, relu à chaque écriture pour ne pas écraser l'entrée d'un voisin.
 
@@ -724,7 +724,7 @@ tour entier perdu, pendant lequel MIAOU n'affiche rien. Le site d'appel la
 convertit donc en `UpstreamNotAuthorized` (via `_unwrap_exception_group`, anyio
 empaquetant ce qui traverse un task group).
 
-**Cache d'outils** (`ToolCatalogCache`, `<config>-tools.json`) : sans lui, un
+**Cache d'outils** (`ToolCatalogCache`, `state/tools-cache.json`) : sans lui, un
 upstream non autorisé serait muet, `tools/list` répondant 401 avant de rien
 dire. Il couvre aussi le redémarrage du proxy. Il ne sert qu'un upstream qui a un
 authorizer : un upstream sans OAuth et sans session est injoignable, ses outils sont omis

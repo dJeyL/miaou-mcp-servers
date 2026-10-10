@@ -500,7 +500,7 @@ propre pile TLS, a priori hors de portée de `truststore` (non mesuré).
 ## `servers/mcp_ddg.py` — recherche DuckDuckGo (port 8769)
 
 > **Déprécié** : remplacé par `search` de `mcp_web` (moteur `ddg`, mêmes protections),
-> `disabled: true` dans `config.sample.json`. Il imprime un avertissement à chaque
+> `disabled: true` dans `config.defaults.json`. Il imprime un avertissement à chaque
 > démarrage (`build()`, qui rend le singleton, et le lancement standalone). Actif à
 > côté de `mcp_web`, il ne partage pas son espacement vers DuckDuckGo.
 
@@ -537,7 +537,7 @@ couvre.
 ## `servers/mcp_brave.py` — recherche Brave Search (port 8770)
 
 > **Déprécié** : remplacé par `search` / `image_search` de `mcp_web` (moteur `brave`),
-> `disabled: true` dans `config.sample.json`. Il imprime un avertissement à chaque
+> `disabled: true` dans `config.defaults.json`. Il imprime un avertissement à chaque
 > démarrage (`build()` et le lancement standalone).
 
 Deux outils. Requièrent une clef d'API, résolue par `resolve_api_key()` dans cet
@@ -579,7 +579,7 @@ diffère.
 > lui-même (zip, PDF, Excel, Word, PowerPoint), sans serveur. Ce serveur reste en
 > place et intact pour un seul usage, qui reste réel : le travail **hors
 > connexion**, l'ouverture native de MIAOU téléchargeant ses moteurs depuis un CDN.
-> `config.sample.json` porte `disabled: true` sur son entrée `docs` ; le retirer
+> `config.defaults.json` porte `disabled: true` sur son entrée `docs` ; le retirer
 > suffit à le réveiller. Rien n'a été supprimé ici — ne pas « faire le ménage »
 > dans ce package au motif qu'il ne sert plus par défaut. Détail et raisons dans
 > le README (section « `mcp_docs` : obsolète, mais conservé pour le

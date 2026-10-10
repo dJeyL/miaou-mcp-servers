@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,10 +18,19 @@ from .auth_out import (
     build_upstream_authorizers,
     enable_auth_debug,
 )
-from .config import build_upstreams, load_config
+from .config import build_upstreams
+from .layers import (
+    DEFAULT_CHAIN,
+    load_layers,
+    mask_secrets,
+    migrate_local,
+    needs_slimming,
+    resolve_chain,
+)
 from .logging import _log
 from .netproxy import apply_proxy_env_overrides_to_process, compute_proxy_env_overrides
 from .server import ToolCatalogCache, build_proxy_server
+from .state import default_tools_cache_path, migrate_legacy_state, tools_cache_beside
 from .webapp import APP_PREFIX, miaou_dist_warnings, resolve_miaou_dist
 
 
@@ -105,12 +115,50 @@ def run_with_dev_auth(
         pass
 
 
+def _migrate_and_exit(layer_paths: list[Path], local_path: Path) -> None:
+    result = migrate_local(layer_paths, local_path)
+    print(f"{local_path} allégé, original sauvegardé en {local_path.name}.bak.")
+    print(f"  {len(result.removed)} valeur(s) identique(s) aux couches précédentes retirée(s).")
+    if result.inherited:
+        print(
+            "  Reçu des couches précédentes, absent de ce fichier (à neutraliser "
+            "ici si c'était un retrait voulu) :"
+        )
+        for path in result.inherited:
+            print(f"    {path}")
+    sys.exit(0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serveur MCP proxy MIAOU")
     parser.add_argument(
         "--config",
-        default="config.json",
-        help="Chemin vers le fichier de configuration (défaut: config.json)",
+        action="append",
+        default=None,
+        metavar="FICHIER",
+        help=(
+            "Fichier de configuration ; répétable, les suivants patchant les "
+            "précédents (JSON Merge Patch). Remplace la chaîne par défaut : "
+            f"{' → '.join(DEFAULT_CHAIN)}, chacun lu s'il existe."
+        ),
+    )
+    parser.add_argument(
+        "--migrate-config",
+        action="store_true",
+        help=(
+            "Allège le dernier fichier de la chaîne (config.json par défaut) de "
+            "ce que les précédents portent déjà, et de tous ses _comment, après "
+            "l'avoir sauvegardé en <fichier>.bak. La config effective est "
+            "inchangée. Puis quitte."
+        ),
+    )
+    parser.add_argument(
+        "--print-config",
+        action="store_true",
+        help=(
+            "Affiche la config effective (couches fusionnées, variables "
+            "d'environnement substituées, secrets masqués), puis quitte."
+        ),
     )
     parser.add_argument("--host", default=None, help="Override de l'adresse d'écoute")
     parser.add_argument("--port", type=int, default=None, help="Override du port")
@@ -172,8 +220,8 @@ def main() -> None:
         default=None,
         metavar="FICHIER",
         help=(
-            "Fichier des jetons OAuth des upstreams (défaut : <config>-tokens.json, "
-            "à côté de la config). Distinct de config.json à dessein."
+            "Fichier des jetons OAuth des upstreams (défaut : state/tokens.json, "
+            "à côté de config.json). Distinct de la config à dessein."
         ),
     )
     parser.add_argument(
@@ -228,23 +276,33 @@ def main() -> None:
         )
         sys.exit(1)
 
-    config_path = Path(args.config)
-    if not config_path.exists():
-        print(
-            f"Erreur : config introuvable '{config_path}'. "
-            "Copier config.sample.json → config.json et l'adapter.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     try:
-        cfg = load_config(config_path)
+        layer_paths, local_path = resolve_chain(args.config)
+        if args.migrate_config:
+            _migrate_and_exit(layer_paths, local_path)
+        loaded = load_layers(layer_paths, local_path)
+        cfg = loaded.cfg
+        if args.print_config:
+            print(json.dumps(mask_secrets(cfg), indent=2, ensure_ascii=False))
+            return
         host = args.host or cfg.get("host", "127.0.0.1")
         port = args.port or int(cfg["port"])
-        miaou_dist = resolve_miaou_dist(cfg, config_path)
+        miaou_dist = resolve_miaou_dist(cfg, loaded.miaou_dist_base)
     except ValueError as e:
         print(f"Erreur : {e}", file=sys.stderr)
         sys.exit(1)
+
+    _log(f"Config : {' + '.join(str(p) for p in layer_paths)}")
+    for name, where in loaded.unset_vars:
+        _log(f"  attention : ${{{name}}} non définie (clé {where}) — remplacée par \"\".")
+    if needs_slimming(layer_paths, local_path):
+        _log(
+            f"  {local_path} répète des valeurs des couches précédentes : "
+            f"`--migrate-config` l'allège (sauvegarde en {local_path.name}.bak)."
+        )
+    if args.tokens_file is None:
+        for line in migrate_legacy_state(local_path):
+            _log(f"  état : {line}")
 
     proxy_overrides = compute_proxy_env_overrides(args.proxy, args.noproxy)
     if proxy_overrides is not None:
@@ -276,7 +334,7 @@ def main() -> None:
 
     upstreams = build_upstreams(cfg, proxy_env_overrides=proxy_overrides)
 
-    tokens_path = args.tokens_file or _default_tokens_path(args.config)
+    tokens_path = args.tokens_file or _default_tokens_path(local_path)
     try:
         authorizers = build_upstream_authorizers(
             cfg,
@@ -292,9 +350,10 @@ def main() -> None:
     tool_map: dict[str, tuple[str, str]] = {}
     # Cache d'outils à côté du fichier de jetons : pas un secret, mais même
     # durée de vie. Sans lui, un upstream non autorisé n'aurait rien à lister.
-    catalog = ToolCatalogCache(Path(tokens_path).with_name(
-        Path(tokens_path).stem.replace("-tokens", "") + "-tools.json"
-    ))
+    catalog = ToolCatalogCache(
+        tools_cache_beside(args.tokens_file) if args.tokens_file
+        else default_tools_cache_path(local_path)
+    )
     mcp_server = build_proxy_server(
         upstreams, tool_map, authorizers=authorizers, catalog=catalog
     )

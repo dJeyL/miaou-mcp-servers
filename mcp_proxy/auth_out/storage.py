@@ -14,19 +14,19 @@ from pathlib import Path
 from typing import Any
 
 from ..logging import _log
+from ..state import default_tokens_path
 from .debug import _auth_debug_enabled
 
 
 _TOKENS_FILE_MODE = 0o600
 
 def _default_tokens_path(config_path: str | Path) -> Path:
-    """À côté de config.json, suffixé — pas dedans.
+    """Sous `state/`, à côté de config.json — pas dedans.
 
     config.json est ouvert et édité à la main ; un refresh token n'a rien à y
-    faire. Fichier distinct, donc, et à ajouter au .gitignore.
+    faire. Fichier distinct, donc, dans un dossier gitignoré (cf. `state.py`).
     """
-    cfg = Path(config_path)
-    return cfg.with_name(f"{cfg.stem}-tokens.json")
+    return default_tokens_path(config_path)
 
 
 def _write_secret_file(path: Path, payload: dict[str, Any]) -> None:

@@ -60,6 +60,11 @@ sans `uri`, `name` ou `description` absents, description trop longue, entrée qu
 pas un objet, skill servie non listée ; `build("empty")`, extension déclarée et listage
 vide. Ce qu'ils couvrent est jugé sur NOTRE lecture de la spec, aucun upstream tiers ne
 servant encore l'extension.
+`tests/test_proxy_layers.py` (config en couches, `state/`) joue les vecteurs de l'annexe A
+de la RFC 7386 sur `merge_patch`, et vérifie l'allègement comme PROPRIÉTÉ — config
+effective inchangée — sur une copie retouchée du vrai `config.defaults.json`, pas
+seulement sur des dicts choisis. `--print-config` et `--migrate-config` passent par
+`entry.main()` (`monkeypatch.chdir` sur `tmp_path`, `sys.argv` remplacé).
 `tests/test_proxy_webapp.py` (MIAOU servi sous `/app/`) monte un `dist/` factice dans
 `tmp_path` et l'interroge à trois niveaux : les purs de `webapp.py`, l'app de
 `build_app` sur `httpx2.ASGITransport` (wrapper ASGI compris), et un **vrai uvicorn**

@@ -24,6 +24,8 @@ miaou-mcp-servers/
 │   ├── upstream.py       # InProcess / Stdio / Http (ère négociée par `Client` ; skills : inprocess seulement)
 │   ├── netproxy.py       # override --proxy / --noproxy
 │   ├── config.py         # load_config, build_upstreams
+│   ├── layers.py         # chaîne config.defaults → config.site → config.json, Merge Patch, ${VAR}, --migrate-config
+│   ├── state.py          # state/ : tokens.json, tools-cache.json, déplacement des anciens <config>-*.json
 │   ├── server.py         # build_proxy_server, catalogue, instructions, relais du `_meta` d'outil
 │   ├── skills.py         # extension Skills agrégée : URI préfixées, bloc des instructions, repli read_skill
 │   ├── auth_in.py        # Resource Server OAuth (AB-1)
@@ -35,7 +37,7 @@ miaou-mcp-servers/
 │   ├── app.py            # build_app (Starlette)
 │   ├── webapp.py         # MIAOU servi sous /app/ : clé miaou_dist, MiaouStaticFiles, garde et avertissements
 │   └── entry.py          # CLI, main()
-├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker — versionné VIDE (.gitkeep), contenu gitignoré
+├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker — versionné VIDE (.gitkeep) ; contenu NON gitignoré, pour qu'un fork y versionne MIAOU — ne pas le committer ici
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
 │   ├── mcp_base.py       # classe de base partagée (MiaouMCPBase + make_opener + extension Skills)
@@ -67,6 +69,7 @@ miaou-mcp-servers/
 │   ├── test_brave.py
 │   ├── test_docs.py
 │   ├── test_proxy.py
+│   ├── test_proxy_layers.py  # config en couches (vecteurs RFC 7386, allègement), state/
 │   ├── test_skills.py    # extension Skills de mcp_base (vecteurs d'empreinte de la spec)
 │   ├── test_proxy_skills.py  # skills servies par le proxy : URI, `_meta`, bloc, repli
 │   ├── test_proxy_era.py  # ère négociée avec les upstreams stdio/http (vrais handshakes)
@@ -75,8 +78,10 @@ miaou-mcp-servers/
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante (lot AB-2)
 │   ├── test_proxy_webapp.py  # MIAOU servi sous /app/ (lot AO-1) : purs, ASGI, vrai uvicorn
 │   └── test_dev_auth_server.py  # serveur d'autorisation de développement (lot AB-1.3)
-├── config.sample.json    # template de config pour le proxy
-├── config.json           # (gitignored) config active du proxy
+├── config.defaults.json  # couche de BASE de la config, versionnée, lue telle quelle
+├── config.site.json      # (fork seulement, absent ici) valeurs communes d'une organisation
+├── config.json           # (gitignored) le propre d'une installation, par-dessus les deux
+├── state/                # (gitignored) jetons OAuth et cache d'outils du proxy
 ├── requirements.txt      # pour les utilisateurs sans uv
 ├── pyproject.toml        # métadonnées projet + config pytest (asyncio_mode=auto) + groupe dev
 │                         # + [project.scripts] mcp_proxy et le build-system qui le rend
@@ -108,7 +113,7 @@ Deux points qu'on ne devine pas depuis le tableau :
   moteurs depuis un CDN). Ne pas « faire le ménage » dans ce package au motif qu'il
   ne sert plus par défaut.
 - **`mcp_ddg` et `mcp_brave` sont dépréciés** — remplacés par `search`/`image_search`
-  de `mcp_web`, désactivés dans `config.sample.json`, conservés le temps de la
+  de `mcp_web`, désactivés dans `config.defaults.json`, conservés le temps de la
   transition (avertissement à chaque démarrage). `mcp_ddg` actif à côté de `mcp_web`
   ne partage pas son espacement vers DuckDuckGo.
 - **Pas d'outil sans config fonctionnelle** — `mcp_brave` refuse de s'initialiser sans
@@ -138,10 +143,11 @@ uv run --directory servers python -m mcp_web         # HTTP 127.0.0.1:8768
 uv run --directory servers python -m mcp_docs        # HTTP 127.0.0.1:8771
 
 # Proxy (agrège tout sur un seul port)
-cp config.sample.json config.json     # puis éditer config.json (clefs de config.search de web, etc.)
-uv run mcp_proxy                        # port défini dans config.json
+uv run mcp_proxy                        # config.defaults.json + config.site.json + config.json
+uv run mcp_proxy --print-config         # config effective, secrets masqués
+uv run mcp_proxy --migrate-config       # allège un config.json à l'ancienne (sauvegarde .bak)
 uv run mcp_proxy --port 8765            # override port
-uv run mcp_proxy --config autre.json
+uv run mcp_proxy --config autre.json   # remplace la chaîne ; répétable, en couches
 uv run mcp_proxy --proxy 10.0.0.1:3128  # force le proxy réseau vu par les upstreams
 uv run mcp_proxy --noproxy              # force l'absence de proxy vu par les upstreams
 ```
@@ -367,7 +373,14 @@ lots — piège déjà payé côté MIAOU.
 - **`docs/proxy.md`** — `mcp_proxy/` hors auth : les trois types d'upstream
   (inprocess/stdio/http), `build_upstreams`/`build_proxy_server`/`build_app` et le
   wrapper ASGI qui évite le 307 sur `/mcp`, l'override `--proxy`/`--noproxy` et ses
-  trois chemins d'application, le format de `config.json`, le pattern
+  trois chemins d'application, le format de `config.json` ; config en couches
+  (`layers.py` : chaîne `config.defaults.json` → `config.site.json` → `config.json`,
+  `--config` répétable qui la remplace, JSON Merge Patch sans variante, `${VAR}`
+  substitué APRÈS la fusion et hors clés `_*`, `miaou_dist` résolu contre la couche
+  qui le déclare, `--print-config` masqué, `--migrate-config` et son contrat de config
+  effective inchangée, `_comment` retirés, absences listées et jamais neutralisées
+  d'office, `.bak` jamais écrasée) et `state/` (`state.py`, `state/<nom>/` pour une
+  autre config, anciens fichiers déplacés sans réécriture), le pattern
   `build(config)` pour plusieurs instances d'un même module, ce que `call_tool`
   relaie d'un upstream stdio/http (`relay_call_result` : `content`, `isError`,
   `_meta` sans le `serverInfo` de l'upstream, pas `structuredContent`), ce qu'il rend en erreur depuis le SDK 2.x

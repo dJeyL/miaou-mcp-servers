@@ -718,7 +718,7 @@ class HttpUpstream(_RemoteSkills, Upstream):
                 raise RuntimeError(
                     f"{failure} (HTTP 401) — ce serveur exige une autorisation "
                     f"OAuth : ajouter un bloc \"auth\" à son entrée (cf. "
-                    f"_example_http_oauth de config.sample.json)."
+                    f"_example_http_oauth de config.defaults.json)."
                 ) from failure
             if failure is not None:
                 raise failure

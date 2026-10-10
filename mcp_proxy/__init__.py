@@ -6,10 +6,11 @@ in-process (import Python direct, pas de subprocess) ou stdio (subprocess extern
 Tous les outils upstream sont exposés préfixés du nom de serveur suivi de "__" :
     bench__echo, bench__get_image, weather__get_weather, …
 
-Configuration : config.json (non versionné, copier config.sample.json).
+Configuration : config.defaults.json (versionné), puis config.site.json et
+config.json s'ils existent, chacun patchant le précédent — cf. layers.py.
 
 Lancement :
-    uv run -m mcp_proxy                            # lit config.json, port dedans
+    uv run -m mcp_proxy                            # lit la chaîne de config, port dedans
     uv run -m mcp_proxy --config mon_config.json   # config alternative
     uv run -m mcp_proxy --host 0.0.0.0             # override host
     uv run -m mcp_proxy --port 8765                # override port

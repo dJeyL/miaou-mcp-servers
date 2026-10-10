@@ -51,7 +51,7 @@ def test_tokens_path_is_beside_config_not_inside_it():
     """config.json est ouvert et édité à la main : un refresh token n'y a rien
     à faire. Fichier distinct, nom dérivé pour rester trouvable."""
     path = _default_tokens_path("/etc/miaou/config.json")
-    assert path == Path("/etc/miaou/config-tokens.json")
+    assert path == Path("/etc/miaou/state/tokens.json")
     assert path != Path("/etc/miaou/config.json")
 
 

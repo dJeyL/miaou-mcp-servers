@@ -21,7 +21,7 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 **MIAOU ouvre désormais tous ces formats lui-même** — archives zip, PDF, classeurs
 Excel, documents Word et présentations PowerPoint — sans aucun serveur. Ce serveur
 n'est donc plus la voie normale d'ouverture d'un document, et il est **désactivé
-par défaut** dans `config.sample.json` depuis ce constat.
+par défaut** dans `config.defaults.json` depuis ce constat.
 
 Il n'est pas retiré pour autant, et ce n'est pas du conservatisme : l'ouverture
 native de MIAOU télécharge ses moteurs (pdf.js, mammoth, SheetJS, fflate) depuis
@@ -74,12 +74,36 @@ uv run servers/mcp_bench.py --transport stdio # mode stdio
 ### Proxy (agrège tout sur un seul port)
 
 ```bash
-cp config.sample.json config.json
-# Éditer config.json : clefs de recherche (web → config.search), activer/désactiver des serveurs
 uv run mcp_proxy
 ```
 
-`config.sample.json` active bench, weather et web par défaut en inprocess. La
+La config se lit en couches : `config.defaults.json` (versionné, la base, à ne pas
+éditer), puis `config.site.json` et `config.json` s'ils existent, chacun ne portant que
+ce qu'il change. Un `config.json` minimal pour donner une clef Brave à la recherche :
+
+```json
+{ "mcpServers": { "web": { "config": { "search": { "brave": { "api_key": "<clef>" } } } } } }
+```
+
+Les objets fusionnent clé par clé, `null` retire une clé, tout le reste remplace —
+tableaux compris (JSON Merge Patch, RFC 7386). Une valeur peut citer l'environnement :
+`"${BRAVE_API_KEY}"`, `"${VAR:-défaut}"`, `$$` pour un `$` littéral. `config.site.json`
+n'existe pas dans ce dépôt : c'est la couche d'un fork, pour les valeurs communes d'une
+organisation — absente en amont, elle ne crée jamais de conflit de merge.
+
+```bash
+uv run mcp_proxy --print-config     # config effective, secrets masqués
+uv run mcp_proxy --migrate-config   # allège un config.json copié de l'ancien config.sample.json
+```
+
+`--migrate-config` retire de `config.json` ce que les couches précédentes portent déjà,
+et tous ses `_comment`, après l'avoir sauvegardé en `config.json.bak` ; la config
+effective ne change pas. Il liste ce que la base apporte et que `config.json` n'avait
+pas — un serveur retiré de l'ancienne copie y revient actif, à neutraliser par
+`"disabled": true`. Le proxy le propose au démarrage tant que `config.json` répète la
+base, sans jamais réécrire le fichier de lui-même.
+
+`config.defaults.json` active bench, weather et web par défaut en inprocess. La
 recherche de web (`search`, `image_search`) essaie Brave, Ollama puis DuckDuckGo
 dans l'ordre de `config.search.order` ; un moteur à clef sans clef
 (`config.search.brave.api_key` / `BRAVE_API_KEY`, `config.search.ollama.api_key` /
@@ -369,7 +393,7 @@ l'enregistrement dynamique éventuellement déjà mémorisé. Si l'override disp
 la config, le proxy retombe dessus plutôt que d'en refaire un.
 
 **Les jetons ne vivent pas dans `config.json`** mais dans un fichier distinct,
-`<config>-tokens.json` à côté d'elle, réglable par `--tokens-file`. La config reste
+`state/tokens.json` à côté d'elle, réglable par `--tokens-file`. La config reste
 donc partageable, et les jetons survivent aux redémarrages — l'autorisation n'est à
 accorder qu'une fois.
 
@@ -441,6 +465,8 @@ miaou-mcp-servers/
 ├── mcp_proxy/            # proxy (package, point d'entrée principal)
 │   ├── upstream.py       # InProcess / Stdio / Http
 │   ├── config.py         # load_config, build_upstreams
+│   ├── layers.py         # chaîne de config, fusion, ${VAR}, --migrate-config
+│   ├── state.py          # state/ : jetons OAuth et cache d'outils
 │   ├── server.py         # build_proxy_server, catalogue d'outils
 │   ├── skills.py         # skills des upstreams, agrégées (extension Skills)
 │   ├── auth_in.py        # Resource Server OAuth (entrante)
@@ -461,7 +487,7 @@ miaou-mcp-servers/
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — obsolète
 ├── docs/                 # documentation par domaine, pour qui modifie le code
 │   ├── servers.md        # les six serveurs en détail (outils, contrats, env)
-│   ├── proxy.md          # upstreams, config.json, override de proxy réseau, /app/
+│   ├── proxy.md          # upstreams, config en couches, override de proxy réseau, /app/
 │   ├── auth.md           # auth OAuth entrante et sortante
 │   ├── miaou-contract.md # surface de contact avec MIAOU (transport, skills, REF_UNKNOWN)
 │   ├── tls.md            # magasin de confiance système (truststore)
@@ -478,6 +504,7 @@ miaou-mcp-servers/
 │   ├── test_brave.py
 │   ├── test_docs.py
 │   ├── test_proxy.py
+│   ├── test_proxy_layers.py         # config en couches, state/
 │   ├── test_skills.py               # extension Skills des serveurs
 │   ├── test_proxy_skills.py         # skills servies par le proxy
 │   ├── test_proxy_remote_skills.py  # skills relayées d'upstreams stdio et http
@@ -487,7 +514,7 @@ miaou-mcp-servers/
 │   ├── test_proxy_webapp.py         # MIAOU servi sous /app/ (dont un vrai uvicorn)
 │   ├── test_dev_auth_server.py      # serveur d'autorisation de développement
 │   └── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
-├── config.sample.json
+├── config.defaults.json  # couche de base de la config (config.site.json, config.json par-dessus)
 ├── requirements.txt
 ├── pyproject.toml        # métadonnées + config pytest (asyncio_mode=auto) + groupe dev
 └── uv.lock               # lock uv, versionné

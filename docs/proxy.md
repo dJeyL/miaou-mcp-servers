@@ -98,7 +98,9 @@ mcp_proxy/ (paquet, à la racine du projet)
 │   └── _RemoteSkills      : skills de stdio/http par le fil, si `serves_skills`
 │                            (ère moderne ET extension déclarée)
 ├── netproxy.py    override --proxy / --noproxy (calcul pur, n'applique rien)
-├── config.py      lit config.json → build_upstreams()
+├── layers.py      chaîne de config, fusion (RFC 7386), ${VAR}, --migrate-config
+├── config.py      config fusionnée → build_upstreams()
+├── state.py       state/ : tokens.json, tools-cache.json
 ├── server.py      build_proxy_server() : mcp.server.Server, on_list_tools / on_call_tool
 │   ├── list_tools → agrège tous les upstreams, préfixe les noms avec "{name}__"
 │   ├── call_tool  → dépréfixe, route vers l'upstream concerné
@@ -548,6 +550,100 @@ l'affaire du client.
 
 ## Configuration du proxy (`config.json`)
 
+### Couches (`layers.py`)
+
+La config effective est la fusion d'une chaîne, du général au particulier, chaque
+fichier lu s'il existe (au moins un) :
+
+| Fichier | Versionné | Rôle |
+|---|---|---|
+| `config.defaults.json` | dépôt public | la base, documentée par ses `_comment` ; se lit, ne se copie plus |
+| `config.site.json` | fork seulement | valeurs communes d'une organisation (upstreams internes, URL, realms) |
+| `config.json` | jamais | le propre d'une installation : clefs, identifiants, overrides |
+
+`config.site.json` est **absent du dépôt public, à dessein** : un fichier qui n'existe
+pas en amont ne crée aucun conflit quand le fork merge l'amont — un `config.site.json`
+public, même vide, en recréerait un à chaque retouche. Il n'est pas gitignoré non plus,
+pour que le fork le committe sans toucher au `.gitignore`.
+
+`--config` (répétable) **remplace** la chaîne : `--config autre.json` seul lit ce seul
+fichier, comme avant les couches, et `--config a.json --config b.json` pose `b` sur
+`a`. Le dernier fichier de la chaîne (`config.json` pour la chaîne par défaut, même
+absent) est le **maillon local** : cible de `--migrate-config`, emplacement de
+`state/`. Le démarrage journalise la chaîne lue (`Config : a + b`).
+
+**Fusion : JSON Merge Patch (RFC 7386), sans variante.** Les objets fusionnent
+récursivement, `null` supprime la clé, tout le reste remplace — tableaux compris :
+`search.order` ou `args` ne se concatènent jamais, un ordre de moteurs n'a pas de sens
+mis bout à bout. Le choix d'une RFC plutôt que d'un deep-merge maison : la sémantique
+se documente par un lien, et l'opération inverse (le patch minimal, cf. allègement)
+est bien définie. La limite de la RFC — pas de valeur `null` posable — est sans effet :
+aucune clé ne distingue `null` de l'absence. Pour retirer un serveur de la base,
+`"disabled": true` se lit mieux que `null`. `port` est exigé sur le résultat, pas par
+couche.
+
+**`miaou_dist` relatif** se résout contre la DERNIÈRE couche qui déclare la clé
+(`LoadedConfig.miaou_dist_base`), pas contre le maillon local : sinon un
+`--config ailleurs/x.json` qui ne la redéclare pas déplacerait le chemin d'une autre
+couche.
+
+**Variables d'environnement.** Dans les valeurs chaînes : `${VAR}`, `${VAR:-défaut}`
+(absente ou vide), `${VAR-défaut}` (absente seulement), `$$` pour un `$` littéral ; un
+`$` suivi d'autre chose que `{` reste tel quel. Syntaxe de docker compose, pour qu'un
+même `.env` serve aux deux (`env_file` facultatif dans `docker-compose.yml`). Substitué
+**après** la fusion : une valeur littérale de `config.json` qui remplace un
+`${ORG_API_SECRET}` de `config.site.json` n'exige rien de l'environnement. Une variable
+absente sans défaut devient `""` et est signalée au démarrage avec sa clé, comme le
+fait compose — et une clé vide fait déjà écarter un moteur ou refuser un serveur
+(« pas d'outil sans config fonctionnelle »). Clés `_*` jamais substituées (un
+`_comment` cite la syntaxe) ; bloc `disabled` substitué quand même — `--auth`
+réveille un bloc `auth` neutralisé — mais ses variables manquantes tues. Les
+variables propres à un serveur (`BRAVE_API_KEY`, `OLLAMA_API_KEY`) restent lues par
+lui en repli d'une clé vide : rien ne change pour elles.
+
+**`--print-config`** affiche la config effective (fusion + substitution) et quitte.
+Sortie faite pour être collée dans un ticket, donc masquée en `***` : valeurs non
+vides des clés dont le NOM ressemble à un secret (`secret`, `pass` non suivi d'une
+lettre, `password`, `pwd`, `api_key`/`api-key`, `token`, `auth` — casse ignorée,
+d'où `LOGS_PASS` ou un en-tête `X-Auth`), sauf suffixe public (`_endpoint`,
+`_url`, `_uri`, `_method`, `_scope(s)` : `token_endpoint` est ce qu'on vient lire
+dans un diagnostic OAuth) ; toutes les valeurs d'un `env`, aux noms imprévisibles ;
+le mot de passe d'une URL `scheme://user:mdp@hôte`. C'est une liste noire : elle
+réduit l'exposition, elle ne la garantit pas — un nom de clé imprévu passe en clair.
+
+**`--migrate-config`** allège le maillon local et quitte. Contrat : la config
+effective est INCHANGÉE — `merge_patch(base, allégé) == merge_patch(base, local)` aux
+`_comment*` près, propriété testée sur une copie retouchée du vrai
+`config.defaults.json`. Sont retirées les valeurs identiques à la fusion des couches
+qui le précèdent, et **tous** les `_comment*`, changés ou non (ils documentent la
+base ; une copie locale ne fait que vieillir). Pas de comparaison à l'historique des
+samples : une valeur copiée d'un ancien sample et changée depuis en amont reste comme
+override, visible au diff. Les clés de la base absentes du fichier sont **listées,
+jamais neutralisées d'office** : la fusion les ajoute déjà, migration ou non, et dans
+un `config.json` léger l'absence veut dire « hériter » — un `disabled: true` écrit
+d'office y couperait un serveur. Pour une config à l'ancienne, c'est la liste à
+relire (serveur ôté de la copie qui revient actif). Sauvegarde en `<fichier>.bak`
+(mode conservé, le fichier porte des secrets) ; refus si elle existe déjà, une
+seconde migration écraserait l'original. Jamais de réécriture au démarrage : le
+proxy se borne à la proposer tant que le maillon local répète la base
+(`needs_slimming`).
+
+### `state/` (`state.py`)
+
+Ce que le proxy écrit lui-même : `state/tokens.json` (jetons OAuth sortants — un
+ÉTAT, le perdre redemande chaque autorisation) et `state/tools-cache.json` (cache
+d'outils, reconstructible). Nommés pour ne pas se confondre, et hors du motif
+`config*.json`. À côté du maillon local ; une config d'un autre nom range son état
+sous `state/<nom>/`, deux instances du même dossier ne partageant pas leurs jetons.
+Les anciens `<config>-tokens.json` / `<config>-tools.json` sont **déplacés** au
+démarrage (`os.replace`, contenu et mode 0600 intacts), jamais écrasant un état déjà
+présent dans `state/` — l'ancien est alors laissé et signalé. `--tokens-file` explicite
+court-circuite tout ça : rien n'est déplacé, le cache d'outils reste à côté de lui sous
+son ancien nom. Sous Docker, `docker-compose.yml` monte le volume `miaou-state` sur
+`/app/state` : sans lui, une recréation du conteneur jetait les jetons.
+
+### Format
+
 ```json
 {
   "port": 8765,
@@ -637,8 +733,8 @@ comme application (une PWA ne s'installe pas depuis un fichier). Code : `webapp.
 { "port": 8765, "miaou_dist": "../miaou/dist", "mcpServers": { … } }
 ```
 
-**Résolution.** Chemin relatif au fichier `config.json`, pas au répertoire courant
-(qui dépend de la façon de lancer) ; `~` est développé ; absolu accepté. `null` ou `""`
+**Résolution.** Chemin relatif au fichier de config qui déclare la clé (cf. « Couches »),
+pas au répertoire courant (qui dépend de la façon de lancer) ; `~` est développé ; absolu accepté. `null` ou `""`
 valent absence. Une valeur qui n'est pas une chaîne est une erreur de config.
 
 **Routes.** `/app/` rend `miaou.html` — qui ne s'appelle pas `index.html`, d'où une
@@ -688,10 +784,15 @@ aucun fichier caché (`.gitkeep`, `.DS_Store`).
   démarrage est servi sans redémarrage. `check_config` de `StaticFiles` est
   neutralisé, sans quoi un dossier absent lèverait à la première requête (500).
 
-**Docker.** Le dossier `miaou_dist/` du dépôt est versionné vide (`.gitkeep`, son
-contenu gitignoré) et le `Dockerfile` le copie toujours : copier le `dist/` de MIAOU
+**Docker.** Le dossier `miaou_dist/` du dépôt est versionné vide (`.gitkeep`) et le
+`Dockerfile` le copie toujours. Son contenu n'est PAS gitignoré : un fork peut y
+versionner une copie embarquée de MIAOU sans toucher au `.gitignore` (ce qui lui
+coûterait un conflit à chaque merge de l'amont) ; ici, une copie posée pour un build
+apparaît donc en non suivi, à ne pas committer : copier le `dist/` de MIAOU
 dedans AVANT le build, et poser `"miaou_dist": "miaou_dist"` dans le `config.json`
-copié dans l'image. Sans copie préalable, l'image se construit quand même ; le proxy
+copié dans l'image (le `Dockerfile` copie la chaîne : `config.defaults.json`, puis
+`config.site.json` et `config.json` s'ils existent). Sans copie préalable, l'image se
+construit quand même ; le proxy
 avertit alors au démarrage si la clé est posée, et ne sert rien si elle ne l'est pas.
 
 **Pas de compression.** `miaou.html` pèse ~1,5 Mo et part tel quel : sans enjeu en

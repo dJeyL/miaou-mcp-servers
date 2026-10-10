@@ -14,7 +14,11 @@ RUN uv sync --frozen --no-dev
 # le process du proxy, pas de subprocess — dev_auth_server.py n'est donc pas
 # nécessaire (--with-dev-auth n'est pas utilisé ici).
 COPY servers ./servers
-COPY config.json ./config.json
+# Chaîne de config : la base versionnée, puis la couche d'un fork et la config
+# locale s'ils existent — le `[n]` en fait des motifs, qu'un COPY tolère sans
+# correspondance tant qu'une source au moins existe. Noms explicites et non
+# `config*.json`, qui embarquerait aussi d'anciens `config-tokens.json`.
+COPY config.defaults.json config.site.jso[n] config.jso[n] ./
 # Copie du dist/ de MIAOU, servie sous /app/ si config.json porte
 # "miaou_dist": "miaou_dist". Le dossier est versionné vide (.gitkeep) : l'image
 # se construit sans copie préalable, et le proxy ne sert alors rien.
