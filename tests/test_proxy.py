@@ -1183,9 +1183,7 @@ def test_main_enables_system_trust_store_before_building_upstreams(tmp_path, mon
     )
     monkeypatch.setattr(sys, "argv", ["mcp_proxy", "--config", str(cfg)])
 
-    import uvicorn
-
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: order.append("serve"))
+    monkeypatch.setattr(mcp_proxy.entry, "serve_http", lambda *a, **kw: order.append("serve"))
     mcp_proxy.main()
 
     assert order == ["trust", "upstreams", "serve"]
@@ -1453,3 +1451,107 @@ async def test_lifespan_leaves_instructions_none_without_declarations():
     async with _run_lifespan(app):
         assert server.instructions is None
         assert server.create_initialization_options().instructions is None
+
+
+# ---------------------------------------------------------------------------
+# Redémarrage sur place (RESTART_SIGNAL)
+# ---------------------------------------------------------------------------
+
+class FakeUvicorn:
+    """uvicorn.Server qui, en guise de service, s'envoie `signum` (None : rien)
+    puis attend qu'on lui demande de s'arrêter, comme la boucle du vrai. Sert
+    aussi le mode dev-auth : `serve()` ne s'envoie le signal que pour le
+    serveur du proxy (le premier construit), l'AS se contente d'attendre."""
+
+    signum: int | None = None
+    started_ok = True
+    instances: list["FakeUvicorn"] = []
+
+    def __init__(self, config):
+        self.config = config
+        self.should_exit = False
+        self.started = False
+        FakeUvicorn.instances.append(self)
+
+    def run(self):
+        self.started = self.started_ok
+        if self.signum is not None:
+            os.kill(os.getpid(), self.signum)
+        while not self.should_exit and self.signum is not None:
+            pass
+
+    async def serve(self):
+        import asyncio
+
+        if self is FakeUvicorn.instances[0] and self.signum is not None:
+            os.kill(os.getpid(), self.signum)
+        while not self.should_exit:
+            await asyncio.sleep(0.01)
+
+
+@pytest.fixture
+def uvicorn_double(monkeypatch):
+    import signal
+
+    import uvicorn
+
+    previous = signal.getsignal(mcp_proxy.entry.RESTART_SIGNAL)
+    monkeypatch.setattr(FakeUvicorn, "instances", [])
+    monkeypatch.setattr(uvicorn, "Server", FakeUvicorn)
+    execs = []
+    monkeypatch.setattr(
+        mcp_proxy.entry.os, "execv", lambda path, argv: execs.append((path, list(argv)))
+    )
+    monkeypatch.setattr(sys, "orig_argv", ["python", "/venv/bin/mcp_proxy", "--port", "8765"])
+    yield execs
+    signal.signal(mcp_proxy.entry.RESTART_SIGNAL, previous)
+
+
+def test_restart_signal_reexecs_the_same_command_line(uvicorn_double, monkeypatch):
+    monkeypatch.setattr(FakeUvicorn, "signum", mcp_proxy.entry.RESTART_SIGNAL)
+    mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765)
+    assert uvicorn_double == [
+        (sys.executable, ["python", "/venv/bin/mcp_proxy", "--port", "8765"])
+    ]
+    assert FakeUvicorn.instances[0].config.timeout_graceful_shutdown == (
+        mcp_proxy.entry.SHUTDOWN_GRACE_S
+    )
+
+
+def test_plain_shutdown_does_not_restart(uvicorn_double):
+    mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765)
+    assert uvicorn_double == []
+
+
+def test_failed_startup_exits_like_uvicorn_run(uvicorn_double, monkeypatch):
+    """`uvicorn.run` sort en 3 si le serveur n'a pas démarré (port pris) ;
+    `Server.run` non — serve_http doit le reprendre, sinon un démarrage raté
+    sortirait en 0."""
+    monkeypatch.setattr(FakeUvicorn, "started_ok", False)
+    with pytest.raises(SystemExit) as exc:
+        mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765)
+    assert exc.value.code == 3
+    assert uvicorn_double == []
+
+
+def test_restart_signal_also_restarts_with_dev_auth(uvicorn_double, monkeypatch, capsys):
+    """Mode --with-dev-auth : le signal arrête le proxy, l'AS suit, puis exec ;
+    la clé de l'AS étant régénérée, le journal dit que les jetons sont perdus."""
+    monkeypatch.setattr(FakeUvicorn, "signum", mcp_proxy.entry.RESTART_SIGNAL)
+    mcp_proxy.entry.run_with_dev_auth(
+        object(), "127.0.0.1", 8765, 8787, "http://127.0.0.1:8787"
+    )
+    assert len(uvicorn_double) == 1
+    assert all(s.should_exit for s in FakeUvicorn.instances)
+    assert "jetons déjà émis sont invalides" in capsys.readouterr().err
+
+
+def test_dev_auth_plain_shutdown_does_not_restart(uvicorn_double, monkeypatch):
+    async def stop_at_once(self):
+        self.should_exit = True
+
+    monkeypatch.setattr(FakeUvicorn, "serve", stop_at_once)
+    mcp_proxy.entry.run_with_dev_auth(
+        object(), "127.0.0.1", 8765, 8787, "http://127.0.0.1:8787"
+    )
+    assert uvicorn_double == []

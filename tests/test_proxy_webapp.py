@@ -363,9 +363,7 @@ def _run_main(tmp_path, monkeypatch, cfg: dict) -> dict:
         return real_build_app(*a, **kw)
 
     monkeypatch.setattr(mcp_proxy.entry, "build_app", spy)
-    import uvicorn
-
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(mcp_proxy.entry, "serve_http", lambda *a, **kw: None)
     mcp_proxy.main()
     return seen
 

@@ -1,11 +1,19 @@
-"""Point d'entrée CLI : parsing d'arguments, amorçage, lancement uvicorn."""
+"""Point d'entrée CLI : parsing d'arguments, amorçage, lancement uvicorn.
+
+`kill -USR1 <pid>` redémarre le proxy sur place en relisant le code (voir
+`serve_http`).
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from types import FrameType
 from typing import Any
 
 from mcp_base import enable_system_trust_store
@@ -32,6 +40,64 @@ from .netproxy import apply_proxy_env_overrides_to_process, compute_proxy_env_ov
 from .server import ToolCatalogCache, build_proxy_server
 from .state import default_tools_cache_path, migrate_legacy_state, tools_cache_beside
 from .webapp import APP_PREFIX, miaou_dist_warnings, resolve_miaou_dist
+
+#: Redémarrage sur place : un hook post-commit local l'envoie à l'instance du
+#: poste. Pas SIGHUP : c'est ce que reçoit le processus quand on ferme son
+#: terminal, il renaîtrait orphelin en gardant le port.
+RESTART_SIGNAL = signal.SIGUSR1
+
+#: À l'arrêt, les requêtes en cours finissent ; au-delà (flux SSE d'une session
+#: MCP restée ouverte), elles sont coupées. Ne borne pas le shutdown du
+#: lifespan, qui referme ensuite les upstreams.
+SHUTDOWN_GRACE_S = 5
+
+
+def _on_restart_signal(server: Any) -> Callable[[], bool]:
+    """Pose le gestionnaire de RESTART_SIGNAL : il demande à `server` (un
+    `uvicorn.Server`) de s'arrêter comme sur Ctrl-C. Renvoie de quoi savoir,
+    une fois l'arrêt fini, si c'est ce signal qui l'a provoqué."""
+    requested = False
+
+    def on_restart(signum: int, frame: FrameType | None) -> None:
+        nonlocal requested
+        requested = True
+        server.should_exit = True
+
+    signal.signal(RESTART_SIGNAL, on_restart)
+    return lambda: requested
+
+
+def _reexec() -> None:
+    """Remplace le processus par sa propre ligne de commande : même pid, même
+    terminal, code relu. Appelé seulement après un arrêt COMPLET, lifespan
+    compris — les upstreams stdio sont alors refermés, pas orphelins. Ne
+    repasse pas par `uv run` : une dépendance ajoutée n'est pas installée."""
+    _log(f"redémarrage : {' '.join(sys.orig_argv)}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, sys.orig_argv)
+
+
+def serve_http(app: Any, host: str, port: int) -> None:
+    """uvicorn, plus un redémarrage sur RESTART_SIGNAL : arrêt en douceur, puis
+    exec de la même ligne de commande. Un code qui ne s'importe plus meurt au
+    redémarrage."""
+    import uvicorn
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app, host=host, port=port, log_level="info",
+            timeout_graceful_shutdown=SHUTDOWN_GRACE_S,
+        )
+    )
+    restart_requested = _on_restart_signal(server)
+    server.run()
+    if not server.started:
+        # Ce que fait `uvicorn.run` (port pris, lifespan en échec) : sans lui,
+        # un démarrage raté sortirait en 0.
+        sys.exit(3)
+    if restart_requested():
+        _reexec()
 
 
 def run_with_dev_auth(
@@ -81,7 +147,10 @@ def run_with_dev_auth(
         print(line, file=sys.stderr, flush=True)
 
     proxy_server = uvicorn.Server(
-        uvicorn.Config(proxy_app, host=host, port=port, log_level="info")
+        uvicorn.Config(
+            proxy_app, host=host, port=port, log_level="info",
+            timeout_graceful_shutdown=SHUTDOWN_GRACE_S,
+        )
     )
     auth_server = uvicorn.Server(
         uvicorn.Config(
@@ -106,13 +175,24 @@ def run_with_dev_auth(
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 auth_task.cancel()
 
+    # Arrêter le proxy suffit : l'AS le suit (`_serve_both`).
+    restart_requested = _on_restart_signal(proxy_server)
     try:
         asyncio.run(_serve_both())
     except KeyboardInterrupt:
         # `uvicorn.run()` avale le Ctrl-C ; `asyncio.run()` non, et laisserait
         # une trace KeyboardInterrupt à chaque arrêt. Sortie silencieuse, pour
         # que les deux modes de lancement se terminent de la même façon.
-        pass
+        return
+    if restart_requested():
+        # La paire de clés de l'AS ne vit qu'en mémoire : la nouvelle ne
+        # vérifie aucun jeton émis par l'ancienne.
+        _log(
+            "redémarrage : nouvelle clé du serveur d'autorisation de "
+            "développement, les jetons déjà émis sont invalides "
+            "(clients à ré-autoriser)."
+        )
+        _reexec()
 
 
 def _migrate_and_exit(layer_paths: list[Path], local_path: Path) -> None:
@@ -361,8 +441,6 @@ def main() -> None:
         mcp_server, upstreams, auth=auth, authorizers=authorizers, miaou_dist=miaou_dist
     )
 
-    import uvicorn
-
     if auth is not None:
         _log(f"Auth OAuth entrante ACTIVE — émetteur accepté : {auth['issuer_url']}")
         _log(f"  ressource protégée : {auth['resource_url']}")
@@ -381,7 +459,7 @@ def main() -> None:
     print(f"miaou-proxy → http://{host}:{port}/mcp  (Ctrl-C pour arrêter)")
 
     if args.with_dev_auth is None:
-        uvicorn.run(app, host=host, port=port, log_level="info")
+        serve_http(app, host=host, port=port)
         return
 
     run_with_dev_auth(

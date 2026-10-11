@@ -120,9 +120,41 @@ mcp_proxy/ (paquet, à la racine du projet)
 │   └── MIAOU (facultatif) : routes de webapp.py, posées après /mcp
 ├── webapp.py      clé `miaou_dist` : resolve_miaou_dist(), miaou_dist_warnings(),
 │                  MiaouStaticFiles et build_miaou_routes() (/app/ et /)
-└── entry.py       main() — CLI ; et run_with_dev_auth() : --with-dev-auth, proxy
-                   ET AS de développement dans ce process, sur DEUX ports
+└── entry.py       main() — CLI ; serve_http() : uvicorn + redémarrage sur SIGUSR1 ;
+                   et run_with_dev_auth() : --with-dev-auth, proxy ET AS de
+                   développement dans ce process, sur DEUX ports
 ```
+
+### Redémarrage sur place (`SIGUSR1`)
+
+`kill -USR1 <pid>` arrête le proxy en douceur (`SHUTDOWN_GRACE_S` = 5 s pour les
+requêtes en cours, au-delà un flux SSE resté ouvert est coupé), puis `os.execv` relance
+sa propre ligne de commande (`sys.orig_argv`) : même pid, même terminal, code relu. Le
+projet étant installé en editable par uv, c'est bien le code du dépôt. Usage : un hook
+git `post-commit` local, non versionné, l'envoie à l'instance du poste après chaque
+commit sur `main`.
+
+- **Pas SIGHUP** : c'est ce que reçoit le processus à la fermeture de son terminal, il
+  renaîtrait orphelin en gardant le port.
+- **L'exec n'arrive qu'après l'arrêt COMPLET**, lifespan compris : les upstreams stdio
+  sont refermés, pas laissés orphelins, et relancés avec leur code relu. Un shutdown de
+  lifespan bloqué n'est pas borné par `SHUTDOWN_GRACE_S`.
+- **Pas de `uv run` au redémarrage** : une dépendance ajoutée n'est pas installée, et un
+  code qui ne s'importe plus meurt au redémarrage. Changer une dépendance, ou
+  `serve_http`/`_on_restart_signal` eux-mêmes, exige un vrai relancement — une instance
+  au code sans gestionnaire MEURT au SIGUSR1 (action par défaut).
+- **Perdu** : les sessions MCP (le client reçoit un 404 et refait `initialize`) et les
+  parcours OAuth sortants en cours. Jetons et cache d'outils sont dans `state/`.
+- **`--with-dev-auth`** : le signal arrête le proxy, l'AS suit (`_serve_both`), puis
+  exec. La paire de clés de l'AS ne vivant qu'en mémoire, les jetons entrants déjà émis
+  deviennent invalides — le journal le dit, les clients sont à ré-autoriser.
+- `serve_http` remplace `uvicorn.run` et en reprend la sortie en 3 sur démarrage raté
+  (port pris), que `Server.run` seul ne fait pas.
+- **Cibler le bon processus** : `uv run` reste le parent, et sa ligne de commande
+  contient `-m mcp_proxy` en forme `uv run python -m mcp_proxy`. uv n'a pas de
+  gestionnaire de SIGUSR1 : le motif `pkill -f` du hook s'ancre sur l'interpréteur
+  (`^([^ ]*/)?python[0-9.]* ([^ ]*/bin/mcp_proxy|-m mcp_proxy)( |$)`). Il vise toutes
+  les instances du poste, port compris.
 
 **Ce que `call_tool` relaie.** Un upstream stdio ou http rend son `CallToolResult` à travers
 `relay_call_result` (upstream.py) : `content`, `isError` et `_meta` passent — sauf, dans

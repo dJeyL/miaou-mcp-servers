@@ -75,7 +75,13 @@ uv run servers/mcp_bench.py --transport stdio # mode stdio
 
 ```bash
 uv run mcp_proxy
+kill -USR1 <pid>   # redémarre sur place (même pid, code relu)
 ```
+
+`SIGUSR1` arrête le proxy en douceur (5 s pour les requêtes en cours) puis le relance
+par `exec`, même pid et même terminal. Ça ne repasse pas par `uv run` : une dépendance
+modifiée demande un vrai relancement. Les sessions MCP en cours sont perdues, et avec
+`--with-dev-auth` les jetons émis par le serveur d'autorisation de développement.
 
 La config se lit en couches : `config.defaults.json` (versionné, la base, à ne pas
 éditer), puis `config.site.json` et `config.json` s'ils existent, chacun ne portant que
@@ -473,7 +479,7 @@ miaou-mcp-servers/
 │   ├── auth_out/         # client OAuth d'upstreams tiers (sortante), package
 │   ├── app.py            # application Starlette
 │   ├── webapp.py         # MIAOU servi sous /app/ (clé miaou_dist)
-│   └── entry.py          # CLI, main()
+│   └── entry.py          # CLI, main(), serve_http (redémarrage sur SIGUSR1)
 ├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker (versionné vide)
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/

@@ -36,7 +36,7 @@ miaou-mcp-servers/
 │   │   └── authorizer.py # parcours, renouvellement, routes Starlette
 │   ├── app.py            # build_app (Starlette)
 │   ├── webapp.py         # MIAOU servi sous /app/ : clé miaou_dist, MiaouStaticFiles, garde et avertissements
-│   └── entry.py          # CLI, main()
+│   └── entry.py          # CLI, main(), serve_http (redémarrage sur SIGUSR1)
 ├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker — versionné VIDE (.gitkeep) ; contenu NON gitignoré, pour qu'un fork y versionne MIAOU — ne pas le committer ici
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
@@ -150,7 +150,17 @@ uv run mcp_proxy --port 8765            # override port
 uv run mcp_proxy --config autre.json   # remplace la chaîne ; répétable, en couches
 uv run mcp_proxy --proxy 10.0.0.1:3128  # force le proxy réseau vu par les upstreams
 uv run mcp_proxy --noproxy              # force l'absence de proxy vu par les upstreams
+kill -USR1 <pid>                        # redémarre le proxy sur place, code relu
 ```
+
+**Instance locale du proxy** : lancée par l'utilisateur au premier plan dans un terminal, pas
+sous launchd ; `.git/hooks/post-commit` (non versionné) lui envoie SIGUSR1 après chaque
+commit sur `main`, ce qui la redémarre sur place (`serve_http`, `docs/proxy.md`).
+`execv` ne repasse pas par `uv run` : un changement de dépendance, ou du gestionnaire
+lui-même, exige un relancement manuel AVANT le commit — une instance au code sans
+gestionnaire meurt au SIGUSR1, et le hook dit quand même « redémarré ». Le motif du hook
+vise toutes les instances du poste : un proxy de test lancé à côté se redémarre aussi,
+et un `pkill` de test au même motif touche l'instance de l'utilisateur.
 
 ### Avec pip
 
@@ -372,7 +382,10 @@ lots — piège déjà payé côté MIAOU.
   `READ_CAP`, sécurité archives, locales des headings docx).
 - **`docs/proxy.md`** — `mcp_proxy/` hors auth : les trois types d'upstream
   (inprocess/stdio/http), `build_upstreams`/`build_proxy_server`/`build_app` et le
-  wrapper ASGI qui évite le 307 sur `/mcp`, l'override `--proxy`/`--noproxy` et ses
+  wrapper ASGI qui évite le 307 sur `/mcp`, le redémarrage sur place au SIGUSR1
+  (`serve_http` : exec après l'arrêt complet, lifespan compris, sans `uv run` ; clés
+  de `--with-dev-auth` perdues ; motif `pkill` ancré sur l'interpréteur et non sur
+  son parent uv), l'override `--proxy`/`--noproxy` et ses
   trois chemins d'application, le format de `config.json` ; config en couches
   (`layers.py` : chaîne `config.defaults.json` → `config.site.json` → `config.json`,
   `--config` répétable qui la remplace, JSON Merge Patch sans variante, `${VAR}`
