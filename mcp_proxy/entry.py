@@ -95,7 +95,13 @@ def serve_http(app: Any, host: str, port: int) -> None:
         )
     )
     restart_requested = _on_restart_signal(server)
-    server.run()
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        # Après un arrêt sur Ctrl-C, `Server.run` relève le SIGINT qu'il a
+        # capturé ; `uvicorn.run` l'avale, sans quoi chaque arrêt laisse une
+        # trace KeyboardInterrupt.
+        pass
     if not server.started:
         # Ce que fait `uvicorn.run` (port pris, lifespan en échec) : sans lui,
         # un démarrage raté sortirait en 0.

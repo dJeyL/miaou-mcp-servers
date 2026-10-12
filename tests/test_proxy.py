@@ -1531,6 +1531,19 @@ def test_plain_shutdown_does_not_restart(uvicorn_double):
     assert uvicorn_double == []
 
 
+def test_ctrl_c_exits_quietly_like_uvicorn_run(uvicorn_double, monkeypatch):
+    """`Server.run` relève le SIGINT capturé une fois l'arrêt fini ; comme
+    `uvicorn.run`, serve_http doit l'avaler plutôt que laisser une trace."""
+
+    def interrupted(self):
+        self.started = True
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(FakeUvicorn, "run", interrupted)
+    mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765)
+    assert uvicorn_double == []
+
+
 def test_failed_startup_exits_like_uvicorn_run(uvicorn_double, monkeypatch):
     """`uvicorn.run` sort en 3 si le serveur n'a pas démarré (port pris) ;
     `Server.run` non — serve_http doit le reprendre, sinon un démarrage raté

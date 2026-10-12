@@ -151,8 +151,10 @@ commit sur `main`.
 - **`--with-dev-auth`** : le signal arrête le proxy, l'AS suit (`_serve_both`), puis
   exec. La paire de clés de l'AS ne vivant qu'en mémoire, les jetons entrants déjà émis
   deviennent invalides — le journal le dit, les clients sont à ré-autoriser.
-- `serve_http` remplace `uvicorn.run` et en reprend la sortie en 3 sur démarrage raté
-  (port pris), que `Server.run` seul ne fait pas.
+- `serve_http` remplace `uvicorn.run` et en reprend deux gestes que `Server.run` seul ne
+  fait pas : la sortie en 3 sur démarrage raté (port pris), et le `KeyboardInterrupt`
+  avalé — `Server.run` relève le SIGINT capturé après l'arrêt, d'où une trace à
+  chaque Ctrl-C sans lui.
 - **Cibler le bon processus** : `uv run` reste le parent, et sa ligne de commande
   contient `-m mcp_proxy` en forme `uv run python -m mcp_proxy`. uv n'a pas de
   gestionnaire de SIGUSR1 : le motif `pkill -f` du hook s'ancre sur l'interpréteur
