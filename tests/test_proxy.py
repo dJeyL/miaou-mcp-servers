@@ -1495,7 +1495,8 @@ def uvicorn_double(monkeypatch):
 
     import uvicorn
 
-    previous = signal.getsignal(mcp_proxy.entry.RESTART_SIGNAL)
+    restart_signal = mcp_proxy.entry.RESTART_SIGNAL
+    previous = restart_signal and signal.getsignal(restart_signal)
     monkeypatch.setattr(FakeUvicorn, "instances", [])
     monkeypatch.setattr(uvicorn, "Server", FakeUvicorn)
     execs = []
@@ -1504,9 +1505,16 @@ def uvicorn_double(monkeypatch):
     )
     monkeypatch.setattr(sys, "orig_argv", ["python", "/venv/bin/mcp_proxy", "--port", "8765"])
     yield execs
-    signal.signal(mcp_proxy.entry.RESTART_SIGNAL, previous)
+    if restart_signal is not None:
+        signal.signal(restart_signal, previous)
 
 
+needs_restart_signal = pytest.mark.skipif(
+    mcp_proxy.entry.RESTART_SIGNAL is None, reason="pas de SIGUSR1 (Windows)"
+)
+
+
+@needs_restart_signal
 def test_restart_signal_reexecs_the_same_command_line(uvicorn_double, monkeypatch):
     monkeypatch.setattr(FakeUvicorn, "signum", mcp_proxy.entry.RESTART_SIGNAL)
     mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765)
@@ -1534,6 +1542,7 @@ def test_failed_startup_exits_like_uvicorn_run(uvicorn_double, monkeypatch):
     assert uvicorn_double == []
 
 
+@needs_restart_signal
 def test_restart_signal_also_restarts_with_dev_auth(uvicorn_double, monkeypatch, capsys):
     """Mode --with-dev-auth : le signal arrête le proxy, l'AS suit, puis exec ;
     la clé de l'AS étant régénérée, le journal dit que les jetons sont perdus."""
@@ -1544,6 +1553,19 @@ def test_restart_signal_also_restarts_with_dev_auth(uvicorn_double, monkeypatch,
     assert len(uvicorn_double) == 1
     assert all(s.should_exit for s in FakeUvicorn.instances)
     assert "jetons déjà émis sont invalides" in capsys.readouterr().err
+
+
+def test_no_restart_signal_serves_without_handler(uvicorn_double, monkeypatch):
+    """Windows n'a pas de SIGUSR1 : RESTART_SIGNAL vaut None, le proxy doit
+    démarrer quand même, sans poser de gestionnaire ni redémarrer."""
+    import signal
+
+    handlers = []
+    monkeypatch.setattr(mcp_proxy.entry, "RESTART_SIGNAL", None)
+    monkeypatch.setattr(signal, "signal", lambda *a: handlers.append(a))
+    mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765)
+    assert handlers == []
+    assert uvicorn_double == []
 
 
 def test_dev_auth_plain_shutdown_does_not_restart(uvicorn_double, monkeypatch):

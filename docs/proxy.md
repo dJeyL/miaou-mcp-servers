@@ -134,6 +134,9 @@ projet étant installé en editable par uv, c'est bien le code du dépôt. Usage
 git `post-commit` local, non versionné, l'envoie à l'instance du poste après chaque
 commit sur `main`.
 
+- **Pas sous Windows** : le module `signal` n'y a pas de `SIGUSR1`. `RESTART_SIGNAL`
+  vaut alors `None`, `_on_restart_signal` ne pose rien, et le proxy tourne sans
+  redémarrage sur place — l'arrêt se fait au Ctrl-C comme avant.
 - **Pas SIGHUP** : c'est ce que reçoit le processus à la fermeture de son terminal, il
   renaîtrait orphelin en gardant le port.
 - **L'exec n'arrive qu'après l'arrêt COMPLET**, lifespan compris : les upstreams stdio

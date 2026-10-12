@@ -385,7 +385,7 @@ lots — piège déjà payé côté MIAOU.
   wrapper ASGI qui évite le 307 sur `/mcp`, le redémarrage sur place au SIGUSR1
   (`serve_http` : exec après l'arrêt complet, lifespan compris, sans `uv run` ; clés
   de `--with-dev-auth` perdues ; motif `pkill` ancré sur l'interpréteur et non sur
-  son parent uv), l'override `--proxy`/`--noproxy` et ses
+  son parent uv ; absent sous Windows, faute de SIGUSR1), l'override `--proxy`/`--noproxy` et ses
   trois chemins d'application, le format de `config.json` ; config en couches
   (`layers.py` : chaîne `config.defaults.json` → `config.site.json` → `config.json`,
   `--config` répétable qui la remplace, JSON Merge Patch sans variante, `${VAR}`

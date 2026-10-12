@@ -81,7 +81,8 @@ kill -USR1 <pid>   # redémarre sur place (même pid, code relu)
 `SIGUSR1` arrête le proxy en douceur (5 s pour les requêtes en cours) puis le relance
 par `exec`, même pid et même terminal. Ça ne repasse pas par `uv run` : une dépendance
 modifiée demande un vrai relancement. Les sessions MCP en cours sont perdues, et avec
-`--with-dev-auth` les jetons émis par le serveur d'autorisation de développement.
+`--with-dev-auth` les jetons émis par le serveur d'autorisation de développement. Sous
+Windows, faute de `SIGUSR1`, le proxy tourne sans ce redémarrage.
 
 La config se lit en couches : `config.defaults.json` (versionné, la base, à ne pas
 éditer), puis `config.site.json` et `config.json` s'ils existent, chacun ne portant que

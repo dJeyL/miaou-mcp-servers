@@ -43,8 +43,9 @@ from .webapp import APP_PREFIX, miaou_dist_warnings, resolve_miaou_dist
 
 #: Redémarrage sur place : un hook post-commit local l'envoie à l'instance du
 #: poste. Pas SIGHUP : c'est ce que reçoit le processus quand on ferme son
-#: terminal, il renaîtrait orphelin en gardant le port.
-RESTART_SIGNAL = signal.SIGUSR1
+#: terminal, il renaîtrait orphelin en gardant le port. `None` sous Windows,
+#: qui n'a pas de SIGUSR1 : le proxy y tourne sans redémarrage sur place.
+RESTART_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 
 #: À l'arrêt, les requêtes en cours finissent ; au-delà (flux SSE d'une session
 #: MCP restée ouverte), elles sont coupées. Ne borne pas le shutdown du
@@ -55,7 +56,10 @@ SHUTDOWN_GRACE_S = 5
 def _on_restart_signal(server: Any) -> Callable[[], bool]:
     """Pose le gestionnaire de RESTART_SIGNAL : il demande à `server` (un
     `uvicorn.Server`) de s'arrêter comme sur Ctrl-C. Renvoie de quoi savoir,
-    une fois l'arrêt fini, si c'est ce signal qui l'a provoqué."""
+    une fois l'arrêt fini, si c'est ce signal qui l'a provoqué. Sans
+    RESTART_SIGNAL (Windows), ne pose rien et ne redémarre jamais."""
+    if RESTART_SIGNAL is None:
+        return lambda: False
     requested = False
 
     def on_restart(signum: int, frame: FrameType | None) -> None:
