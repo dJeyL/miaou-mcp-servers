@@ -19,6 +19,7 @@ from mcp_proxy.layers import (
     mask_secrets,
     merge_patch,
     migrate_local,
+    migration_diff,
     needs_slimming,
     resolve_chain,
     slim,
@@ -328,6 +329,36 @@ def test_migrate_local_only_subtracts_the_layers_before_it(tmp_path):
     assert json.loads(local.read_text()) == {"x": 1}
 
 
+def test_migration_diff_writes_nothing_and_masks_secrets(tmp_path):
+    base = _write(tmp_path / "config.defaults.json", {"port": 1, "host": "h"})
+    local = _write(tmp_path / "config.json", {"port": 1, "host": "x", "api_key": "vraie-clef"})
+    original = local.read_text()
+    (tmp_path / "config.json.bak").write_text("original d'avant")
+
+    result, diff = migration_diff([base, local], local)
+
+    assert result.removed == ["port"]
+    assert local.read_text() == original
+    assert (tmp_path / "config.json.bak").read_text() == "original d'avant"
+    assert not (tmp_path / "config.json.tmp").exists()
+    text = "".join(diff)
+    assert '-  "port": 1,\n' in text
+    assert "vraie-clef" not in text
+    assert '"api_key": "***"' in text
+
+
+def test_migration_diff_is_empty_when_nothing_to_slim(tmp_path):
+    base = _write(tmp_path / "config.defaults.json", {"port": 1})
+    local = _write(tmp_path / "config.json", {"port": 2})
+    assert migration_diff([base, local], local)[1] == []
+
+
+def test_migration_diff_refuses_a_single_layer(tmp_path):
+    local = _write(tmp_path / "config.json", {"port": 1})
+    with pytest.raises(ValueError, match="seule couche"):
+        migration_diff([local], local)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -353,6 +384,30 @@ def test_migrate_config_flag_rewrites_and_exits(tmp_path, monkeypatch, capsys):
     assert exc.value.code == 0
     assert json.loads((tmp_path / "config.json").read_text()) == {}
     assert "mcpServers.bench" in capsys.readouterr().out
+
+
+def test_migrate_config_diff_flag_prints_and_leaves_the_file(tmp_path, monkeypatch, capsys):
+    _write(tmp_path / "config.defaults.json", {"port": 1})
+    local = _write(tmp_path / "config.json", {"port": 1, "x": 2})
+    original = local.read_text()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["mcp_proxy", "--migrate-config", "--diff"])
+    with pytest.raises(SystemExit) as exc:
+        entry.main()
+    assert exc.value.code == 0
+    assert local.read_text() == original
+    assert not (tmp_path / "config.json.bak").exists()
+    out = capsys.readouterr().out
+    assert '-  "port": 1,' in out
+    assert "n'est pas modifié" in out
+
+
+def test_diff_flag_alone_is_refused(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["mcp_proxy", "--diff"])
+    with pytest.raises(SystemExit) as exc:
+        entry.main()
+    assert exc.value.code == 1
+    assert "--migrate-config" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

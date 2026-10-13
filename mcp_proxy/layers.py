@@ -24,6 +24,7 @@ de la config ne distingue `null` de l'absence.
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -323,11 +324,9 @@ def _base_of(paths: list[Path], local: Path) -> dict[str, Any] | None:
     return base
 
 
-def migrate_local(paths: list[Path], local: Path) -> Slimmed:
-    """Réécrit `local` allégé de ce que les couches précédentes portent déjà,
-    après l'avoir sauvegardé en `<local>.bak`. Refuse si la sauvegarde existe
-    déjà (une seconde migration écraserait l'original) ou si `local` est la
-    seule couche (rien à retrancher)."""
+def _slim_local(paths: list[Path], local: Path) -> tuple[dict[str, Any], Slimmed]:
+    """(contenu actuel de `local`, son allègement), avec les refus communs à
+    la migration et à son aperçu."""
     if not local.exists():
         raise ValueError(f"'{local}' n'existe pas : rien à alléger.")
     base = _base_of(paths, local)
@@ -335,13 +334,22 @@ def migrate_local(paths: list[Path], local: Path) -> Slimmed:
         raise ValueError(
             f"'{local}' est la seule couche de la chaîne : rien à retrancher."
         )
+    content = read_layer(local)
+    return content, slim(base, content)
+
+
+def migrate_local(paths: list[Path], local: Path) -> Slimmed:
+    """Réécrit `local` allégé de ce que les couches précédentes portent déjà,
+    après l'avoir sauvegardé en `<local>.bak`. Refuse si la sauvegarde existe
+    déjà (une seconde migration écraserait l'original) ou si `local` est la
+    seule couche (rien à retrancher)."""
     backup = local.with_name(local.name + ".bak")
+    _, result = _slim_local(paths, local)
     if backup.exists():
         raise ValueError(
             f"'{backup}' existe déjà : la retirer d'abord (elle garde peut-être "
             f"l'original d'une migration précédente)."
         )
-    result = slim(base, read_layer(local))
 
     # copy2 garde le mode : un config.json en 0600 (il porte des secrets) ne
     # doit pas devenir lisible de tous par sa sauvegarde ni par sa réécriture.
@@ -353,6 +361,25 @@ def migrate_local(paths: list[Path], local: Path) -> Slimmed:
         f.write(json.dumps(result.content, indent=2, ensure_ascii=False) + "\n")
     os.replace(tmp, local)
     return result
+
+
+def migration_diff(paths: list[Path], local: Path) -> tuple[Slimmed, list[str]]:
+    """Ce que `migrate_local` ferait, sans rien écrire : diff unifié entre le
+    contenu actuel et l'allégé. Les deux côtés sont resérialisés comme la
+    réécriture (indentation 2) pour que la mise en forme d'origine ne noie
+    pas les retraits, et masqués comme `--print-config` : le fichier porte
+    des secrets, et ses lignes inchangées sortent en contexte."""
+    content, result = _slim_local(paths, local)
+
+    def lines(value: dict[str, Any]) -> list[str]:
+        text = json.dumps(mask_secrets(value), indent=2, ensure_ascii=False)
+        return [line + "\n" for line in text.split("\n")]
+
+    diff = difflib.unified_diff(
+        lines(content), lines(result.content),
+        fromfile=str(local), tofile=f"{local} (allégé)",
+    )
+    return result, list(diff)
 
 
 def needs_slimming(paths: list[Path], local: Path) -> bool:

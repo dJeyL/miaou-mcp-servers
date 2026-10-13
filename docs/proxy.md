@@ -120,7 +120,12 @@ mcp_proxy/ (paquet, à la racine du projet)
 │   └── MIAOU (facultatif) : routes de webapp.py, posées après /mcp
 ├── webapp.py      clé `miaou_dist` : resolve_miaou_dist(), miaou_dist_warnings(),
 │                  MiaouStaticFiles et build_miaou_routes() (/app/ et /)
-└── entry.py       main() — CLI ; serve_http() : uvicorn + redémarrage sur SIGUSR1 ;
+├── selfupdate.py  état git du clone et fast-forward (lot AT), synchrone : probe(),
+│                  apply_update(), run_git() borné et jamais interactif
+├── updater.py     extension miaou/self-update : SelfUpdater, sonde de 5 min,
+│                  miaou/update/status et miaou/update/apply
+└── entry.py       main() — CLI ; serve_http() : uvicorn + redémarrage sur SIGUSR1
+                   + sortie en 42 après une mise à jour (ExitRequest) ;
                    et run_with_dev_auth() : --with-dev-auth, proxy ET AS de
                    développement dans ce process, sur DEUX ports
 ```
@@ -160,6 +165,84 @@ commit sur `main`.
   gestionnaire de SIGUSR1 : le motif `pkill -f` du hook s'ancre sur l'interpréteur
   (`^([^ ]*/)?python[0-9.]* ([^ ]*/bin/mcp_proxy|-m mcp_proxy)( |$)`). Il vise toutes
   les instances du poste, port compris.
+
+### Mise à jour à la demande (clé `self_update`, lot AT)
+
+Le proxy lancé depuis un clone git sait dire si la branche distante qu'il suit est en
+avance, et s'y avancer à la demande d'un client (MIAOU). Contrat sur le fil (extension
+`miaou/self-update`, méthodes, forme de l'état, refus) : `docs/miaou-contract.md`.
+Désactivé par défaut ; il faut **deux clefs** pour appliquer :
+
+- `"self_update": true` dans la config (booléen strict : une chaîne `${VAR}` est
+  refusée au démarrage) — publie l'extension et lance la sonde ;
+- `MIAOU_PROXY_SUPERVISED=1` dans l'environnement, posée par `scripts/supervise.sh` —
+  sans elle l'état reste visible, mais `apply` est refusé : un proxy lancé à la main
+  sortirait pour de bon.
+
+**Git** (`selfupdate.py`). Racine du clone = dossier parent de `mcp_proxy/`, qui doit
+être `--show-toplevel` (sinon « pas un clone », comme dans l'image Docker, sans `.git`).
+Aucun nom de remote ni de branche en dur : `for-each-ref
+%(upstream:remotename)/%(upstream:remoteref)` sur la branche courante ; HEAD détaché ou
+branche sans upstream = `not_tracking`. Sonde : `ls-remote` du remote suivi, fetch
+seulement si le sha annoncé est inconnu du clone (`cat-file -e`), position par
+`rev-list --left-right --count`, jamais par dates. Application : `merge --ff-only <sha
+affiché>`, jamais `pull` (qui dépend de `pull.rebase`/`pull.ff`), jamais au-delà du sha
+proposé, après avoir tout revérifié (arbre propre, sha toujours contenu dans la branche
+distante telle que le remote l'annonce maintenant, HEAD ancêtre). Un fichier suivi
+modifié refuse en amont (`status --porcelain --untracked-files=no`) : c'est ce qui rend
+sûr le retour arrière d'un **checkout interrompu** (fichier verrouillé sous Windows,
+disque plein), `reset --hard <HEAD d'avant>` puis retrait des seuls fichiers que la
+cible AJOUTE et que git a déjà écrits — jamais `git clean`, qui emporterait les fichiers
+non suivis de l'utilisateur. Assouplir le refus de l'arbre sale exige de revoir ce
+retour arrière. HEAD d'avant, cible et issue sont notés dans `state/self-update.json`.
+
+Chaque appel git passe `-c credential.interactive=never`, `GCM_INTERACTIVE=never`,
+`GIT_TERMINAL_PROMPT=0`, stdin fermé et `LC_ALL=C` (messages en anglais, pour reconnaître
+l'échec d'authentification sous plusieurs formes, et `dubious ownership`). Sans les deux
+premiers, Git Credential Manager ouvre une FENÊTRE sous Windows. Timeout dur (15 s en
+local, 30 s pour `ls-remote`/fetch, 120 s pour le merge) qui tue le **groupe** de
+processus — `start_new_session` + `killpg`, `CREATE_NEW_PROCESS_GROUP` + `taskkill /T /F`
+sous Windows — parce que `git-remote-https`, petit-enfant, garderait le tube ouvert
+au-delà du timeout ; repli sur le seul `kill` quand l'outil manque. Le proxy réseau :
+`--proxy` écrit dans `os.environ`, git en hérite (remote HTTPS).
+
+**Extension** (`updater.py`). Posée dans `build_app` si `self_update` est vrai, rien
+sinon. Sonde au démarrage, en arrière-plan (état `checking` en attendant), puis toutes
+les 5 min, dans le task group du lifespan ; une seule sonde à la fois. `apply` passe par
+`asyncio.to_thread` et refuse, dans l'ordre : sans superviseur, cible mal formée,
+application déjà en cours (verrou), appels d'outils en vol (`InFlight`, compté autour de
+`handle_call_tool`, tous clients confondus ; revérifié dans le thread juste avant le
+merge, genre connu), puis tout refus de l'étape git. Une mise à jour qui ne touche que
+`miaou_dist` (genre `miaou`) ne redémarre rien et ignore les appels en vol : `/app/` relit
+le disque à chaque requête. Une sonde réseau en cours retarde l'arrêt du proxy jusqu'à
+sa fin (le thread ne s'annule pas), 60 s au pire.
+
+**Sortie en 42** (`UPDATE_EXIT_CODE`, `entry.py`). Après un fast-forward qui exige un
+redémarrage, le handler appelle l'`ExitRequest` créée par `main()` et liée au serveur
+uvicorn dans `serve_http` (ou `run_with_dev_auth`) : même arrêt en douceur que Ctrl-C,
+donc la réponse d'`apply`, requête en vol, part avant la coupure ; lifespan refermé ;
+puis `sys.exit(42)`. Examinée AVANT la demande de SIGUSR1 : les deux posées, la sortie
+l'emporte, seule la relance par `uv run` installant les dépendances. Le proxy ne se
+relance jamais lui-même.
+
+**`scripts/supervise.sh`** (bash : macOS, Linux, Git Bash). Pose
+`MIAOU_PROXY_SUPERVISED=1`, relance tant que la commande sort en 42, rend tout autre code
+tel quel (0 au Ctrl-C). Exécuté, il relance la commande donnée (`uv run --directory
+<clone> mcp_proxy` sans argument) ; sourcé, `miaou_supervise <fonction> [args…]` rappelle
+la fonction à chaque tour, ce qui refait la détection du proxy réseau d'un fork à chaque
+relance. Il ne construit jamais la ligne d'une installation : un fork l'appelle depuis
+son propre `start.sh`, sans le modifier (aucun conflit au merge de l'upstream). Une
+sortie en erreur (code 1 à 127) du lancement qui suit une mise à jour affiche la commande
+de retour arrière, lue dans `state/self-update.json` (chemin par défaut) ; pas un arrêt
+par signal — SIGTERM rend 143, uvicorn relevant le signal après un arrêt propre (mesuré
+sous `uv run`). `.gitattributes` force LF sur `*.sh` :
+Git for Windows convertit en CRLF par défaut, et Git Bash échoue alors dès la première
+ligne.
+
+```bash
+scripts/supervise.sh                                  # uv run mcp_proxy, depuis le clone
+scripts/supervise.sh uv run mcp_proxy --port 8765     # commande explicite
+```
 
 **Ce que `call_tool` relaie.** Un upstream stdio ou http rend son `CallToolResult` à travers
 `relay_call_result` (upstream.py) : `content`, `isError` et `_meta` passent — sauf, dans
@@ -665,11 +748,20 @@ seconde migration écraserait l'original. Jamais de réécriture au démarrage :
 proxy se borne à la proposer tant que le maillon local répète la base
 (`needs_slimming`).
 
+**`--migrate-config --diff`** montre l'allègement sans rien écrire (`migration_diff`) :
+diff unifié entre le contenu actuel et l'allégé, suivi des mêmes comptes et de la
+liste des clés héritées. Les deux côtés sont resérialisés comme la réécriture
+(indentation 2) — la mise en forme d'origine, que la réécriture perd aussi, n'y
+apparaît donc pas — et masqués comme `--print-config`, les lignes de contexte
+portant les secrets restés dans le fichier. Le refus sur `.bak` existante ne
+s'applique pas, rien n'étant écrit ; `--diff` seul est refusé.
+
 ### `state/` (`state.py`)
 
 Ce que le proxy écrit lui-même : `state/tokens.json` (jetons OAuth sortants — un
 ÉTAT, le perdre redemande chaque autorisation) et `state/tools-cache.json` (cache
-d'outils, reconstructible). Nommés pour ne pas se confondre, et hors du motif
+d'outils, reconstructible), plus `state/self-update.json` (HEAD d'avant, cible et
+issue de la dernière mise à jour, lot AT). Nommés pour ne pas se confondre, et hors du motif
 `config*.json`. À côté du maillon local ; une config d'un autre nom range son état
 sous `state/<nom>/`, deux instances du même dossier ne partageant pas leurs jetons.
 Les anciens `<config>-tokens.json` / `<config>-tools.json` sont **déplacés** au

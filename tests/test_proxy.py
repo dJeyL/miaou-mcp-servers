@@ -1581,6 +1581,82 @@ def test_no_restart_signal_serves_without_handler(uvicorn_double, monkeypatch):
     assert uvicorn_double == []
 
 
+def _exit_requested_while_serving(monkeypatch, exit_request, *, signum=None):
+    """La demande de sortie arrive PENDANT le service, comme depuis le
+    handler de `miaou/update/apply` : le double l'appelle depuis `run`."""
+    real_run = FakeUvicorn.run
+
+    def run(self):
+        exit_request()
+        if signum is not None:
+            os.kill(os.getpid(), signum)
+        self.started = True
+        assert self.should_exit
+        real_run(self)
+
+    monkeypatch.setattr(FakeUvicorn, "run", run)
+
+
+def test_update_exit_leaves_with_its_own_code(uvicorn_double, monkeypatch):
+    exit_request = mcp_proxy.entry.ExitRequest()
+    _exit_requested_while_serving(monkeypatch, exit_request)
+    with pytest.raises(SystemExit) as exc:
+        mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765, exit_request=exit_request)
+    assert exc.value.code == mcp_proxy.entry.UPDATE_EXIT_CODE == 42
+    assert uvicorn_double == []
+
+
+@needs_restart_signal
+def test_update_exit_wins_over_the_restart_signal(uvicorn_double, monkeypatch):
+    """Les deux demandes posées : la sortie l'emporte, parce que seule la
+    relance par `uv run` installe les dépendances d'une mise à jour."""
+    exit_request = mcp_proxy.entry.ExitRequest()
+    _exit_requested_while_serving(
+        monkeypatch, exit_request, signum=mcp_proxy.entry.RESTART_SIGNAL
+    )
+    with pytest.raises(SystemExit) as exc:
+        mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765, exit_request=exit_request)
+    assert exc.value.code == 42
+    assert uvicorn_double == []
+
+
+def test_exit_request_before_bind_still_stops():
+    exit_request = mcp_proxy.entry.ExitRequest()
+    exit_request()
+    server = FakeUvicorn(None)
+    exit_request.bind(server)
+    assert server.should_exit
+
+
+def test_untouched_exit_request_changes_nothing(uvicorn_double):
+    mcp_proxy.entry.serve_http(
+        object(), "127.0.0.1", 8765, exit_request=mcp_proxy.entry.ExitRequest()
+    )
+    assert uvicorn_double == []
+
+
+def test_update_exit_with_dev_auth(uvicorn_double, monkeypatch):
+    exit_request = mcp_proxy.entry.ExitRequest()
+
+    async def serve(self):
+        import asyncio
+
+        if self is FakeUvicorn.instances[0]:
+            exit_request()
+        while not self.should_exit:
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(FakeUvicorn, "serve", serve)
+    with pytest.raises(SystemExit) as exc:
+        mcp_proxy.entry.run_with_dev_auth(
+            object(), "127.0.0.1", 8765, 8787, "http://127.0.0.1:8787",
+            exit_request=exit_request,
+        )
+    assert exc.value.code == 42
+    assert all(s.should_exit for s in FakeUvicorn.instances)
+    assert uvicorn_double == []
+
+
 def test_dev_auth_plain_shutdown_does_not_restart(uvicorn_double, monkeypatch):
     async def stop_at_once(self):
         self.should_exit = True

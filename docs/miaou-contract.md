@@ -179,6 +179,69 @@ apprend à lire une skill par son slug. L'instruction de bench (« sa skill MCP 
 par son URI ») et l'en-tête du bloc (« pas des skills locales : leur nom ne suffit
 pas ») ont été écrits pour ça, et la description de `read_skill` le redit.
 
+## Mise à jour du proxy (extension `miaou/self-update`, lot AT)
+
+Publiée seulement si `self_update` vaut `true` dans la config ; sinon ni extension, ni
+méthode (`-32601`). **Ère 2026-07-28 seulement** : `extensions["miaou/self-update"] = {}`
+dans `server/discover` vaut découverte, et en legacy `initialize` ne publie jamais
+`extensions`. Deux méthodes JSON-RPC hors outils, absentes de `tools/list` : le modèle ne
+les voit pas. Mise en œuvre : `mcp_proxy/updater.py` (extension) et `selfupdate.py` (git).
+
+**`miaou/update/status`** `{ refresh?: bool }` → `{ status: {…} }`. Lit l'état mis en
+cache par la sonde du proxy (au démarrage, puis toutes les 5 min) ; `refresh: true` force
+une sonde, sauf si la dernière date de moins de 30 s. Champs de `status` :
+
+| Champ | Valeur |
+|---|---|
+| `state` | voir ci-dessous |
+| `detail` | cause brute (sortie de git condensée) ou `null` |
+| `remedy` | commande à lancer à la main, ou `null` (`repo_refused`, `auth_required`) |
+| `branch`, `remote`, `remote_ref` | branche courante et ce qu'elle suit (`refs/heads/…`), lus dans la config de suivi |
+| `head` | sha de HEAD |
+| `target` | sha annoncé par le remote : **la valeur à renvoyer à `apply`** |
+| `ahead`, `behind` | commits d'avance et de retard sur `target` |
+| `dirty` | fichiers suivis modifiés (20 au plus), `[]` sinon |
+| `update` | `null`, ou `{ kind, paths, subjects, subjects_total }` quand une mise à jour existe |
+| `checked_at` | date ISO 8601 UTC de la sonde, `null` avant la première |
+| `supervised` | `MIAOU_PROXY_SUPERVISED=1` présente : sans elle, `apply` est refusé |
+| `applying` | une application est en cours |
+| `served_build` | `build` de `<miaou_dist>/version.json`, relu à chaque appel ; `null` sans `miaou_dist` |
+
+`state` : `checking` (première sonde pas encore rendue), `up_to_date`, `behind`
+(mise à jour disponible), `dirty` (mise à jour disponible, bloquée par `dirty`),
+`ahead`, `diverged`, `not_tracking` (HEAD détaché, branche sans upstream, branche
+distante supprimée), `auth_required`, `fetch_failed` (dont timeout), `not_a_clone`,
+`git_missing`, `repo_refused` (`safe.directory`), `git_error`. Un arbre sale sans mise à
+jour reste `up_to_date`, avec `dirty` rempli.
+
+`update.kind` : `miaou` (seuls des fichiers de `miaou_dist` changent), `proxy` (aucun),
+`both`. `subjects` : sujets des nouveaux commits sans les merges, plus récents d'abord,
+20 au plus ; `subjects_total` les compte tous. `paths` : nombre de fichiers touchés.
+
+**`miaou/update/apply`** `{ target: <sha complet> }` → `{ applied: true, restart, kind,
+before, target }`. Avance la branche **exactement** à `target`, en fast-forward, jamais
+au-delà. `restart` vaut `false` pour `kind: miaou` : rien ne redémarre, `/app/` sert les
+nouveaux fichiers aussitôt et `served_build` change ; l'état publié est relu tout de
+suite. Sinon, la réponse partie, le proxy s'arrête en douceur et sort en 42 ; son
+superviseur (`scripts/supervise.sh`) le relance par `uv run`. La session MCP meurt avec
+lui : le client se reconnecte, puis relit l'état.
+
+Refus : erreur JSON-RPC, code applicatif dans `error.data.code` (à tester par égalité),
+message lisible, et selon le cas `data.before`, `data.target`, `data.remedy`.
+
+| `data.code` | `error.code` | Cas |
+|---|---|---|
+| `UPDATE_NOT_SUPERVISED` | `-32600` | variable du superviseur absente |
+| `UPDATE_INVALID_TARGET` | `-32602` | `target` n'est pas un sha complet |
+| `UPDATE_IN_PROGRESS` | `-32600` | une autre application tourne |
+| `UPDATE_TOOLS_IN_FLIGHT` | `-32600` | appels d'outils en cours, tous clients confondus (jamais pour `kind: miaou`) |
+| `UPDATE_STALE` | `-32600` | `target` déjà atteint, ou plus atteignable en avance rapide (branche réécrite, autre application) : relire l'état |
+| `UPDATE_REFUSED` | `-32600` | arbre sale, remote injoignable, git a refusé avant de toucher l'arbre… (cause dans le message) |
+| `UPDATE_ROLLED_BACK` | `-32603` | checkout interrompu, arbre remis à l'état d'avant |
+| `UPDATE_ROLLBACK_FAILED` | `-32603` | retour arrière en échec : `data.remedy` donne la commande |
+
+Tout refus laisse le proxy en marche et l'arbre dans son état d'avant (sauf le dernier).
+
 ## Contrat partagé `mcp_docs` ↔ MIAOU (dispatcher, lot A/D6)
 
 Contrat entre le dispatcher client MIAOU et `mcp_docs` (et tout futur outil inflatable) —

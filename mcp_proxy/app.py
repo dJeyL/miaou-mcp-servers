@@ -34,6 +34,7 @@ def build_app(
     token_verifier: Any = None,
     authorizers: dict[str, UpstreamAuthorizer] | None = None,
     miaou_dist: Path | None = None,
+    updater: Any = None,
 ) -> Any:
     """`auth` : sortie de resolve_auth_config(), ou None (auth désactivée —
     comportement d'avant le lot AB-1, à l'octet près).
@@ -49,6 +50,9 @@ def build_app(
     `miaou_dist` : sortie de resolve_miaou_dist(), ou None (rien d'autre que
     `/mcp` et les routes OAuth n'est servi). Sinon MIAOU est servi sous `/app/`
     et `/` y redirige — cf. webapp.py.
+
+    `updater` : un `SelfUpdater` (lot AT), ou None (`self_update` à false :
+    ni méthode, ni extension, ni boucle de sonde — surface d'avant le lot).
     """
     from contextlib import asynccontextmanager
 
@@ -254,6 +258,10 @@ def build_app(
                 # l'extinction (cancel_scope.cancel() du finally).
                 if authorizers:
                     tg.start_soon(_refresh_loop)
+                # Première sonde en arrière-plan : un `ls-remote` ne retarde
+                # pas le démarrage. Annulée avec le task group.
+                if updater is not None:
+                    tg.start_soon(updater.run)
                 # session_manager.run() initialise le task group interne requis pour
                 # traiter les requêtes MCP (sans ça : RuntimeError "Task group is not initialized").
                 async with session_manager.run():
@@ -267,6 +275,11 @@ def build_app(
                 # Sans annulation explicite, les tâches de service encore
                 # vivantes retiendraient le task group — donc l'extinction.
                 tg.cancel_scope.cancel()
+
+    if updater is not None:
+        # Dès la construction : les capacités se calculent à chaque
+        # server/discover, aucun client ne peut arriver avant.
+        updater.install(mcp_server)
 
     async def handle_mcp(scope: Any, receive: Any, send: Any) -> None:
         await session_manager.handle_request(scope, receive, send)

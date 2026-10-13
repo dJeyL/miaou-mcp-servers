@@ -192,6 +192,7 @@ Le proxy accepte en plus :
 
 `type` absent → `stdio`. `port` est obligatoire, `host` optionnel.
 `miaou_dist` (clé racine, facultative) → le proxy sert MIAOU sous `/app/` (voir plus bas).
+`self_update` (clé racine, `false` par défaut) → le proxy propose à MIAOU de se mettre à jour (voir plus bas).
 `"disabled": true` sur une entrée → upstream ignoré au démarrage.
 L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'est plus celle qu'on écrit — dans ce fichier, un souligné en tête signale ailleurs (`_comment`) une clé ignorée, ce que cet interrupteur n'est justement pas. Le proxy le signale au démarrage, une ligne par bloc concerné, pour que la migration se voie plutôt que de traîner indéfiniment ; une config déjà en `disabled` ne dit rien.
 `env` sur une entrée inprocess → variables d'environnement injectées avant l'import.
@@ -289,6 +290,25 @@ fait passer de l'une à l'autre).
 Image Docker : copier le `dist/` de MIAOU dans le dossier `miaou_dist/` du dépôt
 (versionné vide) avant `docker compose build`, et poser `"miaou_dist": "miaou_dist"` dans
 `config.json`. Sans copie, l'image se construit quand même. Détail : `docs/proxy.md`.
+
+### Mise à jour depuis MIAOU (clé `self_update`)
+
+Un proxy lancé depuis un clone git peut se mettre à jour à la demande de MIAOU : il
+vérifie toutes les 5 min si la branche distante que suit le clone est en avance, MIAOU le
+propose, et le proxy avance alors son clone en fast-forward jusqu'au commit affiché, puis
+sort en 42. `scripts/supervise.sh` le relance par `uv run`, qui installe au passage les
+dépendances modifiées. Deux clefs sont nécessaires : `"self_update": true` dans la
+config, et `MIAOU_PROXY_SUPERVISED=1` dans l'environnement, que pose `supervise.sh`
+(sans elle, la mise à jour est visible mais refusée : rien ne relancerait le proxy).
+
+```bash
+scripts/supervise.sh                                # uv run mcp_proxy, relancé après chaque mise à jour
+scripts/supervise.sh uv run mcp_proxy --port 8765   # ou la commande de son choix
+```
+
+Un fichier suivi modifié localement bloque la mise à jour (les fichiers non suivis et
+`config.json` ne gênent pas). Une mise à jour qui ne change que `miaou_dist` ne redémarre
+pas le proxy. Détail : `docs/proxy.md`.
 
 ### Exiger une autorisation OAuth (clé `auth`)
 
@@ -480,7 +500,11 @@ miaou-mcp-servers/
 │   ├── auth_out/         # client OAuth d'upstreams tiers (sortante), package
 │   ├── app.py            # application Starlette
 │   ├── webapp.py         # MIAOU servi sous /app/ (clé miaou_dist)
-│   └── entry.py          # CLI, main(), serve_http (redémarrage sur SIGUSR1)
+│   ├── selfupdate.py     # mise à jour par lui-même : état git du clone, fast-forward
+│   ├── updater.py        # extension miaou/self-update (état, application)
+│   └── entry.py          # CLI, main(), serve_http (SIGUSR1, sortie en 42 après mise à jour)
+├── scripts/
+│   └── supervise.sh      # relance le proxy quand il sort en 42 (mise à jour appliquée)
 ├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker (versionné vide)
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
@@ -519,6 +543,7 @@ miaou-mcp-servers/
 │   ├── test_proxy_auth.py           # auth OAuth entrante
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante
 │   ├── test_proxy_webapp.py         # MIAOU servi sous /app/ (dont un vrai uvicorn)
+│   ├── test_proxy_selfupdate.py     # mise à jour par lui-même (dépôts git jetables)
 │   ├── test_dev_auth_server.py      # serveur d'autorisation de développement
 │   └── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
 ├── config.defaults.json  # couche de base de la config (config.site.json, config.json par-dessus)

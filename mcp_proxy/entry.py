@@ -1,7 +1,8 @@
 """Point d'entrée CLI : parsing d'arguments, amorçage, lancement uvicorn.
 
 `kill -USR1 <pid>` redémarre le proxy sur place en relisant le code (voir
-`serve_http`).
+`serve_http`). Une mise à jour appliquée (lot AT) le fait sortir en
+`UPDATE_EXIT_CODE`, pour que son superviseur le relance par `uv run`.
 """
 
 from __future__ import annotations
@@ -32,13 +33,16 @@ from .layers import (
     load_layers,
     mask_secrets,
     migrate_local,
+    migration_diff,
     needs_slimming,
     resolve_chain,
 )
 from .logging import _log
 from .netproxy import apply_proxy_env_overrides_to_process, compute_proxy_env_overrides
-from .server import ToolCatalogCache, build_proxy_server
-from .state import default_tools_cache_path, migrate_legacy_state, tools_cache_beside
+from .server import InFlight, ToolCatalogCache, build_proxy_server
+from .state import default_tools_cache_path, migrate_legacy_state, state_dir, tools_cache_beside
+from .updater import SUPERVISED_ENV, SelfUpdater, UpdateConfig, is_supervised, resolve_self_update
+from . import selfupdate
 from .webapp import APP_PREFIX, miaou_dist_warnings, resolve_miaou_dist
 
 #: Redémarrage sur place : un hook post-commit local l'envoie à l'instance du
@@ -46,6 +50,11 @@ from .webapp import APP_PREFIX, miaou_dist_warnings, resolve_miaou_dist
 #: terminal, il renaîtrait orphelin en gardant le port. `None` sous Windows,
 #: qui n'a pas de SIGUSR1 : le proxy y tourne sans redémarrage sur place.
 RESTART_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
+
+#: Sortie après une mise à jour appliquée (lot AT) : `scripts/supervise.sh`
+#: relance sur ce code, et sur lui seul. Hors de 0 (arrêt normal, Ctrl-C
+#: compris), 1 (config), 2 (argparse), 3 (démarrage raté) et des signaux.
+UPDATE_EXIT_CODE = 42
 
 #: À l'arrêt, les requêtes en cours finissent ; au-delà (flux SSE d'une session
 #: MCP restée ouverte), elles sont coupées. Ne borne pas le shutdown du
@@ -71,6 +80,40 @@ def _on_restart_signal(server: Any) -> Callable[[], bool]:
     return lambda: requested
 
 
+class ExitRequest:
+    """Demande de sortie posée depuis l'app (`SelfUpdater.request_restart`),
+    lue par `serve_http` une fois l'arrêt COMPLET, lifespan compris.
+
+    Créée dans `main()` avant le serveur uvicorn, qui ne naît que dans
+    `serve_http` : `bind` les relie. L'arrêt est celui de Ctrl-C, en douceur,
+    donc la réponse JSON-RPC de `miaou/update/apply`, requête encore en vol,
+    part avant la coupure. Le proxy ne se relance pas lui-même : c'est le
+    superviseur qui décide, et `uv run` réinstalle alors les dépendances."""
+
+    def __init__(self) -> None:
+        self.code: int | None = None
+        self._server: Any = None
+
+    def bind(self, server: Any) -> None:
+        self._server = server
+        if self.code is not None:
+            server.should_exit = True
+
+    def __call__(self) -> None:
+        self.code = UPDATE_EXIT_CODE
+        if self._server is not None:
+            self._server.should_exit = True
+
+
+def _exit_if_requested(exit_request: ExitRequest | None) -> None:
+    """Examinée AVANT la demande de redémarrage par signal : une mise à jour
+    appliquée doit repasser par `uv run`, ce que l'exec du SIGUSR1 ne fait
+    pas. Les deux posées ensemble, la sortie l'emporte."""
+    if exit_request is not None and exit_request.code is not None:
+        _log(f"sortie en {exit_request.code} : mise à jour appliquée, relance par le superviseur.")
+        sys.exit(exit_request.code)
+
+
 def _reexec() -> None:
     """Remplace le processus par sa propre ligne de commande : même pid, même
     terminal, code relu. Appelé seulement après un arrêt COMPLET, lifespan
@@ -82,10 +125,11 @@ def _reexec() -> None:
     os.execv(sys.executable, sys.orig_argv)
 
 
-def serve_http(app: Any, host: str, port: int) -> None:
+def serve_http(app: Any, host: str, port: int, exit_request: ExitRequest | None = None) -> None:
     """uvicorn, plus un redémarrage sur RESTART_SIGNAL : arrêt en douceur, puis
     exec de la même ligne de commande. Un code qui ne s'importe plus meurt au
-    redémarrage."""
+    redémarrage. `exit_request` posée (mise à jour appliquée) : même arrêt,
+    puis sortie en UPDATE_EXIT_CODE au lieu de l'exec."""
     import uvicorn
 
     server = uvicorn.Server(
@@ -95,6 +139,8 @@ def serve_http(app: Any, host: str, port: int) -> None:
         )
     )
     restart_requested = _on_restart_signal(server)
+    if exit_request is not None:
+        exit_request.bind(server)
     try:
         server.run()
     except KeyboardInterrupt:
@@ -106,6 +152,7 @@ def serve_http(app: Any, host: str, port: int) -> None:
         # Ce que fait `uvicorn.run` (port pris, lifespan en échec) : sans lui,
         # un démarrage raté sortirait en 0.
         sys.exit(3)
+    _exit_if_requested(exit_request)
     if restart_requested():
         _reexec()
 
@@ -117,6 +164,7 @@ def run_with_dev_auth(
     dev_auth_port: int,
     issuer_url: str,
     auto_approve: bool = False,
+    exit_request: ExitRequest | None = None,
 ) -> None:
     """Sert le proxy ET le serveur d'autorisation de développement dans CE
     process, sur deux ports distincts.
@@ -187,6 +235,8 @@ def run_with_dev_auth(
 
     # Arrêter le proxy suffit : l'AS le suit (`_serve_both`).
     restart_requested = _on_restart_signal(proxy_server)
+    if exit_request is not None:
+        exit_request.bind(proxy_server)
     try:
         asyncio.run(_serve_both())
     except KeyboardInterrupt:
@@ -194,6 +244,7 @@ def run_with_dev_auth(
         # une trace KeyboardInterrupt à chaque arrêt. Sortie silencieuse, pour
         # que les deux modes de lancement se terminent de la même façon.
         return
+    _exit_if_requested(exit_request)
     if restart_requested():
         # La paire de clés de l'AS ne vit qu'en mémoire : la nouvelle ne
         # vérifie aucun jeton émis par l'ancienne.
@@ -205,10 +256,17 @@ def run_with_dev_auth(
         _reexec()
 
 
-def _migrate_and_exit(layer_paths: list[Path], local_path: Path) -> None:
-    result = migrate_local(layer_paths, local_path)
-    print(f"{local_path} allégé, original sauvegardé en {local_path.name}.bak.")
-    print(f"  {len(result.removed)} valeur(s) identique(s) aux couches précédentes retirée(s).")
+def _migrate_and_exit(layer_paths: list[Path], local_path: Path, diff_only: bool) -> None:
+    if diff_only:
+        result, diff = migration_diff(layer_paths, local_path)
+        if diff:
+            sys.stdout.writelines(diff)
+        print(f"Aperçu seulement : {local_path} n'est pas modifié.")
+        print(f"  {len(result.removed)} valeur(s) identique(s) aux couches précédentes à retirer.")
+    else:
+        result = migrate_local(layer_paths, local_path)
+        print(f"{local_path} allégé, original sauvegardé en {local_path.name}.bak.")
+        print(f"  {len(result.removed)} valeur(s) identique(s) aux couches précédentes retirée(s).")
     if result.inherited:
         print(
             "  Reçu des couches précédentes, absent de ce fichier (à neutraliser "
@@ -240,6 +298,14 @@ def main() -> None:
             "ce que les précédents portent déjà, et de tous ses _comment, après "
             "l'avoir sauvegardé en <fichier>.bak. La config effective est "
             "inchangée. Puis quitte."
+        ),
+    )
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help=(
+            "Avec --migrate-config : affiche le diff de l'allègement (secrets "
+            "masqués) sans rien écrire."
         ),
     )
     parser.add_argument(
@@ -354,6 +420,10 @@ def main() -> None:
         print("Erreur : --proxy et --noproxy sont mutuellement exclusifs.", file=sys.stderr)
         sys.exit(1)
 
+    if args.diff and not args.migrate_config:
+        print("Erreur : --diff ne s'emploie qu'avec --migrate-config.", file=sys.stderr)
+        sys.exit(1)
+
     if args.auth and args.no_auth:
         print("Erreur : --auth et --no-auth sont mutuellement exclusifs.", file=sys.stderr)
         sys.exit(1)
@@ -369,7 +439,7 @@ def main() -> None:
     try:
         layer_paths, local_path = resolve_chain(args.config)
         if args.migrate_config:
-            _migrate_and_exit(layer_paths, local_path)
+            _migrate_and_exit(layer_paths, local_path, args.diff)
         loaded = load_layers(layer_paths, local_path)
         cfg = loaded.cfg
         if args.print_config:
@@ -378,6 +448,7 @@ def main() -> None:
         host = args.host or cfg.get("host", "127.0.0.1")
         port = args.port or int(cfg["port"])
         miaou_dist = resolve_miaou_dist(cfg, loaded.miaou_dist_base)
+        self_update = resolve_self_update(cfg)
     except ValueError as e:
         print(f"Erreur : {e}", file=sys.stderr)
         sys.exit(1)
@@ -444,11 +515,26 @@ def main() -> None:
         tools_cache_beside(args.tokens_file) if args.tokens_file
         else default_tools_cache_path(local_path)
     )
+    in_flight = InFlight()
     mcp_server = build_proxy_server(
-        upstreams, tool_map, authorizers=authorizers, catalog=catalog
+        upstreams, tool_map, authorizers=authorizers, catalog=catalog, in_flight=in_flight
     )
+    updater = None
+    exit_request = ExitRequest()
+    if self_update:
+        updater = SelfUpdater(
+            UpdateConfig(
+                root=selfupdate.PROJECT_ROOT,
+                miaou_dist=miaou_dist,
+                supervised=is_supervised(),
+                state_file=selfupdate.state_path(state_dir(local_path)),
+            ),
+            in_flight,
+            request_restart=exit_request,
+        )
     app = build_app(
-        mcp_server, upstreams, auth=auth, authorizers=authorizers, miaou_dist=miaou_dist
+        mcp_server, upstreams, auth=auth, authorizers=authorizers, miaou_dist=miaou_dist,
+        updater=updater,
     )
 
     if auth is not None:
@@ -461,6 +547,13 @@ def main() -> None:
         )
         _log(f"  jetons : {tokens_path}")
         _log(f"  redirection : {build_callback_url(host, port)}")
+    if updater is not None:
+        _log(
+            "Mise à jour à la demande active"
+            + ("" if updater.config.supervised else
+               f" — sans {SUPERVISED_ENV}=1, l'application est refusée (aucun superviseur ne relancerait)")
+            + "."
+        )
     if miaou_dist is not None:
         _log(f"MIAOU servi depuis {miaou_dist}")
         for warning in miaou_dist_warnings(miaou_dist):
@@ -469,7 +562,7 @@ def main() -> None:
     print(f"miaou-proxy → http://{host}:{port}/mcp  (Ctrl-C pour arrêter)")
 
     if args.with_dev_auth is None:
-        serve_http(app, host=host, port=port)
+        serve_http(app, host=host, port=port, exit_request=exit_request)
         return
 
     run_with_dev_auth(
@@ -479,4 +572,5 @@ def main() -> None:
         dev_auth_port=args.with_dev_auth,
         issuer_url=dev_auth_url or f"http://127.0.0.1:{args.with_dev_auth}",
         auto_approve=args.dev_auth_auto_approve,
+        exit_request=exit_request,
     )

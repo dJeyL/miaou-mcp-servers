@@ -1,0 +1,4 @@
+# Les scripts bash doivent garder des fins de ligne LF, y compris sous Windows
+# (core.autocrlf=true par défaut avec Git for Windows) : un CRLF fait échouer
+# Git Bash dès la première ligne (« $'\r': command not found »).
+*.sh text eol=lf

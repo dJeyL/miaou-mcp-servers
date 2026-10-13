@@ -78,6 +78,30 @@ vérifié en retirant la table.
 Les tests qui interceptent le client HTTP du SDK patchent **`httpx2`** (`AsyncClient`,
 `MockTransport`, `Response`) : le SDK 2.x n'emploie plus `httpx`, et un patch resté sur
 l'ancien nom ne lève rien — il ne patche plus rien, et le test part sur le réseau.
+`tests/test_proxy_selfupdate.py` (mise à jour du proxy par lui-même, `selfupdate.py`)
+travaille sur de **vrais dépôts jetables** sous `tmp_path`, sans réseau : un dépôt nu sert
+de remote, un clone `seed` y publie, et le « clone du proxy » est un second clone dont le
+remote s'appelle `fork` et la branche `trunk` — un code qui supposerait `origin` ou `main`
+y échoue. La config git de l'utilisateur est neutralisée en fixture autouse
+(`GIT_CONFIG_GLOBAL` vers un fichier vide, `GIT_CONFIG_NOSYSTEM`) : une signature de
+commits ou un hook global casseraient sinon les commits de fixture. « Aucun fetch » se
+prouve par l'absence de `.git/FETCH_HEAD`. Ce que git ne produit pas sur un dépôt local
+(refus d'authentification sous plusieurs formes, « dubious ownership », `ls-remote` qui
+ne répond plus, reset qui échoue) passe par un **faux `git` en tête du PATH**, script bash
+qui répond pour une sous-commande et délègue au vrai pour le reste. Le timeout se teste
+avec un faux git qui lance un petit-enfant gardant stdout (le groupe entier doit mourir),
+puis sans `os.killpg` (repli : l'appel rend quand même la main). Le checkout interrompu se
+provoque par un dossier suivi passé en `0o555`, sur lequel la cible ajoute un fichier ;
+le test est sauté sous root, que ces droits n'arrêtent pas. L'extension
+(`updater.py`) se teste en JSON-RPC moderne sur le `Server` du proxy (le harnais legacy
+ne voit pas les `extensions`), `scripts/supervise.sh` par `bash` sur une fausse commande
+qui rend une suite de codes de sortie (42, 42, 0…), exécuté puis sourcé. Deux tests de
+bout en bout lancent `serve_http` sur un **vrai uvicorn** dans le thread principal (il
+pose des gestionnaires de signaux), le client MCP streamable-http dans un autre : `apply`
+répond, puis le processus sort en 42 ; pour une mise à jour MIAOU seule, `/app/version.json`
+change sans sortie. Un garde-fou envoie SIGINT au bout de 30 s, pour qu'un test cassé
+échoue au lieu de pendre. La sortie en 42 elle-même, et son ordre face au SIGUSR1, se
+testent aussi avec le double d'uvicorn de `test_proxy.py`.
 Les tests de docs monkeypatchent `mcp_docs.session.WORKDIR` (fixture `tmp_path`) pour
 isoler le filesystem par test, exercent chaque format (fixtures PDF/xlsx/docx/pptx/zip
 générées à la volée par les libs elles-mêmes) via `formats.py` directement, et vérifient

@@ -36,7 +36,11 @@ miaou-mcp-servers/
 │   │   └── authorizer.py # parcours, renouvellement, routes Starlette
 │   ├── app.py            # build_app (Starlette)
 │   ├── webapp.py         # MIAOU servi sous /app/ : clé miaou_dist, MiaouStaticFiles, garde et avertissements
-│   └── entry.py          # CLI, main(), serve_http (redémarrage sur SIGUSR1)
+│   ├── selfupdate.py     # mise à jour par lui-même (lot AT) : état git du clone, fast-forward vers le sha affiché
+│   ├── updater.py        # extension miaou/self-update : status/apply, sonde de 5 min, refus (supervision, appels en vol)
+│   └── entry.py          # CLI, main(), serve_http (redémarrage sur SIGUSR1, sortie en 42 après mise à jour)
+├── scripts/
+│   └── supervise.sh      # superviseur bash : relance sur le code 42, pose MIAOU_PROXY_SUPERVISED=1
 ├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker — versionné VIDE (.gitkeep) ; contenu NON gitignoré, pour qu'un fork y versionne MIAOU — ne pas le committer ici
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
@@ -77,16 +81,18 @@ miaou-mcp-servers/
 │   ├── test_proxy_auth.py  # auth OAuth entrante (lot AB-1)
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante (lot AB-2)
 │   ├── test_proxy_webapp.py  # MIAOU servi sous /app/ (lot AO-1) : purs, ASGI, vrai uvicorn
+│   ├── test_proxy_selfupdate.py  # mise à jour par lui-même (lot AT) : vrais dépôts jetables, faux git, extension
 │   └── test_dev_auth_server.py  # serveur d'autorisation de développement (lot AB-1.3)
 ├── config.defaults.json  # couche de BASE de la config, versionnée, lue telle quelle
 ├── config.site.json      # (fork seulement, absent ici) valeurs communes d'une organisation
 ├── config.json           # (gitignored) le propre d'une installation, par-dessus les deux
-├── state/                # (gitignored) jetons OAuth et cache d'outils du proxy
+├── state/                # (gitignored) jetons OAuth, cache d'outils, self-update.json (HEAD d'avant une mise à jour)
 ├── requirements.txt      # pour les utilisateurs sans uv
 ├── pyproject.toml        # métadonnées projet + config pytest (asyncio_mode=auto) + groupe dev
 │                         # + [project.scripts] mcp_proxy et le build-system qui le rend
 │                         #   installable — c'est ce qui garde `uv run mcp_proxy` court
 ├── uv.lock               # lock uv, versionné
+├── .gitattributes        # *.sh en LF (Git Bash échoue sur CRLF)
 └── .gitignore
 ```
 
@@ -146,11 +152,13 @@ uv run --directory servers python -m mcp_docs        # HTTP 127.0.0.1:8771
 uv run mcp_proxy                        # config.defaults.json + config.site.json + config.json
 uv run mcp_proxy --print-config         # config effective, secrets masqués
 uv run mcp_proxy --migrate-config       # allège un config.json à l'ancienne (sauvegarde .bak)
+uv run mcp_proxy --migrate-config --diff  # le même allègement en diff (secrets masqués), sans écrire
 uv run mcp_proxy --port 8765            # override port
 uv run mcp_proxy --config autre.json   # remplace la chaîne ; répétable, en couches
 uv run mcp_proxy --proxy 10.0.0.1:3128  # force le proxy réseau vu par les upstreams
 uv run mcp_proxy --noproxy              # force l'absence de proxy vu par les upstreams
 kill -USR1 <pid>                        # redémarre le proxy sur place, code relu
+scripts/supervise.sh                    # uv run mcp_proxy, relancé après une mise à jour (self_update)
 ```
 
 **Instance locale du proxy** : lancée par l'utilisateur au premier plan dans un terminal, pas
@@ -385,12 +393,20 @@ lots — piège déjà payé côté MIAOU.
   wrapper ASGI qui évite le 307 sur `/mcp`, le redémarrage sur place au SIGUSR1
   (`serve_http` : exec après l'arrêt complet, lifespan compris, sans `uv run` ; clés
   de `--with-dev-auth` perdues ; motif `pkill` ancré sur l'interpréteur et non sur
-  son parent uv ; absent sous Windows, faute de SIGUSR1), l'override `--proxy`/`--noproxy` et ses
+  son parent uv ; absent sous Windows, faute de SIGUSR1), la mise à jour à la demande
+  (lot AT : clé `self_update` ET `MIAOU_PROXY_SUPERVISED=1`, `selfupdate.py` — aucun
+  nom de remote ni de branche en dur, `ls-remote` puis fetch seulement si le sha est
+  inconnu, `merge --ff-only` vers le sha affiché, arbre sale refusé en amont et retour
+  arrière d'un checkout interrompu qui en dépend, git jamais interactif et tué par
+  groupe de processus —, `updater.py` — sonde de 5 min, `checking`, refus dans
+  l'ordre, `InFlight`, genre `miaou` sans redémarrage —, sortie en 42 par
+  `ExitRequest` examinée avant le SIGUSR1, `scripts/supervise.sh` exécuté ou sourcé,
+  `.gitattributes` LF), l'override `--proxy`/`--noproxy` et ses
   trois chemins d'application, le format de `config.json` ; config en couches
   (`layers.py` : chaîne `config.defaults.json` → `config.site.json` → `config.json`,
   `--config` répétable qui la remplace, JSON Merge Patch sans variante, `${VAR}`
   substitué APRÈS la fusion et hors clés `_*`, `miaou_dist` résolu contre la couche
-  qui le déclare, `--print-config` masqué, `--migrate-config` et son contrat de config
+  qui le déclare, `--print-config` masqué, `--migrate-config` (et `--diff`, aperçu masqué sans écriture) et son contrat de config
   effective inchangée, `_comment` retirés, absences listées et jamais neutralisées
   d'office, `.bak` jamais écrasée) et `state/` (`state.py`, `state/<nom>/` pour une
   autre config, anciens fichiers déplacés sans réécriture), le pattern
@@ -501,7 +517,11 @@ lots — piège déjà payé côté MIAOU.
   d'un proxy chaîné et la collision d'approbations qu'il rend possible, et le réflexe
   `miaou__skills__read` mesuré avec MIAOU actuel), MIAOU servi sous `/app/` (portée,
   `manifest.webmanifest` seul nom figé, icônes lues dans le manifeste, `no-cache`,
-  types fixés), et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
+  types fixés), l'extension `miaou/self-update` (lot AT : ère moderne seulement,
+  `miaou/update/status` et la forme de son état — `state`, `target` à renvoyer,
+  `update.kind` miaou/proxy/both, `served_build` —, `miaou/update/apply` vers le sha
+  exact, `restart` faux pour MIAOU seul, refus `UPDATE_*` dans `error.data.code`),
+  et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
   `ref`+`content_b64`, `session_id`, idempotence de la matérialisation, REF_UNKNOWN
   levée en `MCPError` par l'outil et donc rejouable en autonome comme derrière le
   proxy, taille d'un `content_b64` et `MAX_REQUEST_BODY_BYTES` couplé au plafond
@@ -517,7 +537,10 @@ lots — piège déjà payé côté MIAOU.
   chemin JSON-RPC de MIAOU, jamais le mode par défaut), les patchs qui visent
   `httpx2` et non plus `httpx`, l'isolation filesystem par `tmp_path`, les deux pièges de fixture
   du mock de réponse de `test_web.py` (queue de remplissage compressible, garde
-  verte des deux côtés), `test_proxy_webapp.py` et son vrai uvicorn sur port
+  verte des deux côtés), `test_proxy_selfupdate.py` et ses vrais dépôts jetables
+  (remote `fork`, branche `trunk`, config git de l'utilisateur neutralisée, faux
+  `git` en tête du PATH pour l'authentification refusée et le timeout, absence de
+  `FETCH_HEAD` comme preuve qu'aucun fetch n'a eu lieu), `test_proxy_webapp.py` et son vrai uvicorn sur port
   éphémère (en-têtes émis, revalidation après `git pull` ; `guess_type` à remplacer
   dans `starlette.responses`, pas dans `mimetypes`), les vrais handshakes de `test_proxy_era.py` (fixtures
   stdio des deux ères, app http sur `httpx2.ASGITransport`, middleware qui imite

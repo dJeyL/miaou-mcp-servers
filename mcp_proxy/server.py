@@ -524,11 +524,30 @@ def aggregate_instructions(
     return "\n\n".join([_INSTRUCTIONS_PREAMBLE, *sections])
 
 
+class InFlight:
+    """Compte les appels d'outils en cours, tous clients confondus.
+
+    Lu par la mise à jour du proxy (lot AT) : un redémarrage couperait ces
+    appels, chez tous les clients du proxy, et seul le proxy les voit tous.
+    Lu depuis un thread (`before_merge`) : une lecture d'entier suffit."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def __enter__(self) -> InFlight:
+        self.count += 1
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.count -= 1
+
+
 def build_proxy_server(
     upstreams: dict[str, Upstream],
     tool_map: dict[str, tuple[str, str]],
     authorizers: dict[str, Any] | None = None,
     catalog: Any = None,
+    in_flight: InFlight | None = None,
 ) -> Server:
     """Construit le Server MCP avec les handlers list_tools / call_tool.
 
@@ -537,6 +556,7 @@ def build_proxy_server(
     (« connu mais pas autorisé ») et l'outil `status`.
     """
     authorizers = authorizers or {}
+    in_flight = in_flight if in_flight is not None else InFlight()
 
     async def handle_list_tools(
         ctx: Any, params: types.PaginatedRequestParams | None
@@ -625,6 +645,11 @@ def build_proxy_server(
     async def handle_call_tool(
         ctx: Any, params: types.CallToolRequestParams
     ) -> types.CallToolResult:
+        # `status` et `read_skill` compris : tout appel en cours en est un.
+        with in_flight:
+            return await route_call_tool(params)
+
+    async def route_call_tool(params: types.CallToolRequestParams) -> types.CallToolResult:
         """Route l'appel et rend ce que le CLIENT doit voir de son issue.
 
         Le `Server` bas niveau du SDK 2.x n'enveloppe plus rien : une exception
