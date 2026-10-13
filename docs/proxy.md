@@ -125,6 +125,7 @@ mcp_proxy/ (paquet, à la racine du projet)
 ├── updater.py     extension miaou/self-update : SelfUpdater, sonde de 5 min,
 │                  miaou/update/status et miaou/update/apply
 └── entry.py       main() — CLI ; serve_http() : uvicorn + redémarrage sur SIGUSR1
+                   (exec, ou sortie en 43 sous superviseur)
                    + sortie en 42 après une mise à jour (ExitRequest) ;
                    et run_with_dev_auth() : --with-dev-auth, proxy ET AS de
                    développement dans ce process, sur DEUX ports
@@ -139,6 +140,15 @@ projet étant installé en editable par uv, c'est bien le code du dépôt. Usage
 git `post-commit` local, non versionné, l'envoie à l'instance du poste après chaque
 commit sur `main`.
 
+- **Sous superviseur, sortie en 43 au lieu de l'exec** (`RESTART_EXIT_CODE`,
+  `_restart`) : même arrêt complet, puis `sys.exit(43)`, et `scripts/supervise.sh` relance
+  par sa fonction de lancement — `uv run` compris, donc dépendances installées et proxy
+  réseau d'un fork redétecté. Exige `MIAOU_PROXY_SUPERVISED=1` ET
+  `MIAOU_PROXY_RESTART_BY_EXIT=1`, posées toutes deux par `supervise.sh` ; la seconde
+  n'existe que pour la transition : un `supervise.sh` d'avant le code 43, encore en
+  mémoire dans le bash qui a relancé un proxy mis à jour, ne relance que sur 42 et
+  rendrait 43 en arrêtant tout. Sans elle, exec comme hors supervision. Tout ce qui suit
+  sur l'exec ne vaut donc que hors supervision.
 - **Pas sous Windows** : le module `signal` n'y a pas de `SIGUSR1`. `RESTART_SIGNAL`
   vaut alors `None`, `_on_restart_signal` ne pose rien, et le proxy tourne sans
   redémarrage sur place — l'arrêt se fait au Ctrl-C comme avant.
@@ -226,14 +236,16 @@ l'emporte, seule la relance par `uv run` installant les dépendances. Le proxy n
 relance jamais lui-même.
 
 **`scripts/supervise.sh`** (bash : macOS, Linux, Git Bash). Pose
-`MIAOU_PROXY_SUPERVISED=1`, relance tant que la commande sort en 42, rend tout autre code
-tel quel (0 au Ctrl-C). Exécuté, il relance la commande donnée (`uv run --directory
+`MIAOU_PROXY_SUPERVISED=1` et `MIAOU_PROXY_RESTART_BY_EXIT=1`, relance tant que la
+commande sort en 42 (mise à jour) ou 43 (SIGUSR1), rend tout autre code tel quel (0 au
+Ctrl-C). Exécuté, il relance la commande donnée (`uv run --directory
 <clone> mcp_proxy` sans argument) ; sourcé, `miaou_supervise <fonction> [args…]` rappelle
 la fonction à chaque tour, ce qui refait la détection du proxy réseau d'un fork à chaque
 relance. Il ne construit jamais la ligne d'une installation : un fork l'appelle depuis
 son propre `start.sh`, sans le modifier (aucun conflit au merge de l'upstream). Une
 sortie en erreur (code 1 à 127) du lancement qui suit une mise à jour affiche la commande
-de retour arrière, lue dans `state/self-update.json` (chemin par défaut) ; pas un arrêt
+de retour arrière, lue dans `state/self-update.json` (chemin par défaut) — une relance
+sur 43 entre les deux la désarme : le code mis à jour a tourné ; pas un arrêt
 par signal — SIGTERM rend 143, uvicorn relevant le signal après un arrêt propre (mesuré
 sous `uv run`). `.gitattributes` force LF sur `*.sh` :
 Git for Windows convertit en CRLF par défaut, et Git Bash échoue alors dès la première

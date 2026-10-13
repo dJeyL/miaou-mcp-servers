@@ -1,7 +1,8 @@
 """Point d'entrée CLI : parsing d'arguments, amorçage, lancement uvicorn.
 
 `kill -USR1 <pid>` redémarre le proxy sur place en relisant le code (voir
-`serve_http`). Une mise à jour appliquée (lot AT) le fait sortir en
+`serve_http`) ; sous un superviseur qui sait le relancer, il sort plutôt en
+`RESTART_EXIT_CODE`. Une mise à jour appliquée (lot AT) le fait sortir en
 `UPDATE_EXIT_CODE`, pour que son superviseur le relance par `uv run`.
 """
 
@@ -55,6 +56,15 @@ RESTART_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 #: relance sur ce code, et sur lui seul. Hors de 0 (arrêt normal, Ctrl-C
 #: compris), 1 (config), 2 (argparse), 3 (démarrage raté) et des signaux.
 UPDATE_EXIT_CODE = 42
+
+#: Sortie sur RESTART_SIGNAL sous superviseur, au lieu de l'exec : la relance
+#: repasse par `uv run` (dépendances installées) et par la fonction de
+#: lancement du superviseur (proxy réseau redétecté). Exige, en plus de
+#: SUPERVISED_ENV, RESTART_BY_EXIT_ENV, que seul pose un `supervise.sh` qui
+#: connaît ce code : un superviseur plus ancien, encore en mémoire après une
+#: mise à jour, rendrait 43 au lieu de relancer, et le proxy resterait arrêté.
+RESTART_EXIT_CODE = 43
+RESTART_BY_EXIT_ENV = "MIAOU_PROXY_RESTART_BY_EXIT"
 
 #: À l'arrêt, les requêtes en cours finissent ; au-delà (flux SSE d'une session
 #: MCP restée ouverte), elles sont coupées. Ne borne pas le shutdown du
@@ -125,6 +135,15 @@ def _reexec() -> None:
     os.execv(sys.executable, sys.orig_argv)
 
 
+def _restart() -> None:
+    """Suite d'un arrêt sur RESTART_SIGNAL : sortie en RESTART_EXIT_CODE sous
+    un superviseur qui la relance, exec sur place sinon."""
+    if is_supervised() and os.environ.get(RESTART_BY_EXIT_ENV) == "1":
+        _log(f"sortie en {RESTART_EXIT_CODE} : redémarrage demandé, relance par le superviseur.")
+        sys.exit(RESTART_EXIT_CODE)
+    _reexec()
+
+
 def serve_http(app: Any, host: str, port: int, exit_request: ExitRequest | None = None) -> None:
     """uvicorn, plus un redémarrage sur RESTART_SIGNAL : arrêt en douceur, puis
     exec de la même ligne de commande. Un code qui ne s'importe plus meurt au
@@ -154,7 +173,7 @@ def serve_http(app: Any, host: str, port: int, exit_request: ExitRequest | None 
         sys.exit(3)
     _exit_if_requested(exit_request)
     if restart_requested():
-        _reexec()
+        _restart()
 
 
 def run_with_dev_auth(
@@ -253,7 +272,7 @@ def run_with_dev_auth(
             "développement, les jetons déjà émis sont invalides "
             "(clients à ré-autoriser)."
         )
-        _reexec()
+        _restart()
 
 
 def _migrate_and_exit(layer_paths: list[Path], local_path: Path, diff_only: bool) -> None:

@@ -842,8 +842,11 @@ def _countdown(tmp_path: Path, codes: list[int]) -> Path:
 
 
 @needs_bash
-@pytest.mark.parametrize("codes, final", [([42, 42, 0], 0), ([42, 7], 7), ([3], 3), ([0], 0)])
-def test_supervise_relaunches_on_42_only(tmp_path, codes, final):
+@pytest.mark.parametrize(
+    "codes, final",
+    [([42, 42, 0], 0), ([42, 7], 7), ([3], 3), ([0], 0), ([43, 43, 0], 0), ([43, 42, 43, 5], 5)],
+)
+def test_supervise_relaunches_on_42_and_43_only(tmp_path, codes, final):
     fake = _countdown(tmp_path, codes)
     done = subprocess.run([BASH, str(SUPERVISE), str(fake), "--port", "1"],
                           capture_output=True, text=True, timeout=30)
@@ -863,10 +866,22 @@ def test_supervise_points_to_the_rollback_after_a_failed_restart(tmp_path):
 
 
 @needs_bash
-@pytest.mark.parametrize("codes", [[1], [42, 143], [42, 130]])
+def test_supervise_still_points_to_the_rollback_after_a_restart_then_an_update(tmp_path):
+    fake = _countdown(tmp_path, [43, 42, 1])
+    done = subprocess.run([BASH, str(SUPERVISE), str(fake)],
+                          capture_output=True, text=True, timeout=30)
+    assert done.returncode == 1
+    assert "s'est arrêté en erreur (code 1)" in done.stderr
+    assert "redémarrage demandé (SIGUSR1)" in done.stderr
+
+
+@needs_bash
+@pytest.mark.parametrize("codes", [[1], [42, 143], [42, 130], [42, 43, 1]])
 def test_supervise_says_nothing_after_a_plain_failure_or_a_signal(tmp_path, codes):
     """Ni après un échec sans mise à jour, ni après un arrêt par signal
-    (SIGTERM rend 143 : mesuré, uvicorn relève le signal après l'arrêt)."""
+    (SIGTERM rend 143 : mesuré, uvicorn relève le signal après l'arrêt), ni
+    après une relance sur 43 qui suit la mise à jour : le code mis à jour a
+    tourné, l'échec suivant ne s'y rapporte plus."""
     fake = _countdown(tmp_path, codes)
     done = subprocess.run([BASH, str(SUPERVISE), str(fake)],
                           capture_output=True, text=True, timeout=30)
@@ -894,6 +909,17 @@ def test_supervise_sourced_reevaluates_the_launch_function(tmp_path):
     assert (tmp_path / "runs").read_text().splitlines() == [
         "run 1 tour-1 --x", "run 1 tour-2 --x", "run 1 tour-3 --x",
     ]
+
+
+@needs_bash
+def test_supervise_announces_that_it_relaunches_on_43(tmp_path):
+    """Le proxy ne sort en 43 que s'il voit cette variable : un superviseur
+    qui ne la pose pas ne relance que sur 42."""
+    probe = tmp_path / "probe.sh"
+    probe.write_text(f'#!/bin/bash\necho "$MIAOU_PROXY_RESTART_BY_EXIT" > "{tmp_path}/seen"\n')
+    probe.chmod(0o755)
+    subprocess.run([BASH, str(SUPERVISE), str(probe)], timeout=30, check=True)
+    assert (tmp_path / "seen").read_text().strip() == "1"
 
 
 def test_supervise_is_lf_only():

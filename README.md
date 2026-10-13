@@ -80,7 +80,8 @@ kill -USR1 <pid>   # redémarre sur place (même pid, code relu)
 
 `SIGUSR1` arrête le proxy en douceur (5 s pour les requêtes en cours) puis le relance
 par `exec`, même pid et même terminal. Ça ne repasse pas par `uv run` : une dépendance
-modifiée demande un vrai relancement. Les sessions MCP en cours sont perdues, et avec
+modifiée demande un vrai relancement. Sous `scripts/supervise.sh`, le proxy sort plutôt
+en 43 et le superviseur le relance, `uv run` compris. Les sessions MCP en cours sont perdues, et avec
 `--with-dev-auth` les jetons émis par le serveur d'autorisation de développement. Sous
 Windows, faute de `SIGUSR1`, le proxy tourne sans ce redémarrage.
 
@@ -296,7 +297,8 @@ Image Docker : copier le `dist/` de MIAOU dans le dossier `miaou_dist/` du dép�
 Un proxy lancé depuis un clone git peut se mettre à jour à la demande de MIAOU : il
 vérifie toutes les 5 min si la branche distante que suit le clone est en avance, MIAOU le
 propose, et le proxy avance alors son clone en fast-forward jusqu'au commit affiché, puis
-sort en 42. `scripts/supervise.sh` le relance par `uv run`, qui installe au passage les
+sort en 42. `scripts/supervise.sh` le relance par `uv run` (comme après un `SIGUSR1`,
+sur lequel le proxy supervisé sort en 43), qui installe au passage les
 dépendances modifiées. Deux clefs sont nécessaires : `"self_update": true` dans la
 config, et `MIAOU_PROXY_SUPERVISED=1` dans l'environnement, que pose `supervise.sh`
 (sans elle, la mise à jour est visible mais refusée : rien ne relancerait le proxy).
@@ -502,9 +504,9 @@ miaou-mcp-servers/
 │   ├── webapp.py         # MIAOU servi sous /app/ (clé miaou_dist)
 │   ├── selfupdate.py     # mise à jour par lui-même : état git du clone, fast-forward
 │   ├── updater.py        # extension miaou/self-update (état, application)
-│   └── entry.py          # CLI, main(), serve_http (SIGUSR1, sortie en 42 après mise à jour)
+│   └── entry.py          # CLI, main(), serve_http (SIGUSR1 ou sortie en 43 supervisé, 42 après mise à jour)
 ├── scripts/
-│   └── supervise.sh      # relance le proxy quand il sort en 42 (mise à jour appliquée)
+│   └── supervise.sh      # relance le proxy quand il sort en 42 (mise à jour) ou 43 (SIGUSR1)
 ├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker (versionné vide)
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/

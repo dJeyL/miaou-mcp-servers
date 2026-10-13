@@ -38,9 +38,9 @@ miaou-mcp-servers/
 │   ├── webapp.py         # MIAOU servi sous /app/ : clé miaou_dist, MiaouStaticFiles, garde et avertissements
 │   ├── selfupdate.py     # mise à jour par lui-même (lot AT) : état git du clone, fast-forward vers le sha affiché
 │   ├── updater.py        # extension miaou/self-update : status/apply, sonde de 5 min, refus (supervision, appels en vol)
-│   └── entry.py          # CLI, main(), serve_http (redémarrage sur SIGUSR1, sortie en 42 après mise à jour)
+│   └── entry.py          # CLI, main(), serve_http (redémarrage sur SIGUSR1 — sortie en 43 sous superviseur —, sortie en 42 après mise à jour)
 ├── scripts/
-│   └── supervise.sh      # superviseur bash : relance sur le code 42, pose MIAOU_PROXY_SUPERVISED=1
+│   └── supervise.sh      # superviseur bash : relance sur 42 et 43, pose MIAOU_PROXY_SUPERVISED=1 et MIAOU_PROXY_RESTART_BY_EXIT=1
 ├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker — versionné VIDE (.gitkeep) ; contenu NON gitignoré, pour qu'un fork y versionne MIAOU — ne pas le committer ici
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
@@ -158,7 +158,7 @@ uv run mcp_proxy --config autre.json   # remplace la chaîne ; répétable, en c
 uv run mcp_proxy --proxy 10.0.0.1:3128  # force le proxy réseau vu par les upstreams
 uv run mcp_proxy --noproxy              # force l'absence de proxy vu par les upstreams
 kill -USR1 <pid>                        # redémarre le proxy sur place, code relu
-scripts/supervise.sh                    # uv run mcp_proxy, relancé après une mise à jour (self_update)
+scripts/supervise.sh                    # uv run mcp_proxy, relancé après une mise à jour (self_update) ou un SIGUSR1
 ```
 
 **Instance locale du proxy** : lancée par l'utilisateur au premier plan dans un terminal, pas
@@ -393,14 +393,16 @@ lots — piège déjà payé côté MIAOU.
   wrapper ASGI qui évite le 307 sur `/mcp`, le redémarrage sur place au SIGUSR1
   (`serve_http` : exec après l'arrêt complet, lifespan compris, sans `uv run` ; clés
   de `--with-dev-auth` perdues ; motif `pkill` ancré sur l'interpréteur et non sur
-  son parent uv ; absent sous Windows, faute de SIGUSR1), la mise à jour à la demande
+  son parent uv ; absent sous Windows, faute de SIGUSR1 ; sortie en 43 sous superviseur,
+  exigeant `MIAOU_PROXY_RESTART_BY_EXIT` pour un `supervise.sh` d'avant resté en mémoire), la mise à jour à la demande
   (lot AT : clé `self_update` ET `MIAOU_PROXY_SUPERVISED=1`, `selfupdate.py` — aucun
   nom de remote ni de branche en dur, `ls-remote` puis fetch seulement si le sha est
   inconnu, `merge --ff-only` vers le sha affiché, arbre sale refusé en amont et retour
   arrière d'un checkout interrompu qui en dépend, git jamais interactif et tué par
   groupe de processus —, `updater.py` — sonde de 5 min, `checking`, refus dans
   l'ordre, `InFlight`, genre `miaou` sans redémarrage —, sortie en 42 par
-  `ExitRequest` examinée avant le SIGUSR1, `scripts/supervise.sh` exécuté ou sourcé,
+  `ExitRequest` examinée avant le SIGUSR1, `scripts/supervise.sh` exécuté ou sourcé
+  (une relance sur 43 désarme l'indication de retour arrière),
   `.gitattributes` LF), l'override `--proxy`/`--noproxy` et ses
   trois chemins d'application, le format de `config.json` ; config en couches
   (`layers.py` : chaîne `config.defaults.json` → `config.site.json` → `config.json`,

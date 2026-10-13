@@ -1504,6 +1504,10 @@ def uvicorn_double(monkeypatch):
         mcp_proxy.entry.os, "execv", lambda path, argv: execs.append((path, list(argv)))
     )
     monkeypatch.setattr(sys, "orig_argv", ["python", "/venv/bin/mcp_proxy", "--port", "8765"])
+    # Suite lancée elle-même sous supervise.sh : les tests hors supervision
+    # n'en héritent pas.
+    monkeypatch.delenv("MIAOU_PROXY_SUPERVISED", raising=False)
+    monkeypatch.delenv(mcp_proxy.entry.RESTART_BY_EXIT_ENV, raising=False)
     yield execs
     if restart_signal is not None:
         signal.signal(restart_signal, previous)
@@ -1568,6 +1572,56 @@ def test_restart_signal_also_restarts_with_dev_auth(uvicorn_double, monkeypatch,
     assert "jetons déjà émis sont invalides" in capsys.readouterr().err
 
 
+def _supervised(monkeypatch, restart_by_exit=True):
+    monkeypatch.setenv("MIAOU_PROXY_SUPERVISED", "1")
+    if restart_by_exit:
+        monkeypatch.setenv(mcp_proxy.entry.RESTART_BY_EXIT_ENV, "1")
+
+
+@needs_restart_signal
+def test_restart_signal_exits_with_43_under_supervision(uvicorn_double, monkeypatch):
+    """Sous superviseur, le signal fait sortir au lieu de l'exec : la
+    relance repasse par `uv run` et par la fonction de lancement."""
+    _supervised(monkeypatch)
+    monkeypatch.setattr(FakeUvicorn, "signum", mcp_proxy.entry.RESTART_SIGNAL)
+    with pytest.raises(SystemExit) as exc:
+        mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765)
+    assert exc.value.code == mcp_proxy.entry.RESTART_EXIT_CODE == 43
+    assert uvicorn_double == []
+
+
+@needs_restart_signal
+def test_restart_signal_still_reexecs_under_an_older_supervisor(uvicorn_double, monkeypatch):
+    """Un supervise.sh d'avant le code 43, encore en mémoire après une mise à
+    jour, ne pose que MIAOU_PROXY_SUPERVISED : sortir en 43 l'arrêterait pour
+    de bon, le proxy s'exec donc comme hors supervision."""
+    _supervised(monkeypatch, restart_by_exit=False)
+    monkeypatch.setattr(FakeUvicorn, "signum", mcp_proxy.entry.RESTART_SIGNAL)
+    mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765)
+    assert len(uvicorn_double) == 1
+
+
+@needs_restart_signal
+def test_restart_by_exit_alone_is_not_supervision(uvicorn_double, monkeypatch):
+    monkeypatch.setenv(mcp_proxy.entry.RESTART_BY_EXIT_ENV, "1")
+    monkeypatch.setattr(FakeUvicorn, "signum", mcp_proxy.entry.RESTART_SIGNAL)
+    mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765)
+    assert len(uvicorn_double) == 1
+
+
+@needs_restart_signal
+def test_restart_signal_exits_with_43_with_dev_auth(uvicorn_double, monkeypatch):
+    _supervised(monkeypatch)
+    monkeypatch.setattr(FakeUvicorn, "signum", mcp_proxy.entry.RESTART_SIGNAL)
+    with pytest.raises(SystemExit) as exc:
+        mcp_proxy.entry.run_with_dev_auth(
+            object(), "127.0.0.1", 8765, 8787, "http://127.0.0.1:8787"
+        )
+    assert exc.value.code == 43
+    assert all(s.should_exit for s in FakeUvicorn.instances)
+    assert uvicorn_double == []
+
+
 def test_no_restart_signal_serves_without_handler(uvicorn_double, monkeypatch):
     """Windows n'a pas de SIGUSR1 : RESTART_SIGNAL vaut None, le proxy doit
     démarrer quand même, sans poser de gestionnaire ni redémarrer."""
@@ -1607,9 +1661,13 @@ def test_update_exit_leaves_with_its_own_code(uvicorn_double, monkeypatch):
 
 
 @needs_restart_signal
-def test_update_exit_wins_over_the_restart_signal(uvicorn_double, monkeypatch):
+@pytest.mark.parametrize("supervised", [False, True])
+def test_update_exit_wins_over_the_restart_signal(uvicorn_double, monkeypatch, supervised):
     """Les deux demandes posées : la sortie l'emporte, parce que seule la
-    relance par `uv run` installe les dépendances d'une mise à jour."""
+    relance par `uv run` installe les dépendances d'une mise à jour — et,
+    sous superviseur, parce que seul 42 arme l'indication de retour arrière."""
+    if supervised:
+        _supervised(monkeypatch)
     exit_request = mcp_proxy.entry.ExitRequest()
     _exit_requested_while_serving(
         monkeypatch, exit_request, signum=mcp_proxy.entry.RESTART_SIGNAL

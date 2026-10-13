@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Superviseur du proxy MCP : relance la commande tant qu'elle sort en 42.
+# Superviseur du proxy MCP : relance la commande tant qu'elle sort en 42 ou 43.
 #
 # Le proxy sort en 42 après une mise à jour appliquée depuis MIAOU (clef
 # `self_update` de la config) ; relancé ici par `uv run`, il repart sur le
-# nouveau code avec ses dépendances à jour. Tout autre code de sortie arrête
-# la boucle et est rendu tel quel (0 : arrêt normal, Ctrl-C compris).
+# nouveau code avec ses dépendances à jour. Il sort en 43 sur SIGUSR1, au lieu
+# de s'exec sur place. Tout autre code de sortie arrête la boucle et est rendu
+# tel quel (0 : arrêt normal, Ctrl-C compris).
 # Pose MIAOU_PROXY_SUPERVISED=1 : sans elle, le proxy refuse d'appliquer une
-# mise à jour, faute de quelqu'un pour le relancer.
+# mise à jour, faute de quelqu'un pour le relancer. Pose aussi
+# MIAOU_PROXY_RESTART_BY_EXIT=1 : sans elle, le proxy ne sort pas en 43 et
+# s'exec comme hors supervision — c'est ce qui garde en vie un proxy mis à
+# jour sous un superviseur plus ancien, qui ne relance que sur 42.
 #
 # Bash seulement (macOS, Linux, Git Bash sous Windows). Deux usages :
 #
@@ -26,6 +30,7 @@
 # un fork l'appelle depuis son propre script, sans le modifier.
 
 MIAOU_UPDATE_EXIT_CODE=42
+MIAOU_RESTART_EXIT_CODE=43
 MIAOU_SUPERVISE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 _miaou_rollback_hint() {
@@ -44,11 +49,19 @@ _miaou_rollback_hint() {
 miaou_supervise() {
     local launch="$1" code updated=0
     shift
-    export MIAOU_PROXY_SUPERVISED=1
+    export MIAOU_PROXY_SUPERVISED=1 MIAOU_PROXY_RESTART_BY_EXIT=1
     while :; do
         "$launch" "$@"
         code=$?
-        if [ "$code" -ne "$MIAOU_UPDATE_EXIT_CODE" ]; then
+        if [ "$code" -eq "$MIAOU_UPDATE_EXIT_CODE" ]; then
+            updated=1
+            echo "supervise: mise à jour appliquée, relance du proxy." >&2
+        elif [ "$code" -eq "$MIAOU_RESTART_EXIT_CODE" ]; then
+            # Le code mis à jour a démarré et tourné : un échec à la relance
+            # vient d'autre chose, le retour arrière ne s'y rapporte plus.
+            updated=0
+            echo "supervise: redémarrage demandé (SIGUSR1), relance du proxy." >&2
+        else
             # Pas pour un arrêt par signal (128 + n : SIGTERM rend 143,
             # uvicorn relevant le signal après un arrêt propre).
             if [ "$updated" -eq 1 ] && [ "$code" -ne 0 ] && [ "$code" -lt 128 ]; then
@@ -56,8 +69,6 @@ miaou_supervise() {
             fi
             return "$code"
         fi
-        updated=1
-        echo "supervise: mise à jour appliquée, relance du proxy." >&2
     done
 }
 
