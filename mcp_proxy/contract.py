@@ -22,6 +22,12 @@ reformule, et un test par sous-chaîne casse sans prévenir.
 """
 
 
+SECRET_REQUIRED = "SECRET_REQUIRED"
+"""Code applicatif du refus d'un outil dont l'upstream attend son secret
+volatil (lot AU). Même contrat qu'AUTHORIZATION_REQUIRED : `error.data.code`
+d'une erreur JSON-RPC, testé par égalité."""
+
+
 def authorize_path(upstream_name: str) -> str:
     """Chemin à ouvrir pour (ré)autoriser un upstream. Source UNIQUE.
 

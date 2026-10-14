@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .volatile import format_path, get_at, iter_markers
+
 
 DEFAULTS_FILE = "config.defaults.json"
 SITE_FILE = "config.site.json"
@@ -60,6 +62,11 @@ class LoadedConfig:
     # Variables `${VAR}` sans valeur ni défaut, avec le chemin de la clé ;
     # remplacées par "" (comme docker compose), à signaler au démarrage.
     unset_vars: list[tuple[str, str]] = field(default_factory=list)
+    # Secrets volatils déclarés par une couche et remplacés, dans la config
+    # effective, par une chaîne en clair : (chemin, clef, couche qui déclare).
+    # Le mot de passe resté dans `config.json` alors que le fork pose le
+    # marqueur — à signaler pour pousser la migration (lot AU).
+    plain_over_volatile: list[tuple[str, str, Path]] = field(default_factory=list)
 
 
 def merge_patch(target: Any, patch: Any) -> Any:
@@ -110,22 +117,32 @@ def resolve_chain(explicit: list[str] | None, base_dir: Path | None = None) -> t
 def load_layers(paths: list[Path], local: Path | None = None) -> LoadedConfig:
     merged: dict[str, Any] = {}
     miaou_dist_base = paths[-1]
+    markers: list[tuple[tuple[str | int, ...], str, Path]] = []
     for path in paths:
         layer = read_layer(path)
         if _MIAOU_DIST_KEY in layer:
             miaou_dist_base = path
+        # Parcours de diagnostic, tolérant : un marqueur mal formé est refusé
+        # plus tard, là où il compte (build_upstreams).
+        markers.extend((p, key, path) for p, key in iter_markers(layer, strict=False))
         merged = merge_patch(merged, layer)
     if "port" not in merged:
         names = ", ".join(f"'{p}'" for p in paths)
         raise ValueError(f"La config ({names}) doit contenir la clé 'port'.")
     unset: list[tuple[str, str]] = []
     cfg = interpolate_env(merged, os.environ, unset)
+    plain = [
+        (format_path(p), key, path)
+        for p, key, path in markers
+        if isinstance(get_at(merged, p), str)
+    ]
     return LoadedConfig(
         cfg=cfg,
         layers=list(paths),
         local=local or paths[-1],
         miaou_dist_base=miaou_dist_base,
         unset_vars=unset,
+        plain_over_volatile=plain,
     )
 
 

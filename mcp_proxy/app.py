@@ -35,6 +35,8 @@ def build_app(
     authorizers: dict[str, UpstreamAuthorizer] | None = None,
     miaou_dist: Path | None = None,
     updater: Any = None,
+    catalog: Any = None,
+    secrets: Any = None,
 ) -> Any:
     """`auth` : sortie de resolve_auth_config(), ou None (auth désactivée —
     comportement d'avant le lot AB-1, à l'octet près).
@@ -53,6 +55,13 @@ def build_app(
 
     `updater` : un `SelfUpdater` (lot AT), ou None (`self_update` à false :
     ni méthode, ni extension, ni boucle de sonde — surface d'avant le lot).
+
+    `catalog` : le `ToolCatalogCache`, où un upstream en attente de son secret
+    volatil (lot AU) retrouve ses `instructions`.
+
+    `secrets` : un `VolatileSecrets` (lot AU), ou None (aucun upstream à
+    secret volatil : ni méthode, ni extension). L'extension n'est publiée que
+    s'il reste un consommateur après le démarrage.
     """
     from contextlib import asynccontextmanager
 
@@ -179,6 +188,20 @@ def build_app(
                     failed.append(name)
                     _log(f"  {name:<12} unavailable — {e}")
                     continue
+                if getattr(upstream, "secret_pending", False) is True:
+                    # Dans la table, non construit (lot AU) : ses outils et ses
+                    # instructions viennent du cache, ses appels sont refusés
+                    # en SECRET_REQUIRED jusqu'à la saisie dans MIAOU.
+                    known = 0
+                    if catalog is not None:
+                        upstream.instructions = catalog.recall_instructions(name)
+                        known = len(catalog.recall(name)[0])
+                    _log(
+                        f"  {name:<12} pending — volatile secret "
+                        f"« {upstream.volatile_key} » to enter in MIAOU "
+                        f"({known} tool{'s' if known != 1 else ''} from cache)"
+                    )
+                    continue
                 started.append(upstream)
                 # Le nombre d'outils n'est connu qu'après start() : un upstream
                 # inprocess n'a pas encore son MCPServer avant, et un stdio
@@ -249,6 +272,18 @@ def build_app(
             started: list[Upstream] = []
             try:
                 started = await _start_upstreams()
+                # Les consommateurs ne sont connus qu'après le démarrage (un
+                # `check_config` qui lève écarte l'upstream) ; avant
+                # session_manager.run(), aucun client n'a encore découvert.
+                if secrets is not None:
+                    secrets.publish_surface = publish_surface
+                    secrets.attach()
+                    if secrets.keys:
+                        secrets.install(mcp_server)
+                        _log(
+                            "Secrets volatils à saisir dans MIAOU : "
+                            + ", ".join(f"« {k} »" for k in secrets.keys) + "."
+                        )
                 # Avant session_manager.run() : aucun client ne peut avoir fait
                 # son handshake avant que la surface soit publiée.
                 await publish_surface()

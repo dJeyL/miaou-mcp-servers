@@ -24,7 +24,7 @@ dépôt n'a jamais utilisé `requests`.
 
 Trois points d'appel, un par mode de lancement, et pas un de plus :
 
-- **`MiaouMCPBase.main()`** — seul point traversé par les six lancements standalone.
+- **`MiaouMCPBase.main()`** — seul point traversé par les sept lancements standalone.
 - **`mcp_proxy.main()`**, en **tête**, avant `build_upstreams` (qui importe les modules de
   serveurs) et avant tout handshake TLS. L'ordre est contractuel : un contexte SSL déjà
   construit garde la classe d'origine et continue d'ignorer le magasin système.

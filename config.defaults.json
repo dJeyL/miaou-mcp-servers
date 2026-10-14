@@ -63,6 +63,17 @@
       "module": "mcp_docs",
       "_comment": "Extraction PDF/Office/Zip. DÉSACTIVÉ PAR DÉFAUT depuis que MIAOU ouvre ces formats lui-même (zip, PDF, Excel, Word, PowerPoint) : ce serveur n'est plus la voie normale. Il garde un usage réel — le travail HORS CONNEXION, l'ouverture native de MIAOU téléchargeant ses moteurs depuis un CDN. Retirer disabled pour le réveiller. Cache sur disque dans ./miaou-docs (sous-dossier du répertoire de travail)."
     },
+    "secret_demo": {
+      "disabled": true,
+      "type": "inprocess",
+      "module": "mcp_secret_demo",
+      "config": {
+        "login": "demo",
+        "password": { "volatile": "Mot de passe de démonstration" },
+        "expected": "miaou"
+      },
+      "_comment": "SECRET VOLATIL : un mot de passe qui n'est écrit nulle part. Dans le bloc 'config' d'un serveur inprocess (et nulle part ailleurs), une valeur remplacée par {\"volatile\": \"<clef>\"} se saisit dans MIAOU, servi par ce proxy sous /app/ ; le proxy la tient en mémoire seulement et la substitue au marqueur avant de construire le serveur, qui la teste au démarrage (un mot de passe faux est refusé, sans être retesté). La clef est libre et sert de libellé ; une seule par serveur, répétable à toute profondeur (sous-blocs d'instances). En attendant la saisie, le serveur est listé avec ses outils de la dernière fois, qui refusent tout appel. Ce serveur de démonstration attend 'miaou' ('injoignable' simule un annuaire en panne). Un fork pose le marqueur dans config.site.json, le login restant dans config.json ; un mot de passe en clair laissé dans config.json par-dessus le marqueur continue de marcher, mais est signalé au démarrage."
+    },
     "_example_http": {
       "disabled": true,
       "type": "http",

@@ -13,6 +13,7 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 | `servers/mcp_web/` | 8768 | Téléchargement d'URL (HTML→texte, text/* et JSON/XML, binaire base64) et recherche web/images multi-moteurs (Brave → Ollama → DuckDuckGo, ordre configurable), package |
 | `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API — **déprécié** (remplacé par `search` de `mcp_web`) |
 | `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) — **déprécié** (remplacé par `search`/`image_search` de `mcp_web`) |
+| `servers/mcp_secret_demo.py` | 8772 | Démonstration des secrets volatils : un mot de passe saisi dans MIAOU, testé au démarrage ([détail](#mot-de-passe-saisi-dans-miaou-secret-volatil)) |
 | `servers/mcp_docs/` | 8771 | Extraction PDF/Office/Zip, paginée, sessions par conversation — **obsolète, désactivé par défaut** ([pourquoi](#mcp_docs--obsolète-mais-conservé-pour-le-hors-connexion)) |
 | `mcp_proxy/` | configurable | Proxy qui agrège les serveurs ci-dessus, leurs outils et leurs skills (extension Skills de MCP) |
 
@@ -63,6 +64,7 @@ uv run servers/mcp_bench.py                   # HTTP 127.0.0.1:8766
 uv run servers/mcp_weather.py                 # HTTP 127.0.0.1:8767
 uv run servers/mcp_ddg.py                     # HTTP 127.0.0.1:8769
 BRAVE_API_KEY=<key> uv run servers/mcp_brave.py  # HTTP 127.0.0.1:8770
+MIAOU_SECRET_DEMO_PASSWORD=miaou uv run servers/mcp_secret_demo.py  # HTTP 127.0.0.1:8772
 
 # mcp_web et mcp_docs sont des packages (pas des scripts plats) — lancement différent :
 uv run --directory servers python -m mcp_web  # HTTP 127.0.0.1:8768
@@ -312,6 +314,30 @@ Un fichier suivi modifié localement bloque la mise à jour (les fichiers non su
 `config.json` ne gênent pas). Une mise à jour qui ne change que `miaou_dist` ne redémarre
 pas le proxy. Détail : `docs/proxy.md`.
 
+### Mot de passe saisi dans MIAOU (secret volatil)
+
+Plutôt que d'écrire un mot de passe dans `config.json`, le bloc `config` d'un serveur
+`inprocess` peut le remplacer par un marqueur, `{"volatile": "<clef>"}` :
+
+```json
+"mon_api": {
+  "type": "inprocess",
+  "module": "mcp_example_api",
+  "config": { "login": "moi", "password": { "volatile": "Mot de passe SSO" } }
+}
+```
+
+La valeur se saisit alors dans MIAOU, ouvert depuis ce proxy (`http://127.0.0.1:<port>/app/`,
+clé `miaou_dist`) : le proxy la tient **en mémoire seulement**, la substitue au marqueur et
+construit le serveur, qui la teste auprès de son service. Un mot de passe faux est refusé,
+et jamais retesté. D'ici là, le serveur est listé avec ses outils, qui refusent tout appel.
+Le proxy oublie la valeur à chaque redémarrage : c'est au client de la renvoyer. Pour
+l'essayer : l'entrée `secret_demo` de `config.defaults.json` (serveur `mcp_secret_demo`,
+qui attend `miaou`), à réactiver dans `config.json` par
+`"mcpServers": {"secret_demo": {"disabled": false}}`. Détail : `docs/proxy.md` ;
+contrat avec le client : `docs/miaou-contract.md` ; serveur qui s'en sert :
+`docs/servers.md`.
+
 ### Exiger une autorisation OAuth (clé `auth`)
 
 Absente par défaut : le proxy ne demande alors aucun jeton, exactement comme avant.
@@ -504,6 +530,8 @@ miaou-mcp-servers/
 │   ├── webapp.py         # MIAOU servi sous /app/ (clé miaou_dist)
 │   ├── selfupdate.py     # mise à jour par lui-même : état git du clone, fast-forward
 │   ├── updater.py        # extension miaou/self-update (état, application)
+│   ├── volatile.py       # secrets volatils : marqueurs {"volatile": clef} de la config
+│   ├── volatile_store.py # extension miaou/volatile-secrets (saisie, validation, oubli)
 │   └── entry.py          # CLI, main(), serve_http (SIGUSR1 ou sortie en 43 supervisé, 42 après mise à jour)
 ├── scripts/
 │   └── supervise.sh      # relance le proxy quand il sort en 42 (mise à jour) ou 43 (SIGUSR1)
@@ -516,10 +544,11 @@ miaou-mcp-servers/
 │   ├── mcp_web/          # fetch URL et recherche multi-moteurs (port 8768), package
 │   ├── mcp_ddg.py        # recherche DDG (port 8769) — déprécié
 │   ├── mcp_brave.py      # recherche Brave (port 8770) — déprécié
+│   ├── mcp_secret_demo.py # démonstration des secrets volatils (port 8772)
 │   ├── skills/           # skills des serveurs mono-fichier (bench)
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — obsolète
 ├── docs/                 # documentation par domaine, pour qui modifie le code
-│   ├── servers.md        # les six serveurs en détail (outils, contrats, env)
+│   ├── servers.md        # les serveurs en détail (outils, contrats, env)
 │   ├── proxy.md          # upstreams, config en couches, override de proxy réseau, /app/
 │   ├── auth.md           # auth OAuth entrante et sortante
 │   ├── miaou-contract.md # surface de contact avec MIAOU (transport, skills, REF_UNKNOWN)
@@ -546,6 +575,8 @@ miaou-mcp-servers/
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante
 │   ├── test_proxy_webapp.py         # MIAOU servi sous /app/ (dont un vrai uvicorn)
 │   ├── test_proxy_selfupdate.py     # mise à jour par lui-même (dépôts git jetables)
+│   ├── test_proxy_volatile.py       # secrets volatils (marqueurs, attente, extension)
+│   ├── test_secret_demo.py          # serveur de démonstration des secrets volatils
 │   ├── test_dev_auth_server.py      # serveur d'autorisation de développement
 │   └── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
 ├── config.defaults.json  # couche de base de la config (config.site.json, config.json par-dessus)
@@ -570,3 +601,9 @@ n'en émet jamais — c'est le rôle d'un serveur d'autorisation distinct.
 `mcp_docs` applique en plus des gardes propres à l'extraction d'archives (zip-slip,
 tailles, chiffrement, imbrication) et un contrat d'erreur `REF_UNKNOWN` partagé avec le
 dispatcher MIAOU — détails dans `docs/servers.md` et `docs/miaou-contract.md`.
+
+Les secrets volatils ne sont gérés que par MIAOU servi par ce proxy, sur
+`127.0.0.1`/`localhost` : l'extension refuse toute autre origine (page tierce, `file://`,
+DNS rebinding), faute de quoi n'importe quelle page ouverte dans le navigateur pourrait
+provoquer des échecs d'authentification jusqu'au verrouillage du compte. La valeur n'est
+jamais écrite, journalisée ni relue.

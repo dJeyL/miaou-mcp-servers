@@ -768,6 +768,79 @@ apparaît donc pas — et masqués comme `--print-config`, les lignes de context
 portant les secrets restés dans le fichier. Le refus sur `.bak` existante ne
 s'applique pas, rien n'étant écrit ; `--diff` seul est refusé.
 
+### Secrets volatils (`{"volatile": "<clef>"}`, `volatile.py`, lot AU)
+
+Dans le bloc `config` d'une entrée `inprocess`, une valeur peut être remplacée
+par un **marqueur** : un objet dont la seule clé est `volatile`, et dont la
+valeur est la **clef** du secret, une chaîne libre qui sert aussi de libellé
+(`"password": {"volatile": "Mot de passe SSO"}`). La valeur n'est alors écrite
+nulle part : l'utilisateur la saisit dans MIAOU, le proxy la tient en mémoire et
+la substitue au marqueur, dans une copie de la config, juste avant
+`build(config)`. Le serveur reçoit une chaîne, comme avant.
+
+- Marqueur résolu à toute profondeur, listes comprises (trois sous-blocs
+  d'instances portant la même clef), hors clés à souligné (`_comment`,
+  `_example_*`). Un objet qui porte `volatile` À CÔTÉ d'autres clés n'est pas un
+  marqueur et passe tel quel.
+- **Une clef par upstream** en v1 : plusieurs clefs différentes, ou un marqueur
+  sans clef utilisable (`{"volatile": ""}`), écartent l'upstream au démarrage
+  avec ce motif ; les autres démarrent.
+- **Ailleurs, c'est une erreur de config** (sortie 1, chemin de la clé dans le
+  message) : dans `env`, dans une entrée `stdio` ou `http`, hors de
+  `mcpServers`. Le marqueur y arriverait tel quel, un objet à la place d'une
+  chaîne, et casserait loin de sa cause. Seul le `config` d'un `inprocess` est
+  résolu.
+- `--print-config` affiche le marqueur tel quel : c'est un nom, pas une valeur.
+- **Avertissement de migration.** Un marqueur posé par une couche (typiquement
+  `config.site.json` d'un fork) et remplacé, dans la config effective, par une
+  chaîne d'une couche suivante (le mot de passe resté dans `config.json`) est
+  signalé au démarrage, une ligne `WARNING:` par chemin (jaune sur un terminal,
+  comme les avertissements d'uvicorn ; `logging._warn`). La valeur en clair
+  continue de servir : rien n'est refusé.
+
+**Upstream en attente de son secret.** Au démarrage, un upstream porteur d'une
+clef est importé mais **pas construit** (`InProcessUpstream.prepare`) :
+
+- le module doit exposer `build(config)` (seul à recevoir la config), sinon
+  l'upstream est écarté ;
+- son crochet facultatif `check_config(config)` est appelé, **marqueurs en
+  place** (une copie) : il lève (`ConfigIncomplete` de `mcp_base`, ou toute
+  exception) sur une config incomplète, sans rien contacter, et l'upstream est
+  écarté comme aujourd'hui — il n'est donc pas consommateur du secret. Un
+  module sans crochet est réputé complet ;
+- sinon l'upstream reste dans la table, non construit (`secret_pending`),
+  journalisé `pending — volatile secret « <clef> » to enter in MIAOU (N tools
+  from cache)`.
+
+Tant qu'il attend : `upstream_is_live` est faux ; ses outils sont resservis
+depuis `state/tools-cache.json` **sans notice**, à l'octet près comme le live,
+pour que la liste d'outils (et le cache KV du modèle) ne change pas à la
+saisie — d'où l'écriture du cache sans tri des clés, qui réordonnait les
+propriétés des schémas ; ses `instructions` (texte libre) aussi, mémorisées
+dans le même fichier quand il a été construit, alors que son bloc de skills
+n'apparaît qu'une fois construit (le proxy ne publie pas une skill qu'il ne
+sert pas) ; un appel est refusé en erreur JSON-RPC `data.code =
+SECRET_REQUIRED` (`UpstreamSecretRequired`), avec un message qui dit au modèle
+que seul l'utilisateur peut agir, depuis MIAOU. `data` ne porte que
+l'upstream : les noms de clefs ne se lisent que par l'extension, gardée par
+l'origine. Au tout premier démarrage d'une installation, le cache est vide :
+aucun outil, jusqu'à la première saisie acceptée. Le rapport `status` (outil du
+modèle, publié avec l'auth sortante) dit l'attente.
+
+**Saisie, validation, oubli** : extension `miaou/volatile-secrets`
+(`volatile_store.py::VolatileSecrets`, contrat dans `docs/miaou-contract.md`). Créée par
+`main()` dès qu'un upstream porte une clef ; au lifespan, après le démarrage, elle
+recense les consommateurs (`attach`) et ne s'installe que s'il en reste. `build` tourne
+dans `asyncio.to_thread` : un serveur qui s'authentifie auprès d'un annuaire gèlerait
+sinon le proxy entier, et rien ne l'interrompt (pas de délai propre, AU-f) — un
+annuaire muet retient la requête jusqu'au délai du client. L'échec se classe par nom de
+classe dans le MRO (`CredentialsRejected`, `ConfigIncomplete`, le reste indéterminé),
+pour qu'une base importée sous un autre nom de module (`servers.mcp_base`) soit
+reconnue ; son texte est masqué (`volatile.mask`) avant d'être journalisé ou rendu. Une
+instance acceptée laisse ses outils et ses `instructions` dans le cache, sauf si elle y
+cite la valeur (`cache_forbidden`, ligne `WARNING:`). Le journal dit chaque verdict,
+jamais la valeur : `Secret volatil « <clef> » : <upstream> accepted.`
+
 ### `state/` (`state.py`)
 
 Ce que le proxy écrit lui-même : `state/tokens.json` (jetons OAuth sortants — un

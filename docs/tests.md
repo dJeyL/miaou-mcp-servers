@@ -102,6 +102,18 @@ répond, puis le processus sort en 42 ; pour une mise à jour MIAOU seule, `/app
 change sans sortie. Un garde-fou envoie SIGINT au bout de 30 s, pour qu'un test cassé
 échoue au lieu de pendre. La sortie en 42 elle-même, et son ordre face au SIGUSR1, se
 testent aussi avec le double d'uvicorn de `test_proxy.py`.
+`tests/test_proxy_volatile.py` (secrets volatils, lot AU) s'appuie sur
+`tests/volatile_fixture_server.py`, upstream inprocess dont `check_config` et `build`
+notent ce qu'ils reçoivent (`CHECKS`, `BUILDS`, vidés en fixture autouse) : « aucun appel
+sortant » se prouve par un `BUILDS` inchangé. L'extension passe par l'app Starlette
+ENTIÈRE (lifespan de `build_app` compris) sur `httpx2.ASGITransport`, client MCP moderne
+au-dessus : c'est le seul moyen de poser `Host` et `Origin` comme un navigateur (le
+harnais en mémoire n'a pas de requête HTTP, et la garde le refuse). La non-fuite fait
+lever par `build` un message qui cite la config, puis cherche la valeur dans stdout,
+stderr, la réponse, `status` et tout fichier écrit sous `tmp_path`. L'identité à l'octet
+des outils rappelés du cache se compare sur le JSON émis, pour un outil dont les
+propriétés ne sont pas dans l'ordre alphabétique (sur `mcp_bench`, un cache trié passait).
+`tests/test_secret_demo.py` couvre le serveur de démonstration.
 Les tests de docs monkeypatchent `mcp_docs.session.WORKDIR` (fixture `tmp_path`) pour
 isoler le filesystem par test, exercent chaque format (fixtures PDF/xlsx/docx/pptx/zip
 générées à la volée par les libs elles-mêmes) via `formats.py` directement, et vérifient

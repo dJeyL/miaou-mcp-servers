@@ -573,6 +573,40 @@ plafonne aussi à 20 au-delà, 422). Les deux outils partagent un helper commun
 `_brave_call` (requête HTTP, chaîne d'erreurs réseau) — seul le mapping des résultats
 diffère.
 
+## `servers/mcp_secret_demo.py` — démonstration des secrets volatils (port 8772)
+
+Serveur jouet du lot AU : de quoi essayer de bout en bout, sans service réel, un mot de
+passe saisi dans MIAOU et tenu en mémoire par le proxy (`docs/proxy.md`, « Secrets
+volatils » ; contrat : `docs/miaou-contract.md`). Entrée `secret_demo` de
+`config.defaults.json`, désactivée.
+
+Il se comporte comme un serveur qui s'authentifie au démarrage, et c'est le contrat
+qu'un serveur à secret volatil doit tenir :
+
+- **`check_config(config)`**, crochet facultatif lu par le proxy : complétude seulement
+  (`login` non vide, un `password` par instance), sans rien contacter, marqueurs
+  `{"volatile": …}` encore en place (un objet, donc « présent »). Lève
+  `ConfigIncomplete` (`mcp_base`) : le proxy écarte l'upstream au démarrage, qui n'est
+  alors pas consommateur du secret. `build` l'appelle en premier.
+- **`build(config)`** reçoit la config résolue (une chaîne à la place du marqueur), et
+  **s'authentifie avant de construire** : la valeur attendue (`expected`, sinon
+  `MIAOU_SECRET_DEMO_EXPECTED`, sinon `miaou`) passe ; `injoignable` simule un annuaire
+  en panne (`ConnectionError`, verdict indéterminé : l'utilisateur n'a rien à
+  ressaisir) ; tout le reste lève `CredentialsRejected` (`mcp_base`), seul échec que
+  MIAOU présente comme une saisie ratée. Avec `instances` (liste de sous-blocs, même
+  clef), chacune est testée, et la première refusée fait tout refuser. `delay_s`
+  (borné à [0, 10] s, NaN ramené à 0) simule un annuaire lent. Synchrone, comme un vrai
+  appel bloquant : le proxy appelle `build` hors de sa boucle d'événements.
+- Jamais la valeur dans un message d'exception, une description d'outil ou les
+  `instructions` (le proxy masque quand même, et n'écrit pas dans son cache une
+  instance qui la cite).
+
+Un outil, `whoami()` : le login et le nombre d'instances, jamais le mot de passe.
+`instructions` publiées, pour voir celles d'un upstream en attente servies depuis le
+cache. Pas de singleton `mcp` : un secret volatil exige `build(config)`. En autonome, le
+mot de passe vient de `MIAOU_SECRET_DEMO_PASSWORD` (login : `MIAOU_SECRET_DEMO_LOGIN`,
+défaut `demo`).
+
 ## `servers/mcp_docs/` — extraction de documents (port 8771)
 
 > **Obsolète, désactivé par défaut.** MIAOU ouvre désormais ces cinq formats

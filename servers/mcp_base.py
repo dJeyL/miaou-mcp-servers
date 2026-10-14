@@ -51,6 +51,28 @@ MAX_REQUEST_BODY_BYTES = 96 * 1024 * 1024
 SESSION_IDLE_TIMEOUT_S: float | None = None
 
 
+class CredentialsRejected(Exception):
+    """Identifiants refusés par le service que le serveur interroge.
+
+    À lever depuis `build(config)` quand le service a RÉPONDU que le login ou
+    le mot de passe est faux (401/403 de l'annuaire, par exemple). C'est le
+    seul échec que le proxy rapporte en « refusé » à MIAOU, qui dit alors à
+    l'utilisateur qu'il a raté sa saisie ; toute autre exception vaut
+    « indéterminé » (annuaire injoignable, délai, proxy d'entreprise) et ne
+    lui fait rien ressaisir. Le message ne doit jamais citer la valeur.
+    """
+
+
+class ConfigIncomplete(ValueError):
+    """Config incomplète (login absent, par exemple), constatée sans rien
+    contacter.
+
+    À lever depuis le crochet facultatif `check_config(config)` d'un module,
+    que le proxy appelle au démarrage avec les marqueurs `{"volatile": …}`
+    encore en place, ou depuis `build(config)` avant tout appel sortant.
+    """
+
+
 def enable_system_trust_store() -> bool:
     """Fait vérifier les certificats TLS avec le magasin de confiance du système
     d'exploitation, au lieu du bundle CA figé qu'embarquent certifi/OpenSSL.
@@ -623,7 +645,7 @@ class MiaouMCPBase:
             server.py [--transport http|stdio] [--host H] [--port P]
 
         Active le magasin de confiance système ici plutôt que dans chaque
-        serveur : c'est le seul point traversé par les six lancements
+        serveur : c'est le seul point traversé par les sept lancements
         standalone. Le mode inprocess ne passe pas par là — le proxy fait le
         même appel de son côté, avant d'importer le moindre module de serveur.
         """

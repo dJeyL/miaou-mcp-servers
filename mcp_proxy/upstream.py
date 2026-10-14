@@ -7,6 +7,7 @@ serveur tiers. Tous exposent la même surface `Upstream`.
 
 from __future__ import annotations
 
+import copy
 import importlib
 import os
 import sys
@@ -193,14 +194,59 @@ class InProcessUpstream(Upstream):
         self._env = env
         self._config = config
         self._server: Any = None
+        # Secret volatil (lot AU) : la clef que porte `config`, ou None. Posées
+        # par build_upstreams() ; `volatile_error` écarte l'upstream au
+        # démarrage (plusieurs clefs, marqueur mal formé).
+        self.volatile_key: str | None = None
+        self.volatile_error: str | None = None
+        self._module: Any = None
+        self._already_imported = False
+        # Vrai si l'instance construite cite la valeur de son secret dans ses
+        # outils ou ses instructions : rien d'elle n'est écrit dans le cache.
+        self.cache_forbidden = False
 
-    async def start(self) -> None:
+    @property
+    def secret_pending(self) -> bool:
+        """Upstream à secret volatil pas encore construit : dans la table, ses
+        outils resservis depuis le cache, ses appels refusés en
+        SECRET_REQUIRED (lot AU)."""
+        return self.volatile_key is not None and self._server is None
+
+    async def prepare(self) -> None:
+        """Ce qui précède `build` : l'environnement, l'import du module, et,
+        pour un upstream à secret volatil, les contrôles qui ne demandent pas
+        la valeur. Lève pour écarter l'upstream au démarrage."""
+        if self.volatile_error:
+            raise RuntimeError(self.volatile_error)
         if self._env:
-            import os
             for key, value in self._env.items():
                 os.environ.setdefault(key, value)
-        already_imported = self._module_name in sys.modules
-        module = importlib.import_module(self._module_name)
+        self._already_imported = self._module_name in sys.modules
+        self._module = importlib.import_module(self._module_name)
+        if self.volatile_key is None:
+            return
+        if getattr(self._module, "build", None) is None:
+            raise RuntimeError(
+                f"secret volatil « {self.volatile_key} » : le module "
+                f"'{self._module_name}' n'expose pas build(config), qui seul "
+                f"reçoit la config"
+            )
+        # Crochet facultatif : la config marqueurs en place (un objet, donc
+        # « présent » pour un test de vérité). Il lève sur une config
+        # incomplète (ConfigIncomplete), sans rien contacter : l'upstream est
+        # alors écarté, et n'est pas consommateur du secret. Sans crochet, la
+        # config est réputée complète. Une copie : rien de ce qu'il ferait au
+        # dict ne doit survivre jusqu'au build.
+        check = getattr(self._module, "check_config", None)
+        if check is not None:
+            check(copy.deepcopy(self._config))
+
+    async def start(self) -> None:
+        await self.prepare()
+        if self.volatile_key is not None:
+            # En attente de son secret : construit plus tard, par build_with().
+            return
+        module = self._module
         # Un module qui expose build(config) -> MCPServer supporte le
         # multi-instance (plusieurs entrées config.json du même module, chacune
         # avec sa propre config) : importlib.import_module ne recharge un module
@@ -212,7 +258,7 @@ class InProcessUpstream(Upstream):
         if build_fn is not None:
             server = build_fn(self._config)
         else:
-            if already_imported:
+            if self._already_imported:
                 print(
                     f"Attention : module '{self._module_name}' réutilisé par plusieurs "
                     f"entrées inprocess sans build(config) — même instance MCPServer "
@@ -224,12 +270,33 @@ class InProcessUpstream(Upstream):
             raise RuntimeError(
                 f"Le module '{self._module_name}' n'expose ni 'build(config)' ni 'mcp' (MCPServer)."
             )
+        self.adopt(server)
+
+    def build_with(self, secret: str) -> Any:
+        """Construit une instance avec la config résolue (marqueurs remplacés
+        par `secret`), SANS l'adopter : synchrone, à appeler hors de la boucle
+        d'événements (`asyncio.to_thread`) — un `build` qui s'authentifie
+        auprès d'un annuaire gèlerait sinon le proxy entier. La copie résolue
+        n'est gardée nulle part ici."""
+        from .volatile import resolve
+
+        return self._module.build(resolve(self._config, secret))
+
+    def adopt(self, server: Any) -> None:
+        """Fait de `server` l'instance servie. Un appel d'outil en vol a déjà
+        lu l'ancienne : il finit dessus."""
         self._server = server
         self._warn_on_foreign_skills_extension()
         # Pas d'`initialize` sur ce chemin (on parle au MCPServer en direct,
         # sans transport) : les instructions se lisent sur l'objet, là où les
         # deux autres upstreams les reçoivent dans leur InitializeResult.
         self.instructions = server.instructions
+
+    def discard(self) -> None:
+        """Jette l'instance (geste « Oublier ») : l'upstream repasse en
+        attente. Ses `instructions` restent celles qu'on publiait, pour que le
+        message système du client ne change pas."""
+        self._server = None
 
     async def stop(self) -> None:
         pass

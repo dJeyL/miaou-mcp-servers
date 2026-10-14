@@ -242,6 +242,99 @@ message lisible, et selon le cas `data.before`, `data.target`, `data.remedy`.
 
 Tout refus laisse le proxy en marche et l'arbre dans son état d'avant (sauf le dernier).
 
+## Secrets volatils (extension `miaou/volatile-secrets`, lot AU)
+
+Un mot de passe (ou une clef) que l'utilisateur saisit dans MIAOU, que le proxy tient
+**en mémoire seulement**, et qu'il substitue au marqueur `{"volatile": "<clef>"}` du
+`config` d'un upstream `inprocess` avant son `build(config)` (config : `docs/proxy.md`,
+« Secrets volatils »). Mise en œuvre : `mcp_proxy/volatile.py` (config) et
+`volatile_store.py` (extension).
+
+**Découverte.** `extensions["miaou/volatile-secrets"] = {}` dans `server/discover`, **ère
+2026-07-28 seulement**, publiée s'il reste au moins un upstream **consommateur** après le
+démarrage (un upstream à clef dont `check_config` a passé) ; sinon ni extension, ni
+méthode (`-32601`). Trois méthodes JSON-RPC hors outils, absentes de `tools/list`.
+
+**Garde, sur les trois méthodes.** Acceptées seulement si l'en-tête `Host` vaut
+`127.0.0.1:<port>` ou `localhost:<port>` (port d'écoute du proxy) **et** si `Origin`
+vaut `http://<Host>` : MIAOU servi par ce proxy sous `/app/`, avec une carte qui vise la
+même adresse. Tout le reste — `Origin: null` de `file://`, autre origine, autre nom que
+celui de la page, DNS rebinding, `Origin` absent — est refusé en
+`SECRET_ORIGIN_REFUSED`, dont le message donne l'adresse de `/app/` à ouvrir.
+
+**Entrée d'une clef**, rendue par les trois méthodes :
+
+```json
+{ "key": "Mot de passe SSO", "held": true,
+  "consumers": [ { "upstream": "api_prod", "state": "ready", "verdict": "accepted", "detail": null },
+                 { "upstream": "logs", "state": "pending", "verdict": "untested", "detail": "non testé : …" } ] }
+```
+
+| Champ | Valeur |
+|---|---|
+| `key` | la clef, telle que la config la déclare (libellé à afficher) |
+| `held` | au moins un consommateur est construit avec une valeur acceptée |
+| `consumers[]` | upstreams qui attendent cette clef, dans l'ordre de la config (celui du test) |
+| `state` | `pending` (non construit, ses appels refusés en `SECRET_REQUIRED`) ou `ready` |
+| `verdict` | issue de la dernière saisie : `null` (aucune, ou après « Oublier »), `accepted`, `rejected` (identifiants refusés par le service), `indeterminate` (toute autre panne : annuaire injoignable, délai…), `incomplete` (config incomplète, rien contacté), `untested` (un consommateur précédent a refusé) |
+| `detail` | cause lisible d'un verdict autre qu'`accepted`, valeur masquée (`***`), ou `null` |
+
+Après un `rejected` sur un consommateur déjà `ready` (remplacement à chaud), il reste
+`ready` : son instance précédente sert toujours.
+
+**`miaou/secrets/status`** `{}` → `{ status: { instance, secrets: [entrée…] } }`.
+`instance` : identifiant tiré au démarrage du proxy (16 hexadécimaux) ; un autre que le
+dernier lu veut dire que le proxy a redémarré, donc oublié toutes les valeurs.
+
+**`miaou/secrets/submit`** `{ key, value }` → `{ secret: entrée }`. Validation =
+construction réussie, **séquentielle** dans l'ordre des consommateurs, **arrêtée au
+premier refus** (une saisie fausse coûte un échec à l'annuaire, pas un par
+consommateur) ; `indeterminate` et `incomplete` n'arrêtent pas. Gardes contre le
+verrouillage de compte : une valeur **refusée** n'est jamais retestée tant que le proxy
+tourne (verdict `rejected`, `detail` le dit) ; une valeur **identique** à celle qu'un
+consommateur a acceptée ne le reconstruit pas (aucun appel sortant) — c'est ce qui rend
+sans danger le renvoi simultané par plusieurs onglets (les dépôts d'une même clef sont
+sérialisés). Un consommateur `ready` qui refuse la nouvelle valeur garde son instance.
+Un appel d'outil en vol finit sur l'instance qui l'a reçu. Après chaque changement
+d'instance, le proxy republie ses `instructions` et ses skills (visibles à la
+prochaine connexion) : MIAOU doit reconnecter le serveur après une acceptation, faute
+de `notifications/tools/list_changed`.
+
+**`miaou/secrets/forget`** `{ key }` → `{ secret: entrée }`. Jette les instances
+construites (le serveur garde ses identifiants dans son objet) et remet les
+consommateurs en attente. Les valeurs refusées restent mémorisées comme telles.
+
+Refus d'une requête (erreur JSON-RPC, `error.data.code` à tester par égalité, message
+qui ne cite jamais la valeur) :
+
+| `data.code` | `error.code` | Cas |
+|---|---|---|
+| `SECRET_ORIGIN_REFUSED` | `-32600` | garde `Host`/`Origin` |
+| `SECRET_INVALID_PARAMS` | `-32602` | `key` absente ou vide ; `value` absente, vide, non textuelle ou de plus de 4096 caractères |
+| `SECRET_UNKNOWN_KEY` | `-32602` | aucun consommateur n'attend cette clef |
+
+**`tools/call` d'un upstream en attente** : erreur JSON-RPC `-32600`, `data = { code:
+"SECRET_REQUIRED", upstream }` (sans la clef : un appel d'outil n'est pas gardé par
+l'origine), message adressé au modèle (seul l'utilisateur peut agir, depuis MIAOU ; le
+même appel fonctionnera après la saisie). Un appel arrivé pendant la validation est
+refusé : vrai à l'instant de l'appel. Les outils d'un upstream en attente sont listés
+**sans notice**, à l'octet près comme une fois construit (cache disque), ses
+`instructions` aussi ; au tout premier démarrage d'une installation (cache vide), ils
+n'apparaissent qu'après la première saisie acceptée. Aucun `_meta` de `tools/list` ne
+signale l'attente : l'état se lit par l'extension.
+
+**La valeur** n'est jamais écrite sur disque, journalisée, ni rendue par une méthode,
+pas même masquée. Le proxy ne garde que des empreintes (HMAC, sel propre au processus),
+et l'instance construite par le serveur la détient. Elle est perdue à tout redémarrage
+du proxy (SIGUSR1, mise à jour, sortie en 43) : `instance` change, les consommateurs
+repassent `pending`, et c'est au client de renvoyer une valeur qu'il détient comme
+acceptée.
+
+**Hors périmètre** : upstreams `stdio` et `http` ; proxy chaîné (un proxy qui agrège un
+proxy porteur de secrets ne relaie pas l'extension) ; mot de passe qui expire en cours
+de vie (le serveur rend alors une erreur d'outil ordinaire, l'utilisateur passe par
+« Oublier »).
+
 ## Contrat partagé `mcp_docs` ↔ MIAOU (dispatcher, lot A/D6)
 
 Contrat entre le dispatcher client MIAOU et `mcp_docs` (et tout futur outil inflatable) —

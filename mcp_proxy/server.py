@@ -21,6 +21,7 @@ from mcp_base import SKILLS_EXTENSION_ID
 
 from .contract import (
     AUTHORIZATION_REQUIRED,
+    SECRET_REQUIRED,
     AuthorizationRequired,
     authorize_path,
 )
@@ -74,8 +75,24 @@ class ToolCatalogCache:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def _write(self, data: dict[str, Any]) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            # Sans `sort_keys` : l'ordre des clés d'un schéma est celui que
+            # l'upstream publie (ordre de la signature), et un outil rappelé
+            # doit sortir à l'OCTET près comme le live — un upstream à secret
+            # volatil est resservi d'ici sans notice, pour que le cache KV du
+            # modèle ne bouge pas à la saisie (lot AU). Trié, `url` et
+            # `max_bytes` s'inversaient.
+            self._path.write_text(json.dumps(data, indent=2))
+        except OSError as e:
+            # Un cache non écrit dégrade, il ne casse pas : le proxy sert
+            # toujours l'upstream, il l'oubliera seulement au redémarrage.
+            _log(f"Cache d'outils non écrit ({e}).")
+
     def remember(self, upstream_name: str, tools: list[types.Tool]) -> None:
         data = self._read()
+        previous = data.get(upstream_name)
         data[upstream_name] = {
             "known_at": time.time(),
             # `_meta` mémorisé avec le reste : un upstream non autorisé
@@ -91,13 +108,29 @@ class ToolCatalogCache:
                 for t in tools
             ],
         }
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(data, indent=2, sort_keys=True))
-        except OSError as e:
-            # Un cache non écrit dégrade, il ne casse pas : le proxy sert
-            # toujours l'upstream, il l'oubliera seulement au redémarrage.
-            _log(f"Cache d'outils non écrit ({e}).")
+        if isinstance(previous, dict) and isinstance(previous.get("instructions"), str):
+            data[upstream_name]["instructions"] = previous["instructions"]
+        self._write(data)
+
+    def remember_instructions(self, upstream_name: str, instructions: str | None) -> None:
+        """Consigne de portée serveur d'un upstream à secret volatil, gardée
+        pour être publiée pendant qu'il attend (lot AU, Q1) : non construit, il
+        n'en a pas, et sa section apparaîtrait à chaque saisie — le message
+        système du client changerait à chaque redémarrage du proxy."""
+        data = self._read()
+        entry = data.get(upstream_name)
+        entry = dict(entry) if isinstance(entry, dict) else {"known_at": time.time(), "tools": []}
+        if instructions:
+            entry["instructions"] = instructions
+        else:
+            entry.pop("instructions", None)
+        data[upstream_name] = entry
+        self._write(data)
+
+    def recall_instructions(self, upstream_name: str) -> str | None:
+        entry = self._read().get(upstream_name)
+        text = entry.get("instructions") if isinstance(entry, dict) else None
+        return text if isinstance(text, str) and text else None
 
     def recall(self, upstream_name: str) -> tuple[list[types.Tool], float | None]:
         entry = self._read().get(upstream_name)
@@ -205,6 +238,31 @@ class UpstreamNotAuthorized(MCPError):
         )
         self.upstream_name = upstream_name
         self.authorization_path = authorize_path(upstream_name)
+
+
+class UpstreamSecretRequired(MCPError):
+    """Appel d'un outil dont l'upstream attend son secret volatil (lot AU).
+
+    Même forme qu'`UpstreamNotAuthorized` : erreur JSON-RPC, `data.code`
+    testé par égalité. `data` ne porte que l'upstream, pas la clef : un appel
+    d'outil n'est pas gardé par l'origine, et les noms des clefs ne se lisent
+    que par l'extension `miaou/volatile-secrets`, qui l'est."""
+
+    def __init__(self, upstream_name: str) -> None:
+        # Lu par un modèle : il dit qui peut agir (l'utilisateur), où (dans
+        # MIAOU), et que l'échec n'est pas définitif.
+        message = (
+            f"Le serveur '{upstream_name}' attend un mot de passe (ou une clef) "
+            f"que seul l'utilisateur peut saisir, dans MIAOU (carte de ce "
+            f"serveur MCP). Ses outils refusent tout appel en attendant ; une "
+            f"fois la saisie acceptée, le même appel fonctionnera."
+        )
+        super().__init__(
+            INVALID_REQUEST,
+            message,
+            data={"code": SECRET_REQUIRED, "upstream": upstream_name},
+        )
+        self.upstream_name = upstream_name
 
 
 def _error_result(text: str) -> types.CallToolResult:
@@ -340,6 +398,13 @@ def build_status_report(
     lines: list[str] = []
     for name, upstream in sorted(upstreams.items()):
         kind = type(upstream).__name__.replace("Upstream", "").lower()
+        if _secret_pending(upstream):
+            lines.append(
+                f"- {name} ({kind}) : EN ATTENTE d'un mot de passe que seul "
+                f"l'utilisateur peut saisir, dans MIAOU. Ses outils refusent à "
+                f"l'appel avec {SECRET_REQUIRED}."
+            )
+            continue
         authorizer = authorizers.get(name)
         if authorizer is not None and not upstream_is_live(upstream, authorizer):
             lines.append(
@@ -386,6 +451,12 @@ def build_status_report(
     return "Serveurs agrégés par ce proxy :\n" + "\n".join(lines)
 
 
+def _secret_pending(upstream: Any) -> bool:
+    """Upstream en attente de son secret volatil (lot AU). `is True` : un
+    double de test (MagicMock) répond à tout attribut par un objet vrai."""
+    return getattr(upstream, "secret_pending", False) is True
+
+
 def upstream_is_live(upstream: Upstream, authorizer: Any = None) -> bool:
     """« Cet upstream honorerait-il un appel d'outil maintenant ? »
 
@@ -405,6 +476,8 @@ def upstream_is_live(upstream: Upstream, authorizer: Any = None) -> bool:
     L'`authorizer` est facultatif : les appelants qui n'en ont pas (un upstream
     sans OAuth, un test) obtiennent le comportement d'avant, à l'octet près.
     """
+    if _secret_pending(upstream):
+        return False
     if authorizer is not None and getattr(authorizer, "authorization_pending", False):
         return False
     if isinstance(upstream, HttpUpstream):
@@ -587,8 +660,16 @@ def build_proxy_server(
                 except Exception as e:
                     _log(f"Outils de '{prefix}' non listés ({_describe_failure(e)}).")
                     continue
-                if catalog is not None:
+                if catalog is not None and getattr(upstream, "cache_forbidden", False) is not True:
                     catalog.remember(prefix, upstream_tools)
+                stale_since = None
+            elif catalog is not None and _secret_pending(upstream):
+                # En attente de son secret (lot AU) : resservi depuis le cache
+                # SANS notice, à l'octet près comme le live, pour que la liste
+                # ne change pas à la saisie (cache KV du modèle). Le modèle
+                # apprend l'attente à l'appel, par SECRET_REQUIRED. Au tout
+                # premier démarrage, le cache est vide : aucun outil.
+                upstream_tools, stale_since = catalog.recall(prefix)
                 stale_since = None
             elif catalog is not None and prefix in authorizers:
                 # Non autorisé : tools/list répondrait 401 avant de rien dire.
@@ -606,7 +687,7 @@ def build_proxy_server(
                 prefixed = f"{prefix}__{tool.name}"
                 tool_map[prefixed] = (prefix, tool.name)
                 description = tool.description
-                if not live:
+                if not live and not _secret_pending(upstream):
                     description = format_stale_description(description, stale_since)
                 meta = relay_tool_meta(prefix, tool.meta)
                 tools.append(
@@ -687,6 +768,8 @@ def build_proxy_server(
 
         upstream = upstreams[upstream_name]
         if not upstream_is_live(upstream, authorizers.get(upstream_name)):
+            if _secret_pending(upstream):
+                raise UpstreamSecretRequired(upstream_name)
             if upstream_name not in authorizers:
                 # Sans parcours d'autorisation, un upstream non vivant est
                 # injoignable : le refuser en AUTHORIZATION_REQUIRED enverrait

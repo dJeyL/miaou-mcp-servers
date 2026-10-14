@@ -4,10 +4,10 @@ Instructions pour travailler dans ce dépôt.
 
 ## Ce qu'est le projet
 
-Six serveurs MCP de développement (bench, weather, web, ddg, brave, docs) et un serveur
-proxy qui les agrège, extraits du dépôt [MIAOU](https://github.com/dJeyL/miaou), un client de
-chat web pour API OpenAI-compatible (single-file HTML). Ils servent à tester l'agrégation
-MCP de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
+Six serveurs MCP de développement (bench, weather, web, ddg, brave, docs), un serveur de
+démonstration des secrets volatils (secret_demo) et un serveur proxy qui les agrège,
+extraits du dépôt [MIAOU](https://github.com/dJeyL/miaou), un client de chat web pour API
+OpenAI-compatible (single-file HTML). Ils servent à tester l'agrégation MCP de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 
 Ils n'ont pas de rôle en production — ce sont des outils de banc d'essai, destinés à
 tourner localement pendant le développement de MIAOU.
@@ -26,6 +26,8 @@ miaou-mcp-servers/
 │   ├── config.py         # load_config, build_upstreams
 │   ├── layers.py         # chaîne config.defaults → config.site → config.json, Merge Patch, ${VAR}, --migrate-config
 │   ├── state.py          # state/ : tokens.json, tools-cache.json, déplacement des anciens <config>-*.json
+│   ├── volatile.py       # secrets volatils (lot AU) : marqueurs {"volatile": clef} du config inprocess, résolution, masquage
+│   ├── volatile_store.py # extension miaou/volatile-secrets : garde Host/Origin, status/submit/forget, validation séquentielle, empreintes
 │   ├── server.py         # build_proxy_server, catalogue, instructions, relais du `_meta` d'outil
 │   ├── skills.py         # extension Skills agrégée : URI préfixées, bloc des instructions, repli read_skill
 │   ├── auth_in.py        # Resource Server OAuth (AB-1)
@@ -50,6 +52,7 @@ miaou-mcp-servers/
 │   ├── mcp_web/          # téléchargement d'URL et recherche multi-moteurs (port 8768), package — `_meta` client sur fetch_url, `search/` = un module par moteur
 │   ├── mcp_ddg.py        # recherche DuckDuckGo HTML (port 8769) — DÉPRÉCIÉ, désactivé par défaut
 │   ├── mcp_brave.py      # recherche Brave Search API (port 8770) — DÉPRÉCIÉ, désactivé par défaut
+│   ├── mcp_secret_demo.py # démonstration des secrets volatils (port 8772), lot AU — désactivé par défaut
 │   ├── skills/           # skills des serveurs mono-fichier : skills/<serveur>/<skill>/SKILL.md
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — OBSOLÈTE, désactivé par défaut
 ├── docs/                 # domaines détaillés, lus à la demande (voir index en fin de fichier)
@@ -62,6 +65,7 @@ miaou-mcp-servers/
 │   ├── era_fixture_server.py  # upstream 2.x de test (stdio en subprocess, app http via build()) (non collecté)
 │   ├── fabricated_skills_server.py  # upstream 2.x de test aux entrées de skills fabriquées (non collecté)
 │   ├── legacy_stdio_fixture.py  # faux upstream stdio qui ne parle que `initialize` (non collecté)
+│   ├── volatile_fixture_server.py  # upstream inprocess à secret volatil : check_config, build qui accepte/refuse (non collecté)
 │   ├── test_base.py
 │   ├── test_bench.py
 │   ├── test_weather.py
@@ -71,9 +75,11 @@ miaou-mcp-servers/
 │   ├── test_web_search.py  # search/image_search : chaîne de repli, pauses, budget, config
 │   ├── test_ddg.py
 │   ├── test_brave.py
+│   ├── test_secret_demo.py
 │   ├── test_docs.py
 │   ├── test_proxy.py
 │   ├── test_proxy_layers.py  # config en couches (vecteurs RFC 7386, allègement), state/
+│   ├── test_proxy_volatile.py  # secrets volatils (lot AU) : marqueurs, couches, refus au démarrage, attente
 │   ├── test_skills.py    # extension Skills de mcp_base (vecteurs d'empreinte de la spec)
 │   ├── test_proxy_skills.py  # skills servies par le proxy : URI, `_meta`, bloc, repli
 │   ├── test_proxy_era.py  # ère négociée avec les upstreams stdio/http (vrais handshakes)
@@ -98,8 +104,8 @@ miaou-mcp-servers/
 
 ## Les serveurs en un coup d'œil
 
-Six serveurs de banc d'essai plus un proxy qui les agrège. Le détail de chacun
-(outils, contrats, variables d'environnement, décisions) est dans
+Six serveurs de banc d'essai, un serveur de démonstration, et un proxy qui les agrège.
+Le détail de chacun (outils, contrats, variables d'environnement, décisions) est dans
 **`docs/servers.md`** — à lire quand on touche au serveur concerné, pas avant.
 
 | Serveur | Port | Rôle | Outils |
@@ -109,6 +115,7 @@ Six serveurs de banc d'essai plus un proxy qui les agrège. Le détail de chacun
 | `mcp_web/` | 8768 | Téléchargement d'URL, cache disque par checksum, pagination ; recherche multi-moteurs (Brave → Ollama → DDG, ordre en config) | `fetch_url`, `fetch_read`, `fetch_list`, `fetch_resource`, `search`, `image_search` (si un moteur sait chercher des images) |
 | `mcp_ddg.py` | 8769 | Recherche DuckDuckGo (HTML scrapé) — **déprécié** | `ddg_search` |
 | `mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) — **déprécié** | `brave_search`, `brave_image_search` |
+| `mcp_secret_demo.py` | 8772 | Démonstration des secrets volatils : `check_config`, `build` qui teste le mot de passe et lève `CredentialsRejected` | `whoami` |
 | `mcp_docs/` | 8771 | Extraction PDF/Office/Zip — **obsolète, désactivé par défaut** | `list`, `read`, `search`, `extract`, `drop_session` |
 | `mcp_proxy/` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) et les skills ; sert MIAOU sous `/app/` si `miaou_dist` est posée | (+ `status` si auth sortante, `read_skill` si une skill est servie) |
 
@@ -143,6 +150,7 @@ uv run servers/mcp_bench.py --host 0.0.0.0           # toutes interfaces
 uv run servers/mcp_weather.py                        # HTTP 127.0.0.1:8767
 uv run servers/mcp_ddg.py                            # HTTP 127.0.0.1:8769
 BRAVE_API_KEY=<key> uv run servers/mcp_brave.py      # HTTP 127.0.0.1:8770 (déprécié, comme mcp_ddg)
+MIAOU_SECRET_DEMO_PASSWORD=miaou uv run servers/mcp_secret_demo.py  # HTTP 127.0.0.1:8772
 
 # mcp_web et mcp_docs sont des packages (pas des scripts plats) — lancement différent :
 uv run --directory servers python -m mcp_web         # HTTP 127.0.0.1:8768
@@ -264,6 +272,12 @@ auprès de serveurs tiers (campagne AB) — **désactivé par défaut** dans les
 sans clé `auth` dans `config.json`, le comportement est celui d'avant le lot, à
 l'octet près. Détail : `docs/auth.md`.
 
+Les secrets volatils (lot AU) sont la seule surface gardée par l'origine : l'extension
+`miaou/volatile-secrets` ne répond qu'à `Host` `127.0.0.1`/`localhost` au port du proxy
+ET `Origin` de même origine (MIAOU servi sous `/app/`). La valeur n'est jamais écrite,
+journalisée ni relue ; tout texte d'échec d'un `build` passe par `volatile.mask`.
+Détail : `docs/miaou-contract.md`.
+
 ## Ajouter un outil
 
 Décorer une fonction avec `@self.mcp.tool()` dans le `__init__` du serveur concerné.
@@ -356,7 +370,7 @@ cite (constante renommée, contrat déplacé, outil ajouté), la relire et la co
 dans le même lot. Sans ce déclencheur, une ligne d'index reste fausse pendant des
 lots — piège déjà payé côté MIAOU.
 
-- **`docs/servers.md`** — les six serveurs en détail : outils exposés, contrats,
+- **`docs/servers.md`** — les serveurs en détail : outils exposés, contrats,
   variables d'environnement, décisions de conception. Skills d'un serveur
   (`skills_dir` et où le poser, validation au démarrage, ensemble de fichiers figé
   mais contenu relu, `SkillFileResource` et les octets intacts, `requires_skill`,
@@ -387,7 +401,10 @@ lots — piège déjà payé côté MIAOU.
   de plus de 2 h mesuré, espacement `_MIN_INTERVAL_S`/`_MAX_WAIT_S` borné par
   les 30 s de timeout MIAOU, sans effet entre instances), `mcp_brave` — déprécié — (`resolve_api_key`, refus d'init sans clef), `mcp_docs` (obsolète mais
   conservé pour le hors-connexion : sessions, pagination, `search`, `extract` hors
-  `READ_CAP`, sécurité archives, locales des headings docx).
+  `READ_CAP`, sécurité archives, locales des headings docx), `mcp_secret_demo` (lot AU :
+  contrat d'un serveur à secret volatil — `check_config` sans appel sortant et
+  `ConfigIncomplete`, `build` qui s'authentifie et lève `CredentialsRejected`, toute autre
+  panne indéterminée, `instances` testées toutes, `delay_s`, valeur jamais citée).
 - **`docs/proxy.md`** — `mcp_proxy/` hors auth : les trois types d'upstream
   (inprocess/stdio/http), `build_upstreams`/`build_proxy_server`/`build_app` et le
   wrapper ASGI qui évite le 307 sur `/mcp`, le redémarrage sur place au SIGUSR1
@@ -410,7 +427,9 @@ lots — piège déjà payé côté MIAOU.
   substitué APRÈS la fusion et hors clés `_*`, `miaou_dist` résolu contre la couche
   qui le déclare, `--print-config` masqué, `--migrate-config` (et `--diff`, aperçu masqué sans écriture) et son contrat de config
   effective inchangée, `_comment` retirés, absences listées et jamais neutralisées
-  d'office, `.bak` jamais écrasée) et `state/` (`state.py`, `state/<nom>/` pour une
+  d'office, `.bak` jamais écrasée), secrets volatils (marqueur `{"volatile": clef}`
+  dans le `config` d'un inprocess seulement, une clef par upstream, erreur de config
+  ailleurs, `WARNING:` jaune quand une couche suivante le remplace en clair) et `state/` (`state.py`, `state/<nom>/` pour une
   autre config, anciens fichiers déplacés sans réécriture), le pattern
   `build(config)` pour plusieurs instances d'un même module, ce que `call_tool`
   relaie d'un upstream stdio/http (`relay_call_result` : `content`, `isError`,
@@ -517,7 +536,12 @@ lots — piège déjà payé côté MIAOU.
   relayées telles quelles, `resources/read` et `Mcp-Name`, `miaou/requiresSkill`,
   bloc des instructions, repli `read_skill` à masquer par sa marque, préfixe double
   d'un proxy chaîné et la collision d'approbations qu'il rend possible, et le réflexe
-  `miaou__skills__read` mesuré avec MIAOU actuel), MIAOU servi sous `/app/` (portée,
+  `miaou__skills__read` mesuré avec MIAOU actuel), l'extension `miaou/volatile-secrets`
+  (lot AU : garde `Host` loopback au port ET `Origin` de même origine, `status` et son
+  `instance`, entrée par clef — `held`, `state`, `verdict` —, `submit` séquentiel arrêté
+  au premier refus, valeur refusée jamais retestée, valeur acceptée = no-op, `forget`,
+  refus `SECRET_*`, `SECRET_REQUIRED` à l'appel, outils et `instructions` d'un upstream en
+  attente servis du cache sans notice), MIAOU servi sous `/app/` (portée,
   `manifest.webmanifest` seul nom figé, icônes lues dans le manifeste, `no-cache`,
   types fixés), l'extension `miaou/self-update` (lot AT : ère moderne seulement,
   `miaou/update/status` et la forme de son état — `state`, `target` à renvoyer,

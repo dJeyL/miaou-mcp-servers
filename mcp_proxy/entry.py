@@ -38,12 +38,13 @@ from .layers import (
     needs_slimming,
     resolve_chain,
 )
-from .logging import _log
+from .logging import _log, _warn
 from .netproxy import apply_proxy_env_overrides_to_process, compute_proxy_env_overrides
 from .server import InFlight, ToolCatalogCache, build_proxy_server
 from .state import default_tools_cache_path, migrate_legacy_state, state_dir, tools_cache_beside
 from .updater import SUPERVISED_ENV, SelfUpdater, UpdateConfig, is_supervised, resolve_self_update
 from . import selfupdate
+from .volatile_store import VolatileSecrets
 from .webapp import APP_PREFIX, miaou_dist_warnings, resolve_miaou_dist
 
 #: Redémarrage sur place : un hook post-commit local l'envoie à l'instance du
@@ -475,6 +476,12 @@ def main() -> None:
     _log(f"Config : {' + '.join(str(p) for p in layer_paths)}")
     for name, where in loaded.unset_vars:
         _log(f"  attention : ${{{name}}} non définie (clé {where}) — remplacée par \"\".")
+    for where, key, layer in loaded.plain_over_volatile:
+        _warn(
+            f"{where} : {layer} y déclare le secret volatil « {key} », mais une couche "
+            f"suivante le remplace par une valeur écrite dans la config. Retirer cette "
+            f"valeur : le secret se saisit alors dans MIAOU, et n'est plus écrit nulle part."
+        )
     if needs_slimming(layer_paths, local_path):
         _log(
             f"  {local_path} répète des valeurs des couches précédentes : "
@@ -512,7 +519,11 @@ def main() -> None:
         print(f"Erreur : {e}", file=sys.stderr)
         sys.exit(1)
 
-    upstreams = build_upstreams(cfg, proxy_env_overrides=proxy_overrides)
+    try:
+        upstreams = build_upstreams(cfg, proxy_env_overrides=proxy_overrides)
+    except ValueError as e:
+        print(f"Erreur : {e}", file=sys.stderr)
+        sys.exit(1)
 
     tokens_path = args.tokens_file or _default_tokens_path(local_path)
     try:
@@ -551,9 +562,12 @@ def main() -> None:
             in_flight,
             request_restart=exit_request,
         )
+    secrets = None
+    if any(getattr(u, "volatile_key", None) for u in upstreams.values()):
+        secrets = VolatileSecrets(upstreams, catalog, port=port)
     app = build_app(
         mcp_server, upstreams, auth=auth, authorizers=authorizers, miaou_dist=miaou_dist,
-        updater=updater,
+        updater=updater, catalog=catalog, secrets=secrets,
     )
 
     if auth is not None:
