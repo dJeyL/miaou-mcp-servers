@@ -51,8 +51,9 @@ héritage implicite. Sans l'un ou l'autre, comportement inchangé.
 Trois chemins d'application distincts selon le type d'upstream :
 
 - **inprocess** : partage le process du proxy, donc `main()` pose/efface directement les
-  4 clés dans `os.environ` du process (`apply_proxy_env_overrides_to_process`) avant
-  `build_upstreams` — `make_opener()` (`servers/mcp_base.py`) relit `os.environ` à chaque
+  4 clés dans `os.environ` du process (`apply_proxy_env_overrides_to_process`) avant le
+  premier `prepare` d'upstream, au lifespan (`build_upstreams` n'importe rien, et la
+  validation d'une config modifiée le rejoue sans toucher à `os.environ`) — `make_opener()` (`servers/mcp_base.py`) relit `os.environ` à chaque
   requête via `ProxyHandler()`, aucun changement requis dans `InProcessUpstream`.
 - **stdio** : le SDK MCP (`mcp.client.stdio.get_default_environment`) n'hérite qu'une
   whitelist restreinte (`HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER`) — les variables
@@ -123,10 +124,16 @@ mcp_proxy/ (paquet, à la racine du projet)
 ├── selfupdate.py  état git du clone et fast-forward (lot AT), synchrone : probe(),
 │                  apply_update(), run_git() borné et jamais interactif
 ├── updater.py     extension miaou/self-update : SelfUpdater, sonde de 5 min,
-│                  miaou/update/status et miaou/update/apply
+│                  miaou/update/status et miaou/update/apply ; restartable()
+├── lifecycle.py   extension miaou/lifecycle (lot AV) : ProcessIdentity, Lifecycle,
+│                  miaou/lifecycle/status et miaou/lifecycle/restart
+├── configwatch.py lot AV : prepare_config(), la séquence de main() rejouée pour
+│                  valider une config modifiée ; fingerprint(), changed_paths(),
+│                  probe_bind(), ConfigWatch.check()
 └── entry.py       main() — CLI ; serve_http() : uvicorn + redémarrage sur SIGUSR1
                    (exec, ou sortie en 43 sous superviseur)
-                   + sortie en 42 après une mise à jour (ExitRequest) ;
+                   + sortie demandée depuis l'app (ExitRequest) : 42 après une
+                   mise à jour, 43 sur miaou/lifecycle/restart ;
                    et run_with_dev_auth() : --with-dev-auth, proxy ET AS de
                    développement dans ce process, sur DEUX ports
 ```
@@ -220,7 +227,9 @@ au-delà du timeout ; repli sur le seul `kill` quand l'outil manque. Le proxy r�
 sinon. Sonde au démarrage, en arrière-plan (état `checking` en attendant), puis toutes
 les 5 min, dans le task group du lifespan ; une seule sonde à la fois. `apply` passe par
 `asyncio.to_thread` et refuse, dans l'ordre : sans superviseur, cible mal formée,
-application déjà en cours (verrou), appels d'outils en vol (`InFlight`, compté autour de
+application déjà en cours (verrou), sortie déjà demandée (`UPDATE_RESTARTING` : un
+redémarrage de `miaou/lifecycle`, ou une mise à jour précédente dont l'arrêt est en
+cours), appels d'outils en vol (`InFlight`, compté autour de
 `handle_call_tool`, tous clients confondus ; revérifié dans le thread juste avant le
 merge, genre connu), puis tout refus de l'étape git. Une mise à jour qui ne touche que
 `miaou_dist` (genre `miaou`) ne redémarre rien et ignore les appels en vol : `/app/` relit
@@ -237,7 +246,7 @@ relance jamais lui-même.
 
 **`scripts/supervise.sh`** (bash : macOS, Linux, Git Bash). Pose
 `MIAOU_PROXY_SUPERVISED=1` et `MIAOU_PROXY_RESTART_BY_EXIT=1`, relance tant que la
-commande sort en 42 (mise à jour) ou 43 (SIGUSR1), rend tout autre code tel quel (0 au
+commande sort en 42 (mise à jour) ou 43 (SIGUSR1, `miaou/lifecycle/restart`), rend tout autre code tel quel (0 au
 Ctrl-C). Exécuté, il relance la commande donnée (`uv run --directory
 <clone> mcp_proxy` sans argument) ; sourcé, `miaou_supervise <fonction> [args…]` rappelle
 la fonction à chaque tour, ce qui refait la détection du proxy réseau d'un fork à chaque
@@ -329,6 +338,67 @@ certains clients MCP ne suivent pas les redirections sur POST/DELETE. Le wrapper
 `scope["path"]` de `/mcp` vers `/mcp/` avant le routeur pour servir la requête directement,
 sans redirection.
 
+
+### Redémarrage à la demande (extension `miaou/lifecycle`, lot AV)
+
+Le proxy dit si sa config a changé depuis son démarrage, et se redémarre à la demande
+d'un client (MIAOU), sous superviseur. Contrat sur le fil (méthodes, forme de l'état,
+refus) : `docs/miaou-contract.md`. **Publiée toujours**, sans clef de config ; aucune
+garde d'origine.
+
+**Empreinte** (`configwatch.py`). `LoadedConfig.merged` est la fusion des couches AVANT
+`interpolate_env` : c'est elle qu'on empreinte (sans `_comment*`, JSON canonique,
+SHA-256), parce qu'`os.environ` bouge après le chargement (`--proxy`, `env` d'un
+inprocess) et qu'une empreinte prise après la substitution changerait toute seule. La
+référence est le dict que `main()` a chargé, passé à `ConfigWatch` — jamais une relecture
+ultérieure, qui ferait d'une édition faite pendant le démarrage l'état initial. À chaque
+`status`, la chaîne est **re-résolue** avec les mêmes arguments (`--config` tel quel,
+chaîne par défaut relative au dossier courant) et relue dans un thread ; rien n'y lève,
+`OSError` et `ValueError` deviennent `invalid` avec leur message.
+
+**Validation partagée.** `prepare_config(loaded, options)` est la suite de `main()` après
+la lecture des couches : hôte et port, `miaou_dist`, `self_update`, `--with-dev-auth`,
+auth entrante, `build_upstreams`, `build_upstream_authorizers`. `main()` l'appelle ; la
+validation la rejoue, avec les mêmes `LaunchOptions` (surcharges de la ligne de commande),
+et substitue les `${VAR}` contre l'environnement du démarrage, recopié en tête de
+`main()` avant toute modification — celui que retrouvera le processus relancé. Toute
+erreur de config y est une `ValueError` dont le message est celui que `main()` affiche :
+`tests/test_proxy_configwatch.py` tient l'inventaire, un cas par sortie en 1. Elle ne fait
+que construire : ni `prepare` d'upstream (import, `env`), ni
+`apply_proxy_env_overrides_to_process`, ni écriture (les autorisations sortantes ne
+touchent au fichier de jetons qu'au premier parcours) ; son journal est coupé par
+`logging.muted()`, variable de contexte que `to_thread` recopie. Elle n'a lieu que si
+l'empreinte diffère de la référence, une fois par empreinte. Une nouvelle option de
+ligne de commande qui pèse sur la config va dans `LaunchOptions`, sinon la validation
+divergera du démarrage.
+
+**`bind` d'essai** (`probe_bind`), seulement si l'hôte ou le port EFFECTIFS changent
+(une surcharge `--port` rend sans effet un changement de `port`) : par
+`loop.create_server`, comme `uvicorn.Server.startup`, donc avec les mêmes options de
+socket par construction — `SO_REUSEADDR` sous POSIX, pas sous Windows, où il
+permettrait de prendre un port déjà occupé. Mis en cache par empreinte pour `status`,
+refait à chaque `restart`. Course assumée : un port libre à l'essai peut être pris avant
+la relance.
+
+**Redémarrage** (`lifecycle.py`). `restart` exige `restartable()` (`updater.py`), la
+condition même du chemin 43 du SIGUSR1 (`_restart`) : une seule source, lue par
+`status`, la garde et le signal. Refus dans l'ordre : superviseur, application d'une mise
+à jour en cours (`SelfUpdater.applying`), config `invalid` (relue, `bind` refait), appels
+en vol (`InFlight`, levé par `force`). Les demandes sont sérialisées par un verrou ; une
+sortie déjà demandée rend la réponse d'acceptation sans rien redemander. Puis
+`ExitRequest(RESTART_EXIT_CODE)` : même arrêt en douceur que pour la mise à jour, la
+réponse part, lifespan refermé, `sys.exit(43)`, journal « redémarrage demandé par un
+client ». `ExitRequest` garde le PREMIER code demandé (42 ou 43) ; une fois une sortie
+demandée, `apply` est refusé (`UPDATE_RESTARTING`). Jamais d'exec : hors supervision, le
+refus `RESTART_NOT_SUPERVISED`, et sous Windows le chemin 43 fonctionne, n'ayant besoin
+d'aucun signal (non éprouvé sur le poste : dette). `--with-dev-auth` : toute relance,
+signal ou sortie demandée, invalide les jetons émis par l'AS de développement, et le
+journal le dit.
+
+**Identité de processus** (`ProcessIdentity`) : `instance` et `started_at`, tirés une
+fois dans `main()`, passés à `Lifecycle` ET à `VolatileSecrets` — une seule identité, que
+le client compare pour reconnaître le processus relancé (`head`, l'indice d'AT, ne bouge
+pas sans mise à jour).
 
 ## Ère des upstreams stdio et http
 

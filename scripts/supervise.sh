@@ -4,8 +4,9 @@
 # Le proxy sort en 42 après une mise à jour appliquée depuis MIAOU (clef
 # `self_update` de la config) ; relancé ici par `uv run`, il repart sur le
 # nouveau code avec ses dépendances à jour. Il sort en 43 sur SIGUSR1, au lieu
-# de s'exec sur place. Tout autre code de sortie arrête la boucle et est rendu
-# tel quel (0 : arrêt normal, Ctrl-C compris).
+# de s'exec sur place, et sur demande d'un client (miaou/lifecycle/restart).
+# Tout autre code de sortie arrête la boucle et est rendu tel quel (0 : arrêt
+# normal, Ctrl-C compris).
 # Pose MIAOU_PROXY_SUPERVISED=1 : sans elle, le proxy refuse d'appliquer une
 # mise à jour, faute de quelqu'un pour le relancer. Pose aussi
 # MIAOU_PROXY_RESTART_BY_EXIT=1 : sans elle, le proxy ne sort pas en 43 et
@@ -60,7 +61,7 @@ miaou_supervise() {
             # Le code mis à jour a démarré et tourné : un échec à la relance
             # vient d'autre chose, le retour arrière ne s'y rapporte plus.
             updated=0
-            echo "supervise: redémarrage demandé (SIGUSR1), relance du proxy." >&2
+            echo "supervise: redémarrage demandé (SIGUSR1 ou client MCP), relance du proxy." >&2
         else
             # Pas pour un arrêt par signal (128 + n : SIGTERM rend 143,
             # uvicorn relevant le signal après un arrêt propre).

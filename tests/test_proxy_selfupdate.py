@@ -872,7 +872,7 @@ def test_supervise_still_points_to_the_rollback_after_a_restart_then_an_update(t
                           capture_output=True, text=True, timeout=30)
     assert done.returncode == 1
     assert "s'est arrêté en erreur (code 1)" in done.stderr
-    assert "redémarrage demandé (SIGUSR1)" in done.stderr
+    assert "redémarrage demandé (SIGUSR1 ou client MCP)" in done.stderr
 
 
 @needs_bash

@@ -85,7 +85,8 @@ par `exec`, même pid et même terminal. Ça ne repasse pas par `uv run` : une d
 modifiée demande un vrai relancement. Sous `scripts/supervise.sh`, le proxy sort plutôt
 en 43 et le superviseur le relance, `uv run` compris. Les sessions MCP en cours sont perdues, et avec
 `--with-dev-auth` les jetons émis par le serveur d'autorisation de développement. Sous
-Windows, faute de `SIGUSR1`, le proxy tourne sans ce redémarrage.
+Windows, faute de `SIGUSR1`, le proxy tourne sans ce redémarrage (le redémarrage demandé
+depuis MIAOU sous `supervise.sh`, lui, ne dépend d'aucun signal).
 
 La config se lit en couches : `config.defaults.json` (versionné, la base, à ne pas
 éditer), puis `config.site.json` et `config.json` s'ils existent, chacun ne portant que
@@ -314,6 +315,10 @@ Un fichier suivi modifié localement bloque la mise à jour (les fichiers non su
 `config.json` ne gênent pas). Une mise à jour qui ne change que `miaou_dist` ne redémarre
 pas le proxy. Détail : `docs/proxy.md`.
 
+Sous `supervise.sh`, MIAOU sait aussi redémarrer le proxy sans mise à jour, et le
+proxy lui dit si sa config a changé depuis son démarrage (et si elle redémarrerait :
+une config invalide refuse le redémarrage au lieu de laisser un proxy arrêté).
+
 ### Mot de passe saisi dans MIAOU (secret volatil)
 
 Plutôt que d'écrire un mot de passe dans `config.json`, le bloc `config` d'un serveur
@@ -521,6 +526,7 @@ miaou-mcp-servers/
 │   ├── upstream.py       # InProcess / Stdio / Http
 │   ├── config.py         # load_config, build_upstreams
 │   ├── layers.py         # chaîne de config, fusion, ${VAR}, --migrate-config
+│   ├── configwatch.py    # config modifiée depuis le démarrage, validation avant redémarrage
 │   ├── state.py          # state/ : jetons OAuth et cache d'outils
 │   ├── server.py         # build_proxy_server, catalogue d'outils
 │   ├── skills.py         # skills des upstreams, agrégées (extension Skills)
@@ -530,11 +536,12 @@ miaou-mcp-servers/
 │   ├── webapp.py         # MIAOU servi sous /app/ (clé miaou_dist)
 │   ├── selfupdate.py     # mise à jour par lui-même : état git du clone, fast-forward
 │   ├── updater.py        # extension miaou/self-update (état, application)
+│   ├── lifecycle.py      # extension miaou/lifecycle (config modifiée, redémarrage à la demande)
 │   ├── volatile.py       # secrets volatils : marqueurs {"volatile": clef} de la config
 │   ├── volatile_store.py # extension miaou/volatile-secrets (saisie, validation, oubli)
 │   └── entry.py          # CLI, main(), serve_http (SIGUSR1 ou sortie en 43 supervisé, 42 après mise à jour)
 ├── scripts/
-│   └── supervise.sh      # relance le proxy quand il sort en 42 (mise à jour) ou 43 (SIGUSR1)
+│   └── supervise.sh      # relance le proxy quand il sort en 42 (mise à jour) ou 43 (SIGUSR1, redémarrage demandé)
 ├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker (versionné vide)
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
@@ -576,6 +583,8 @@ miaou-mcp-servers/
 │   ├── test_proxy_webapp.py         # MIAOU servi sous /app/ (dont un vrai uvicorn)
 │   ├── test_proxy_selfupdate.py     # mise à jour par lui-même (dépôts git jetables)
 │   ├── test_proxy_volatile.py       # secrets volatils (marqueurs, attente, extension)
+│   ├── test_proxy_configwatch.py    # config modifiée depuis le démarrage, validation partagée
+│   ├── test_proxy_lifecycle.py      # extension miaou/lifecycle, relance réelle sous supervise.sh
 │   ├── test_secret_demo.py          # serveur de démonstration des secrets volatils
 │   ├── test_dev_auth_server.py      # serveur d'autorisation de développement
 │   └── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)

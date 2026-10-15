@@ -65,6 +65,33 @@ de la RFC 7386 sur `merge_patch`, et vérifie l'allègement comme PROPRIÉTÉ �
 effective inchangée — sur une copie retouchée du vrai `config.defaults.json`, pas
 seulement sur des dicts choisis. `--print-config` et `--migrate-config` passent par
 `entry.main()` (`monkeypatch.chdir` sur `tmp_path`, `sys.argv` remplacé).
+`tests/test_proxy_configwatch.py` (surveillance de la config, lot AV) fait comme `main()`
+pour prendre sa référence — chaîne, couches, `prepare_config` — puis réécrit les fichiers
+d'une chaîne jetable sous `tmp_path` (apparition, retrait, commentaire seul, contenu
+reformaté, JSON tronqué, `--config` disparu, couche illisible par un `read_text` qui lève).
+L'environnement de substitution est passé explicitement, si bien qu'`os.environ` modifié
+après coup prouve qu'il n'entre ni dans l'empreinte ni dans la validation. La validation
+partagée se tient par un inventaire : chaque refus de config de `main()` (lecture,
+port, `miaou_dist`, `self_update`, auth entrante, `build_upstreams`, autorisations
+sortantes) a son cas, qui doit rendre `invalid` ET faire sortir `entry.main()` en 1 avec
+`Erreur : <la même cause>` — un écart de message est un écart de chemin. Le `bind`
+d'essai vise un port tenu par un socket en écoute du test ; « pas d'essai » se prouve en
+remplaçant `probe_bind` par un `pytest.fail`. `build_upstreams` se patche dans
+`mcp_proxy.configwatch`, qui l'appelle, et non plus dans `entry`.
+`tests/test_proxy_lifecycle.py` (extension `miaou/lifecycle`, lot AV) monte la `Lifecycle`
+sur une chaîne jetable, la sortie demandée notée dans une liste au lieu d'arrêter quoi
+que ce soit, et lui parle en JSON-RPC moderne sur le `Server` du proxy. Chaque refus de
+`restart` est testé avec TOUS les refus suivants réunis (config cassée, appels en vol,
+application en cours) : c'est ce qui fige l'ordre, un refus testé seul ne le prouve pas.
+Les variables du superviseur sont retirées en fixture autouse (la suite peut tourner
+elle-même sous `supervise.sh`). Deux bouts-en-bouts : `serve_http` sur un vrai uvicorn
+(thread principal, client streamable-http dans un autre, comme pour la sortie en 42),
+qui doit sortir en 43 après avoir répondu ; et le vrai `main()` lancé par
+`scripts/supervise.sh` en subprocess (`python -m mcp_proxy --config`, port libre), dont
+on lit l'état, édite la config, demande le redémarrage, puis attend un `instance`
+différent. Ce dernier se lance en `start_new_session` et s'arrête par `killpg` sur SON
+groupe — jamais un `pkill` par motif, qui viserait aussi l'instance de l'utilisateur ;
+sauté sans bash ni groupes POSIX.
 `tests/test_proxy_webapp.py` (MIAOU servi sous `/app/`) monte un `dist/` factice dans
 `tmp_path` et l'interroge à trois niveaux : les purs de `webapp.py`, l'app de
 `build_app` sur `httpx2.ASGITransport` (wrapper ASGI compris), et un **vrai uvicorn**

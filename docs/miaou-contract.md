@@ -234,6 +234,7 @@ message lisible, et selon le cas `data.before`, `data.target`, `data.remedy`.
 | `UPDATE_NOT_SUPERVISED` | `-32600` | variable du superviseur absente |
 | `UPDATE_INVALID_TARGET` | `-32602` | `target` n'est pas un sha complet |
 | `UPDATE_IN_PROGRESS` | `-32600` | une autre application tourne |
+| `UPDATE_RESTARTING` | `-32600` | une sortie est déjà demandée (`miaou/lifecycle/restart`, ou mise à jour qui redémarre) : le proxy s'arrête |
 | `UPDATE_TOOLS_IN_FLIGHT` | `-32600` | appels d'outils en cours, tous clients confondus (jamais pour `kind: miaou`) |
 | `UPDATE_STALE` | `-32600` | `target` déjà atteint, ou plus atteignable en avance rapide (branche réécrite, autre application) : relire l'état |
 | `UPDATE_REFUSED` | `-32600` | arbre sale, remote injoignable, git a refusé avant de toucher l'arbre… (cause dans le message) |
@@ -241,6 +242,81 @@ message lisible, et selon le cas `data.before`, `data.target`, `data.remedy`.
 | `UPDATE_ROLLBACK_FAILED` | `-32603` | retour arrière en échec : `data.remedy` donne la commande |
 
 Tout refus laisse le proxy en marche et l'arbre dans son état d'avant (sauf le dernier).
+
+## Cycle de vie du proxy (extension `miaou/lifecycle`, lot AV)
+
+La config a-t-elle changé depuis le démarrage du proxy, et redémarrage à la demande.
+**Publiée toujours**, sans clef de config, **ère 2026-07-28 seulement** :
+`extensions["miaou/lifecycle"] = {}` dans `server/discover`. Deux méthodes JSON-RPC hors
+outils, absentes de `tools/list`. **Aucune garde d'origine** : MIAOU en `file://` s'en
+sert comme MIAOU servi sous `/app/` ; le bloc `auth`, quand il est posé, est la seule
+barrière (limite : toute page ouverte dans le navigateur peut demander un redémarrage).
+Mise en œuvre : `mcp_proxy/lifecycle.py` (extension) et `configwatch.py` (config).
+
+**`miaou/lifecycle/status`** `{}` → `{ status: {…} }`. Relit la config à chaque appel
+(trois petits fichiers, une fusion, un hash) : « vérifier » = rappeler `status`, il n'y a
+ni sonde ni cadence côté proxy.
+
+| Champ | Valeur |
+|---|---|
+| `instance` | identité du processus, tirée une fois au démarrage (16 hexadécimaux) ; la même que celle de `miaou/secrets/status`. Un `instance` différent du dernier lu = un autre processus |
+| `started_at` | date ISO 8601 UTC du démarrage |
+| `restartable` | `MIAOU_PROXY_SUPERVISED=1` ET `MIAOU_PROXY_RESTART_BY_EXIT=1` : un superviseur relance sur 43. Faux : `restart` sera refusé, redémarrage à faire à la main |
+| `restarting` | une sortie est demandée (ce `restart`, ou une mise à jour appliquée), l'arrêt est en cours |
+| `config.state` | `unchanged`, `changed`, `invalid` |
+| `config.changed` | chemins des clefs changées depuis le démarrage, triés, 20 au plus ; `[]` si `unchanged` |
+| `config.changed_total` | leur nombre total |
+| `config.detail` | cause brute si `invalid` (couche illisible, refus de config, port qui ne s'ouvre pas), sinon `null` |
+| `config.layers` | fichiers lus, dans l'ordre, chemins tels que résolus ; `[]` si la chaîne ne se résout plus |
+| `config.checked_at` | date ISO 8601 UTC de cette lecture |
+
+**Ce qui compte comme changement** : le contenu fusionné des couches, AVANT substitution
+des `${VAR}`, sans les clefs `_comment*`. Un fichier ré-enregistré à l'identique, ou
+reformaté, ou dont seul un commentaire change, reste `unchanged`. Un `config.json` apparu
+ou retiré depuis le démarrage compte (chaîne par défaut) ; un `--config` disparu rend
+`invalid`. Une variable d'environnement changée n'est pas une modification de config.
+
+**Chemins** : `mcpServers.<nom>` pour un serveur (ajouté, retiré ou modifié, sans plus de
+détail), la clef racine pour le reste (`port`, `host`, `auth`, `miaou_dist`,
+`self_update`…). Jamais de valeur. Un chemin reste listé même quand une option de la
+ligne de commande le rend sans effet (`--port` pour `port`) : c'est un fait,
+l'interprétation est au client — les chemins qui le couperont du proxy relancé (`port`,
+`host`, `auth`, et `miaou_dist` quand la page est servie par ce proxy) sont à
+annoncer AVANT le redémarrage.
+
+**`invalid`** : la config modifiée ne permettrait pas au proxy de redémarrer. Elle est
+validée par la fonction même du démarrage, avec les mêmes options de ligne de commande :
+tout refus qui ferait sortir le proxy en 1 y est un `invalid`, avec le même message. Si
+l'hôte ou le port effectifs changent, un `bind` d'essai s'y ajoute. Un `invalid` peut être
+transitoire (fichier en cours d'écriture par un éditeur). Ce que la validation ne voit
+pas : un module inprocess qui ne s'importe plus (l'upstream est écarté, le proxy démarre)
+et un port pris entre l'essai et la relance.
+
+**`miaou/lifecycle/restart`** `{ force?: bool }` → `{ restarting: true, instance }`
+(`instance` du processus qui s'arrête). La réponse partie, le proxy s'arrête en douceur
+(5 s pour les requêtes en cours) et sort en 43 ; `scripts/supervise.sh` le relance par
+`uv run`, avec la config relue. Jamais d'exec sur place. Le nouveau processus se reconnaît
+à un `instance` différent dans `status`. La session MCP meurt avec l'ancien, chez tous les
+clients ; les secrets volatils sont à renvoyer (`instance` change aussi dans
+`miaou/secrets/status`). Accepté que la config ait changé ou non. Un `restart` déjà
+accepté, ou une sortie déjà demandée par une mise à jour, rend la même réponse sans rien
+redemander (deux onglets, deux clics).
+
+Refus, **dans cet ordre**, en erreur JSON-RPC `-32600`, code applicatif dans
+`error.data.code` (à tester par égalité) :
+
+| `data.code` | Cas | `data` en plus |
+|---|---|---|
+| `RESTART_NOT_SUPERVISED` | `restartable` faux | — |
+| `RESTART_UPDATE_IN_PROGRESS` | une mise à jour (`miaou/update/apply`) est en cours d'application | — |
+| `RESTART_CONFIG_INVALID` | la config relue à l'instant est `invalid` (`bind` d'essai refait) | `detail` : la cause, aussi dans le message |
+| `RESTART_TOOLS_IN_FLIGHT` | appels d'outils en cours, tous clients confondus | `count` |
+
+`force: true` ne lève que le dernier : les appels en vol sont coupés (un upstream bloqué,
+dont l'appel ne finira jamais, est souvent ce que le redémarrage doit guérir). Le nombre à
+afficher dans la confirmation est `data.count` du refus, jamais un compte local.
+Réciproquement, une fois une sortie demandée, `miaou/update/apply` est refusé en
+`UPDATE_RESTARTING`.
 
 ## Secrets volatils (extension `miaou/volatile-secrets`, lot AU)
 
@@ -283,8 +359,9 @@ Après un `rejected` sur un consommateur déjà `ready` (remplacement à chaud),
 `ready` : son instance précédente sert toujours.
 
 **`miaou/secrets/status`** `{}` → `{ status: { instance, secrets: [entrée…] } }`.
-`instance` : identifiant tiré au démarrage du proxy (16 hexadécimaux) ; un autre que le
-dernier lu veut dire que le proxy a redémarré, donc oublié toutes les valeurs.
+`instance` : identifiant tiré au démarrage du proxy (16 hexadécimaux), le même que celui
+de `miaou/lifecycle/status` ; un autre que le dernier lu veut dire que le proxy a
+redémarré, donc oublié toutes les valeurs.
 
 **`miaou/secrets/submit`** `{ key, value }` → `{ secret: entrée }`. Validation =
 construction réussie, **séquentielle** dans l'ordre des consommateurs, **arrêtée au
@@ -326,7 +403,7 @@ signale l'attente : l'état se lit par l'extension.
 **La valeur** n'est jamais écrite sur disque, journalisée, ni rendue par une méthode,
 pas même masquée. Le proxy ne garde que des empreintes (HMAC, sel propre au processus),
 et l'instance construite par le serveur la détient. Elle est perdue à tout redémarrage
-du proxy (SIGUSR1, mise à jour, sortie en 43) : `instance` change, les consommateurs
+du proxy (SIGUSR1, mise à jour, `miaou/lifecycle/restart`) : `instance` change, les consommateurs
 repassent `pending`, et c'est au client de renvoyer une valeur qu'il détient comme
 acceptée.
 

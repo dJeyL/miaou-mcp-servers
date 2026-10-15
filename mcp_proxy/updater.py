@@ -41,6 +41,10 @@ from .server import InFlight
 
 CONFIG_KEY = "self_update"
 SUPERVISED_ENV = "MIAOU_PROXY_SUPERVISED"
+#: Posée par un `scripts/supervise.sh` qui relance aussi sur 43 (redémarrage) :
+#: un superviseur plus ancien, encore en mémoire après une mise à jour, ne
+#: relancerait que sur 42.
+RESTART_BY_EXIT_ENV = "MIAOU_PROXY_RESTART_BY_EXIT"
 EXTENSION_ID = "miaou/self-update"
 STATUS_METHOD = "miaou/update/status"
 APPLY_METHOD = "miaou/update/apply"
@@ -56,6 +60,7 @@ CHECKING = "checking"
 # contrat qu'AUTHORIZATION_REQUIRED), jamais par sous-chaîne du message.
 NOT_SUPERVISED = "UPDATE_NOT_SUPERVISED"
 IN_PROGRESS = "UPDATE_IN_PROGRESS"
+RESTARTING = "UPDATE_RESTARTING"
 TOOLS_IN_FLIGHT = "UPDATE_TOOLS_IN_FLIGHT"
 INVALID_TARGET = "UPDATE_INVALID_TARGET"
 STALE = "UPDATE_STALE"
@@ -88,6 +93,15 @@ def resolve_self_update(cfg: dict[str, Any]) -> bool:
 
 def is_supervised(environ: dict[str, str] | None = None) -> bool:
     return (environ if environ is not None else os.environ).get(SUPERVISED_ENV) == "1"
+
+
+def restartable(environ: dict[str, str] | None = None) -> bool:
+    """Un redémarrage peut-il passer par une sortie en 43, relancée par le
+    superviseur ? Seule source de cette condition : le SIGUSR1 (`entry`)
+    et `miaou/lifecycle` (`status`, garde de `restart`) la lisent ici, sans
+    quoi MIAOU proposerait un bouton que le proxy refuse."""
+    env = environ if environ is not None else os.environ
+    return is_supervised(env) and env.get(RESTART_BY_EXIT_ENV) == "1"
 
 
 def served_build(miaou_dist: Path | None) -> str | None:
@@ -150,10 +164,15 @@ class SelfUpdater:
         config: UpdateConfig,
         in_flight: InFlight,
         request_restart: Callable[[], None] | None = None,
+        exit_pending: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.in_flight = in_flight
         self.request_restart = request_restart
+        # Une sortie déjà demandée (redémarrage de `miaou/lifecycle`, ou mise à
+        # jour appliquée dont l'arrêt est en cours) : appliquer maintenant
+        # ferait tourner git pendant l'arrêt du processus.
+        self.exit_pending = exit_pending
         self._status: selfupdate.Status | None = None
         self._checked_at: datetime | None = None
         self._probe_lock = asyncio.Lock()
@@ -188,12 +207,15 @@ class SelfUpdater:
                 _log(f"Sonde de mise à jour interrompue ({type(e).__name__}: {e}).")
             await asyncio.sleep(PROBE_INTERVAL_S)
 
+    def applying(self) -> bool:
+        return self._apply_lock.locked()
+
     def snapshot(self) -> dict[str, Any]:
         status = self._status.to_dict() if self._status else selfupdate.Status(CHECKING).to_dict()
         status.update(
             checked_at=self._checked_at.isoformat(timespec="seconds") if self._checked_at else None,
             supervised=self.config.supervised,
-            applying=self._apply_lock.locked(),
+            applying=self.applying(),
             served_build=served_build(self.config.miaou_dist),
         )
         return status
@@ -232,6 +254,8 @@ class SelfUpdater:
             )
         if self._apply_lock.locked():
             raise _refusal(IN_PROGRESS, "Une mise à jour est déjà en cours.")
+        if self.exit_pending is not None and self.exit_pending():
+            raise _refusal(RESTARTING, "Le proxy est en train de redémarrer.")
         async with self._apply_lock:
             # Vérifié une première fois ici pour refuser vite, puis dans le
             # thread juste avant le merge, genre connu (`before_merge`).

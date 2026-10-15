@@ -8,6 +8,9 @@ cycle d'imports entre ces modules.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 
 # Couleurs d'uvicorn.logging.ColourizedFormatter : vert pour INFO, jaune pour
@@ -15,7 +18,26 @@ import sys
 _COLOURS = {"INFO": "32", "WARNING": "33"}
 
 
+# Journal coupé le temps d'un `muted()` : la validation d'une config modifiée
+# (lot AV) rejoue les fonctions du démarrage, qui journalisent ce qu'elles
+# construisent. Ces lignes décriraient un démarrage qui n'a pas lieu. Une
+# variable de contexte et non un drapeau global : `asyncio.to_thread` la
+# recopie, et une requête servie pendant ce temps journalise normalement.
+_muted: ContextVar[bool] = ContextVar("miaou_proxy_log_muted", default=False)
+
+
+@contextmanager
+def muted() -> Iterator[None]:
+    token = _muted.set(True)
+    try:
+        yield
+    finally:
+        _muted.reset(token)
+
+
 def _emit(level: str, message: str) -> None:
+    if _muted.get():
+        return
     levelname = level
     if sys.stderr.isatty():
         # Comme uvicorn.logging.ColourizedFormatter : seul le levelname est

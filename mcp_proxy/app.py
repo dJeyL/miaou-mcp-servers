@@ -37,6 +37,7 @@ def build_app(
     updater: Any = None,
     catalog: Any = None,
     secrets: Any = None,
+    lifecycle: Any = None,
 ) -> Any:
     """`auth` : sortie de resolve_auth_config(), ou None (auth désactivée —
     comportement d'avant le lot AB-1, à l'octet près).
@@ -62,6 +63,9 @@ def build_app(
     `secrets` : un `VolatileSecrets` (lot AU), ou None (aucun upstream à
     secret volatil : ni méthode, ni extension). L'extension n'est publiée que
     s'il reste un consommateur après le démarrage.
+
+    `lifecycle` : un `Lifecycle` (lot AV), que `main()` passe toujours ; None
+    (tests) : ni méthode, ni extension `miaou/lifecycle`.
     """
     from contextlib import asynccontextmanager
 
@@ -315,6 +319,9 @@ def build_app(
         # Dès la construction : les capacités se calculent à chaque
         # server/discover, aucun client ne peut arriver avant.
         updater.install(mcp_server)
+    if lifecycle is not None:
+        # Même moment, pour la même raison.
+        lifecycle.install(mcp_server)
 
     async def handle_mcp(scope: Any, receive: Any, send: Any) -> None:
         await session_manager.handle_request(scope, receive, send)

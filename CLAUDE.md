@@ -25,6 +25,7 @@ miaou-mcp-servers/
 │   ├── netproxy.py       # override --proxy / --noproxy
 │   ├── config.py         # load_config, build_upstreams
 │   ├── layers.py         # chaîne config.defaults → config.site → config.json, Merge Patch, ${VAR}, --migrate-config
+│   ├── configwatch.py    # lot AV : empreinte de la config fusionnée, chemins changés, prepare_config partagé avec main(), bind d'essai
 │   ├── state.py          # state/ : tokens.json, tools-cache.json, déplacement des anciens <config>-*.json
 │   ├── volatile.py       # secrets volatils (lot AU) : marqueurs {"volatile": clef} du config inprocess, résolution, masquage
 │   ├── volatile_store.py # extension miaou/volatile-secrets : garde Host/Origin, status/submit/forget, validation séquentielle, empreintes
@@ -39,10 +40,11 @@ miaou-mcp-servers/
 │   ├── app.py            # build_app (Starlette)
 │   ├── webapp.py         # MIAOU servi sous /app/ : clé miaou_dist, MiaouStaticFiles, garde et avertissements
 │   ├── selfupdate.py     # mise à jour par lui-même (lot AT) : état git du clone, fast-forward vers le sha affiché
-│   ├── updater.py        # extension miaou/self-update : status/apply, sonde de 5 min, refus (supervision, appels en vol)
-│   └── entry.py          # CLI, main(), serve_http (redémarrage sur SIGUSR1 — sortie en 43 sous superviseur —, sortie en 42 après mise à jour)
+│   ├── updater.py        # extension miaou/self-update : status/apply, sonde de 5 min, refus (supervision, appels en vol) ; restartable()
+│   ├── lifecycle.py      # extension miaou/lifecycle (lot AV) : status (config relue), restart (sortie en 43), ProcessIdentity partagée avec les secrets
+│   └── entry.py          # CLI, main(), serve_http (redémarrage sur SIGUSR1 — sortie en 43 sous superviseur —, ExitRequest : 42 après mise à jour, 43 sur miaou/lifecycle/restart)
 ├── scripts/
-│   └── supervise.sh      # superviseur bash : relance sur 42 et 43, pose MIAOU_PROXY_SUPERVISED=1 et MIAOU_PROXY_RESTART_BY_EXIT=1
+│   └── supervise.sh      # superviseur bash : relance sur 42 et 43 (SIGUSR1 ou miaou/lifecycle/restart), pose MIAOU_PROXY_SUPERVISED=1 et MIAOU_PROXY_RESTART_BY_EXIT=1
 ├── miaou_dist/           # copie du dist/ de MIAOU pour l'image Docker — versionné VIDE (.gitkeep) ; contenu NON gitignoré, pour qu'un fork y versionne MIAOU — ne pas le committer ici
 ├── dev_auth_server.py    # serveur d'autorisation OAuth de DÉVELOPPEMENT (jamais en prod)
 ├── servers/
@@ -79,6 +81,8 @@ miaou-mcp-servers/
 │   ├── test_docs.py
 │   ├── test_proxy.py
 │   ├── test_proxy_layers.py  # config en couches (vecteurs RFC 7386, allègement), state/
+│   ├── test_proxy_configwatch.py  # surveillance de la config (lot AV) : chaînes jetables, un `invalid` par sortie en 1 de main(), bind
+│   ├── test_proxy_lifecycle.py  # extension miaou/lifecycle (lot AV) : refus dans l'ordre, force, sortie 43, relance réelle sous supervise.sh
 │   ├── test_proxy_volatile.py  # secrets volatils (lot AU) : marqueurs, couches, refus au démarrage, attente
 │   ├── test_skills.py    # extension Skills de mcp_base (vecteurs d'empreinte de la spec)
 │   ├── test_proxy_skills.py  # skills servies par le proxy : URI, `_meta`, bloc, repli
@@ -420,7 +424,13 @@ lots — piège déjà payé côté MIAOU.
   l'ordre, `InFlight`, genre `miaou` sans redémarrage —, sortie en 42 par
   `ExitRequest` examinée avant le SIGUSR1, `scripts/supervise.sh` exécuté ou sourcé
   (une relance sur 43 désarme l'indication de retour arrière),
-  `.gitattributes` LF), l'override `--proxy`/`--noproxy` et ses
+  `.gitattributes` LF), le redémarrage à la demande (lot AV : `configwatch.py` —
+  empreinte de `LoadedConfig.merged` avant `${VAR}`, référence = le dict chargé par
+  `main()`, chaîne re-résolue, `prepare_config` partagé avec `main()` et ses
+  `LaunchOptions`, environnement du démarrage, journal `muted()`, `bind` d'essai par
+  `loop.create_server` seulement si hôte/port effectifs changent —, `lifecycle.py` —
+  `restartable()` source unique avec le SIGUSR1, refus dans l'ordre, `ExitRequest`
+  au premier code, `ProcessIdentity` —), l'override `--proxy`/`--noproxy` et ses
   trois chemins d'application, le format de `config.json` ; config en couches
   (`layers.py` : chaîne `config.defaults.json` → `config.site.json` → `config.json`,
   `--config` répétable qui la remplace, JSON Merge Patch sans variante, `${VAR}`
@@ -547,6 +557,12 @@ lots — piège déjà payé côté MIAOU.
   `miaou/update/status` et la forme de son état — `state`, `target` à renvoyer,
   `update.kind` miaou/proxy/both, `served_build` —, `miaou/update/apply` vers le sha
   exact, `restart` faux pour MIAOU seul, refus `UPDATE_*` dans `error.data.code`),
+  l'extension `miaou/lifecycle` (lot AV : publiée toujours, sans garde d'origine,
+  `status` relu à chaque appel — `instance` partagé avec les secrets, `restartable`,
+  `config.state` unchanged/changed/invalid, chemins `mcpServers.<nom>` ou clef racine
+  plafonnés à 20, ce qui compte comme changement —, `restart` et ses refus
+  `RESTART_*` dans l'ordre, `force` qui ne lève que les appels en vol, réponse
+  idempotente, `UPDATE_RESTARTING` en retour),
   et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
   `ref`+`content_b64`, `session_id`, idempotence de la matérialisation, REF_UNKNOWN
   levée en `MCPError` par l'outil et donc rejouable en autonome comme derrière le
@@ -566,7 +582,13 @@ lots — piège déjà payé côté MIAOU.
   verte des deux côtés), `test_proxy_selfupdate.py` et ses vrais dépôts jetables
   (remote `fork`, branche `trunk`, config git de l'utilisateur neutralisée, faux
   `git` en tête du PATH pour l'authentification refusée et le timeout, absence de
-  `FETCH_HEAD` comme preuve qu'aucun fetch n'a eu lieu), `test_proxy_webapp.py` et son vrai uvicorn sur port
+  `FETCH_HEAD` comme preuve qu'aucun fetch n'a eu lieu), `test_proxy_configwatch.py`
+  (chaînes jetables sous `tmp_path`, un `invalid` par sortie en 1 de config de
+  `main()` comparé au message de `main()` lui-même, `bind` sur un port occupé),
+  `test_proxy_lifecycle.py` (refus de `restart` dans l'ordre, chacun avec les suivants
+  réunis ; sortie en 43 sur vrai uvicorn ; vrai `main()` sous `supervise.sh`, revenu
+  avec un autre `instance`, groupe de processus tué à la fin),
+  `test_proxy_webapp.py` et son vrai uvicorn sur port
   éphémère (en-têtes émis, revalidation après `git pull` ; `guess_type` à remplacer
   dans `starlette.responses`, pas dans `mimetypes`), les vrais handshakes de `test_proxy_era.py` (fixtures
   stdio des deux ères, app http sur `httpx2.ASGITransport`, middleware qui imite

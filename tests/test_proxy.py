@@ -1175,9 +1175,11 @@ def test_main_enables_system_trust_store_before_building_upstreams(tmp_path, mon
     monkeypatch.setattr(
         mcp_proxy.entry, "enable_system_trust_store", lambda: order.append("trust")
     )
-    real_build = mcp_proxy.entry.build_upstreams
+    # `build_upstreams` est appelé par `prepare_config` (lot AV), qui le lit
+    # dans SON module : c'est là qu'il se patche.
+    real_build = mcp_proxy.configwatch.build_upstreams
     monkeypatch.setattr(
-        mcp_proxy.entry,
+        mcp_proxy.configwatch,
         "build_upstreams",
         lambda *a, **kw: (order.append("upstreams"), real_build(*a, **kw))[1],
     )
@@ -1676,6 +1678,50 @@ def test_update_exit_wins_over_the_restart_signal(uvicorn_double, monkeypatch, s
         mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765, exit_request=exit_request)
     assert exc.value.code == 42
     assert uvicorn_double == []
+
+
+def test_restart_exit_leaves_with_43_and_its_own_journal(uvicorn_double, monkeypatch, capsys):
+    """`miaou/lifecycle/restart` (lot AV) : même arrêt que la mise à jour,
+    son propre code, son propre journal, jamais l'exec."""
+    exit_request = mcp_proxy.entry.ExitRequest()
+    _exit_requested_while_serving(
+        monkeypatch, lambda: exit_request(mcp_proxy.entry.RESTART_EXIT_CODE)
+    )
+    with pytest.raises(SystemExit) as exc:
+        mcp_proxy.entry.serve_http(object(), "127.0.0.1", 8765, exit_request=exit_request)
+    assert exc.value.code == 43
+    err = capsys.readouterr().err
+    assert "sortie en 43 : redémarrage demandé par un client" in err
+    assert "mise à jour" not in err
+    assert uvicorn_double == []
+
+
+def test_first_exit_request_fixes_the_code():
+    exit_request = mcp_proxy.entry.ExitRequest()
+    exit_request(mcp_proxy.entry.UPDATE_EXIT_CODE)
+    exit_request(mcp_proxy.entry.RESTART_EXIT_CODE)
+    assert exit_request.code == 42 and exit_request.pending
+
+
+def test_restart_exit_with_dev_auth_says_tokens_are_lost(uvicorn_double, monkeypatch, capsys):
+    exit_request = mcp_proxy.entry.ExitRequest()
+
+    async def serve(self):
+        import asyncio
+
+        if self is FakeUvicorn.instances[0]:
+            exit_request(mcp_proxy.entry.RESTART_EXIT_CODE)
+        while not self.should_exit:
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(FakeUvicorn, "serve", serve)
+    with pytest.raises(SystemExit) as exc:
+        mcp_proxy.entry.run_with_dev_auth(
+            object(), "127.0.0.1", 8765, 8787, "http://127.0.0.1:8787",
+            exit_request=exit_request,
+        )
+    assert exc.value.code == 43
+    assert "les jetons déjà émis sont invalides" in capsys.readouterr().err
 
 
 def test_exit_request_before_bind_still_stops():

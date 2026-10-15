@@ -59,6 +59,11 @@ class LoadedConfig:
     # Fichier contre lequel résoudre un `miaou_dist` relatif : la dernière
     # couche qui le déclare.
     miaou_dist_base: Path
+    # Fusion des couches AVANT substitution des `${VAR}` : ce qu'empreinte la
+    # surveillance de la config (lot AV). `cfg` ne s'y prête pas, il change
+    # dès qu'`os.environ` bouge après le chargement (`--proxy`, `env` d'un
+    # upstream inprocess).
+    merged: dict[str, Any] = field(default_factory=dict)
     # Variables `${VAR}` sans valeur ni défaut, avec le chemin de la clé ;
     # remplacées par "" (comme docker compose), à signaler au démarrage.
     unset_vars: list[tuple[str, str]] = field(default_factory=list)
@@ -114,7 +119,8 @@ def resolve_chain(explicit: list[str] | None, base_dir: Path | None = None) -> t
     return present, chain[-1]
 
 
-def load_layers(paths: list[Path], local: Path | None = None) -> LoadedConfig:
+def load_layers(paths: list[Path], local: Path | None = None, env: Any = None) -> LoadedConfig:
+    """`env` : l'environnement des `${VAR}`, `os.environ` par défaut."""
     merged: dict[str, Any] = {}
     miaou_dist_base = paths[-1]
     markers: list[tuple[tuple[str | int, ...], str, Path]] = []
@@ -130,7 +136,7 @@ def load_layers(paths: list[Path], local: Path | None = None) -> LoadedConfig:
         names = ", ".join(f"'{p}'" for p in paths)
         raise ValueError(f"La config ({names}) doit contenir la clé 'port'.")
     unset: list[tuple[str, str]] = []
-    cfg = interpolate_env(merged, os.environ, unset)
+    cfg = interpolate_env(merged, os.environ if env is None else env, unset)
     plain = [
         (format_path(p), key, path)
         for p, key, path in markers
@@ -141,6 +147,7 @@ def load_layers(paths: list[Path], local: Path | None = None) -> LoadedConfig:
         layers=list(paths),
         local=local or paths[-1],
         miaou_dist_base=miaou_dist_base,
+        merged=merged,
         unset_vars=unset,
         plain_over_volatile=plain,
     )

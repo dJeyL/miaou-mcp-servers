@@ -21,14 +21,9 @@ from typing import Any
 from mcp_base import enable_system_trust_store
 
 from .app import build_app
-from .auth_in import AuthConfigError, resolve_auth_config
-from .auth_out import (
-    _default_tokens_path,
-    build_callback_url,
-    build_upstream_authorizers,
-    enable_auth_debug,
-)
-from .config import build_upstreams
+from .auth_out import build_callback_url, enable_auth_debug
+from .configwatch import ConfigWatch, LaunchOptions, prepare_config
+from .lifecycle import Lifecycle, ProcessIdentity
 from .layers import (
     DEFAULT_CHAIN,
     load_layers,
@@ -39,13 +34,13 @@ from .layers import (
     resolve_chain,
 )
 from .logging import _log, _warn
-from .netproxy import apply_proxy_env_overrides_to_process, compute_proxy_env_overrides
+from .netproxy import apply_proxy_env_overrides_to_process
 from .server import InFlight, ToolCatalogCache, build_proxy_server
 from .state import default_tools_cache_path, migrate_legacy_state, state_dir, tools_cache_beside
-from .updater import SUPERVISED_ENV, SelfUpdater, UpdateConfig, is_supervised, resolve_self_update
+from .updater import RESTART_BY_EXIT_ENV, SUPERVISED_ENV, SelfUpdater, UpdateConfig, is_supervised, restartable  # noqa: F401 - RESTART_BY_EXIT_ENV ré-exporté
 from . import selfupdate
 from .volatile_store import VolatileSecrets
-from .webapp import APP_PREFIX, miaou_dist_warnings, resolve_miaou_dist
+from .webapp import APP_PREFIX, miaou_dist_warnings
 
 #: Redémarrage sur place : un hook post-commit local l'envoie à l'instance du
 #: poste. Pas SIGHUP : c'est ce que reçoit le processus quand on ferme son
@@ -58,14 +53,14 @@ RESTART_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 #: compris), 1 (config), 2 (argparse), 3 (démarrage raté) et des signaux.
 UPDATE_EXIT_CODE = 42
 
-#: Sortie sur RESTART_SIGNAL sous superviseur, au lieu de l'exec : la relance
-#: repasse par `uv run` (dépendances installées) et par la fonction de
-#: lancement du superviseur (proxy réseau redétecté). Exige, en plus de
-#: SUPERVISED_ENV, RESTART_BY_EXIT_ENV, que seul pose un `supervise.sh` qui
-#: connaît ce code : un superviseur plus ancien, encore en mémoire après une
-#: mise à jour, rendrait 43 au lieu de relancer, et le proxy resterait arrêté.
+#: Sortie sur RESTART_SIGNAL sous superviseur, au lieu de l'exec, et sur
+#: `miaou/lifecycle/restart` (lot AV) : la relance repasse par `uv run`
+#: (dépendances installées) et par la fonction de lancement du superviseur
+#: (proxy réseau redétecté). Exige `restartable()` : en plus de SUPERVISED_ENV,
+#: RESTART_BY_EXIT_ENV, que seul pose un `supervise.sh` qui connaît ce code ;
+#: un superviseur plus ancien, encore en mémoire après une mise à jour,
+#: rendrait 43 au lieu de relancer, et le proxy resterait arrêté.
 RESTART_EXIT_CODE = 43
-RESTART_BY_EXIT_ENV = "MIAOU_PROXY_RESTART_BY_EXIT"
 
 #: À l'arrêt, les requêtes en cours finissent ; au-delà (flux SSE d'une session
 #: MCP restée ouverte), elles sont coupées. Ne borne pas le shutdown du
@@ -92,12 +87,14 @@ def _on_restart_signal(server: Any) -> Callable[[], bool]:
 
 
 class ExitRequest:
-    """Demande de sortie posée depuis l'app (`SelfUpdater.request_restart`),
-    lue par `serve_http` une fois l'arrêt COMPLET, lifespan compris.
+    """Demande de sortie posée depuis l'app, lue par `serve_http` une fois
+    l'arrêt COMPLET, lifespan compris : UPDATE_EXIT_CODE après une mise à
+    jour appliquée (`SelfUpdater.request_restart`), RESTART_EXIT_CODE sur
+    `miaou/lifecycle/restart`. La première demande fixe le code.
 
     Créée dans `main()` avant le serveur uvicorn, qui ne naît que dans
     `serve_http` : `bind` les relie. L'arrêt est celui de Ctrl-C, en douceur,
-    donc la réponse JSON-RPC de `miaou/update/apply`, requête encore en vol,
+    donc la réponse JSON-RPC de la requête qui l'a demandé, encore en vol,
     part avant la coupure. Le proxy ne se relance pas lui-même : c'est le
     superviseur qui décide, et `uv run` réinstalle alors les dépendances."""
 
@@ -105,23 +102,35 @@ class ExitRequest:
         self.code: int | None = None
         self._server: Any = None
 
+    @property
+    def pending(self) -> bool:
+        return self.code is not None
+
     def bind(self, server: Any) -> None:
         self._server = server
         if self.code is not None:
             server.should_exit = True
 
-    def __call__(self) -> None:
-        self.code = UPDATE_EXIT_CODE
+    def __call__(self, code: int = UPDATE_EXIT_CODE) -> None:
+        if self.code is None:
+            self.code = code
         if self._server is not None:
             self._server.should_exit = True
 
 
+_EXIT_REASONS = {
+    UPDATE_EXIT_CODE: "mise à jour appliquée",
+    RESTART_EXIT_CODE: "redémarrage demandé par un client",
+}
+
+
 def _exit_if_requested(exit_request: ExitRequest | None) -> None:
-    """Examinée AVANT la demande de redémarrage par signal : une mise à jour
-    appliquée doit repasser par `uv run`, ce que l'exec du SIGUSR1 ne fait
+    """Examinée AVANT la demande de redémarrage par signal : une sortie
+    demandée doit repasser par `uv run`, ce que l'exec du SIGUSR1 ne fait
     pas. Les deux posées ensemble, la sortie l'emporte."""
     if exit_request is not None and exit_request.code is not None:
-        _log(f"sortie en {exit_request.code} : mise à jour appliquée, relance par le superviseur.")
+        reason = _EXIT_REASONS.get(exit_request.code, "sortie demandée")
+        _log(f"sortie en {exit_request.code} : {reason}, relance par le superviseur.")
         sys.exit(exit_request.code)
 
 
@@ -139,7 +148,7 @@ def _reexec() -> None:
 def _restart() -> None:
     """Suite d'un arrêt sur RESTART_SIGNAL : sortie en RESTART_EXIT_CODE sous
     un superviseur qui la relance, exec sur place sinon."""
-    if is_supervised() and os.environ.get(RESTART_BY_EXIT_ENV) == "1":
+    if restartable():
         _log(f"sortie en {RESTART_EXIT_CODE} : redémarrage demandé, relance par le superviseur.")
         sys.exit(RESTART_EXIT_CODE)
     _reexec()
@@ -264,15 +273,17 @@ def run_with_dev_auth(
         # une trace KeyboardInterrupt à chaque arrêt. Sortie silencieuse, pour
         # que les deux modes de lancement se terminent de la même façon.
         return
-    _exit_if_requested(exit_request)
-    if restart_requested():
+    if (exit_request is not None and exit_request.pending) or restart_requested():
         # La paire de clés de l'AS ne vit qu'en mémoire : la nouvelle ne
-        # vérifie aucun jeton émis par l'ancienne.
+        # vérifie aucun jeton émis par l'ancienne. Vrai de toute relance,
+        # par signal comme par sortie demandée.
         _log(
             "redémarrage : nouvelle clé du serveur d'autorisation de "
             "développement, les jetons déjà émis sont invalides "
             "(clients à ré-autoriser)."
         )
+    _exit_if_requested(exit_request)
+    if restart_requested():
         _restart()
 
 
@@ -456,19 +467,21 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Recopié avant que quoi que ce soit ne le modifie (`--proxy`, `env` des
+    # upstreams inprocess) : c'est l'environnement que retrouvera un processus
+    # relancé par son superviseur, donc celui de la validation (lot AV).
+    launch_env = dict(os.environ)
+    options = LaunchOptions.from_args(args)
+    identity = ProcessIdentity()
+
     try:
         layer_paths, local_path = resolve_chain(args.config)
         if args.migrate_config:
             _migrate_and_exit(layer_paths, local_path, args.diff)
-        loaded = load_layers(layer_paths, local_path)
-        cfg = loaded.cfg
+        loaded = load_layers(layer_paths, local_path, env=launch_env)
         if args.print_config:
-            print(json.dumps(mask_secrets(cfg), indent=2, ensure_ascii=False))
+            print(json.dumps(mask_secrets(loaded.cfg), indent=2, ensure_ascii=False))
             return
-        host = args.host or cfg.get("host", "127.0.0.1")
-        port = args.port or int(cfg["port"])
-        miaou_dist = resolve_miaou_dist(cfg, loaded.miaou_dist_base)
-        self_update = resolve_self_update(cfg)
     except ValueError as e:
         print(f"Erreur : {e}", file=sys.stderr)
         sys.exit(1)
@@ -487,56 +500,31 @@ def main() -> None:
             f"  {local_path} répète des valeurs des couches précédentes : "
             f"`--migrate-config` l'allège (sauvegarde en {local_path.name}.bak)."
         )
+
+    # La même fonction valide une config modifiée avant un redémarrage
+    # (`configwatch`) : chaque refus de démarrer ici y est un refus de
+    # redémarrer, sans quoi le proxy relancé sortirait en 1 pour de bon.
+    try:
+        prepared = prepare_config(loaded, options)
+    except ValueError as e:
+        print(f"Erreur : {e}", file=sys.stderr)
+        sys.exit(1)
+    host, port = prepared.host, prepared.port
+    miaou_dist, auth = prepared.miaou_dist, prepared.auth
+    upstreams, authorizers = prepared.upstreams, prepared.authorizers
+    tokens_path = prepared.tokens_path
+
     if args.tokens_file is None:
         for line in migrate_legacy_state(local_path):
             _log(f"  état : {line}")
 
-    proxy_overrides = compute_proxy_env_overrides(args.proxy, args.noproxy)
-    if proxy_overrides is not None:
-        # Avant build_upstreams : les upstreams inprocess importent leur module
-        # (donc appellent potentiellement make_opener()/ProxyHandler() dès le
-        # premier tool call) en partageant l'environnement de ce process — poser
-        # les overrides ici les couvre sans toucher InProcessUpstream.
-        apply_proxy_env_overrides_to_process(proxy_overrides)
-
-    cli_auth = True if args.auth else (False if args.no_auth else None)
-    dev_auth_url: str | None = None
-    if args.with_dev_auth is not None:
-        # Le serveur de développement EST l'émetteur : on le pose dans la config
-        # avant résolution, pour que --with-dev-auth suffise sans éditer
-        # config.json. Une clé `auth` déjà présente n'est pas écrasée — la
-        # config explicite de l'utilisateur prime toujours sur la commodité.
-        dev_auth_url = f"http://127.0.0.1:{args.with_dev_auth}"
-        if not isinstance(cfg.get("auth"), dict):
-            cfg = {**cfg, "auth": {"issuer_url": dev_auth_url}}
-        else:
-            dev_auth_url = cfg["auth"].get("issuer_url", dev_auth_url)
-        cli_auth = True
-
-    try:
-        auth = resolve_auth_config(cfg, cli_auth=cli_auth, host=host, port=port)
-    except AuthConfigError as e:
-        print(f"Erreur : {e}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        upstreams = build_upstreams(cfg, proxy_env_overrides=proxy_overrides)
-    except ValueError as e:
-        print(f"Erreur : {e}", file=sys.stderr)
-        sys.exit(1)
-
-    tokens_path = args.tokens_file or _default_tokens_path(local_path)
-    try:
-        authorizers = build_upstream_authorizers(
-            cfg,
-            upstreams,
-            tokens_path=tokens_path,
-            callback_url=build_callback_url(host, port),
-            open_browser=args.open,
-        )
-    except ValueError as e:
-        print(f"Erreur : {e}", file=sys.stderr)
-        sys.exit(1)
+    if prepared.proxy_overrides is not None:
+        # Avant le premier `prepare` d'upstream (lifespan) : les upstreams
+        # inprocess importent alors leur module (donc appellent potentiellement
+        # make_opener()/ProxyHandler() dès le premier tool call) en partageant
+        # l'environnement de ce process — poser les overrides ici les couvre
+        # sans toucher InProcessUpstream.
+        apply_proxy_env_overrides_to_process(prepared.proxy_overrides)
 
     tool_map: dict[str, tuple[str, str]] = {}
     # Cache d'outils à côté du fichier de jetons : pas un secret, mais même
@@ -551,7 +539,7 @@ def main() -> None:
     )
     updater = None
     exit_request = ExitRequest()
-    if self_update:
+    if prepared.self_update:
         updater = SelfUpdater(
             UpdateConfig(
                 root=selfupdate.PROJECT_ROOT,
@@ -561,13 +549,26 @@ def main() -> None:
             ),
             in_flight,
             request_restart=exit_request,
+            exit_pending=lambda: exit_request.pending,
         )
     secrets = None
     if any(getattr(u, "volatile_key", None) for u in upstreams.values()):
-        secrets = VolatileSecrets(upstreams, catalog, port=port)
+        secrets = VolatileSecrets(upstreams, catalog, port=port, instance=identity.instance)
+    # Sans clef de config (lot AV) : `status` ne fait que lire, `restart` exige
+    # le superviseur. La référence est la config chargée plus haut.
+    lifecycle = Lifecycle(
+        identity,
+        ConfigWatch(options, launch_env, prepared),
+        in_flight,
+        request_exit=exit_request,
+        exit_pending=lambda: exit_request.pending,
+        restartable=restartable,
+        exit_code=RESTART_EXIT_CODE,
+        applying=updater.applying if updater is not None else None,
+    )
     app = build_app(
         mcp_server, upstreams, auth=auth, authorizers=authorizers, miaou_dist=miaou_dist,
-        updater=updater, catalog=catalog, secrets=secrets,
+        updater=updater, catalog=catalog, secrets=secrets, lifecycle=lifecycle,
     )
 
     if auth is not None:
@@ -603,7 +604,7 @@ def main() -> None:
         host=host,
         port=port,
         dev_auth_port=args.with_dev_auth,
-        issuer_url=dev_auth_url or f"http://127.0.0.1:{args.with_dev_auth}",
+        issuer_url=prepared.dev_auth_url or f"http://127.0.0.1:{args.with_dev_auth}",
         auto_approve=args.dev_auth_auto_approve,
         exit_request=exit_request,
     )

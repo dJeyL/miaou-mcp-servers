@@ -149,12 +149,20 @@ class VolatileSecrets:
     changement d'instance (instructions, extension Skills).
     """
 
-    def __init__(self, upstreams: dict[str, Any], catalog: Any = None, port: int | None = None) -> None:
+    def __init__(
+        self,
+        upstreams: dict[str, Any],
+        catalog: Any = None,
+        port: int | None = None,
+        instance: str | None = None,
+    ) -> None:
         self.upstreams = upstreams
         self.catalog = catalog
         self.port = port
         self.publish_surface: Callable[[], Awaitable[None]] | None = None
-        self.instance = _secrets.token_hex(8)
+        # L'identité du processus (`lifecycle.ProcessIdentity`), la même que
+        # celle de `miaou/lifecycle/status` ; tirée ici seulement à défaut.
+        self.instance = instance or _secrets.token_hex(8)
         self._salt = os.urandom(32)
         self._keys: dict[str, _Key] = {}
 
