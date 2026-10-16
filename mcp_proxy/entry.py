@@ -554,18 +554,21 @@ def main() -> None:
     secrets = None
     if any(getattr(u, "volatile_key", None) for u in upstreams.values()):
         secrets = VolatileSecrets(upstreams, catalog, port=port, instance=identity.instance)
-    # Sans clef de config (lot AV) : `status` ne fait que lire, `restart` exige
-    # le superviseur. La référence est la config chargée plus haut.
-    lifecycle = Lifecycle(
-        identity,
-        ConfigWatch(options, launch_env, prepared),
-        in_flight,
-        request_exit=exit_request,
-        exit_pending=lambda: exit_request.pending,
-        restartable=restartable,
-        exit_code=RESTART_EXIT_CODE,
-        applying=updater.applying if updater is not None else None,
-    )
+    # Clef `lifecycle`, true par défaut (lot AV) : `status` ne fait que lire,
+    # `restart` exige le superviseur. La référence est la config chargée plus
+    # haut. À false, ni méthode ni extension : le SIGUSR1 reste.
+    lifecycle = None
+    if prepared.lifecycle:
+        lifecycle = Lifecycle(
+            identity,
+            ConfigWatch(options, launch_env, prepared),
+            in_flight,
+            request_exit=exit_request,
+            exit_pending=lambda: exit_request.pending,
+            restartable=restartable,
+            exit_code=RESTART_EXIT_CODE,
+            applying=updater.applying if updater is not None else None,
+        )
     app = build_app(
         mcp_server, upstreams, auth=auth, authorizers=authorizers, miaou_dist=miaou_dist,
         updater=updater, catalog=catalog, secrets=secrets, lifecycle=lifecycle,

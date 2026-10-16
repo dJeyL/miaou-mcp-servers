@@ -557,7 +557,8 @@ lots — piège déjà payé côté MIAOU.
   `miaou/update/status` et la forme de son état — `state`, `target` à renvoyer,
   `update.kind` miaou/proxy/both, `served_build` —, `miaou/update/apply` vers le sha
   exact, `restart` faux pour MIAOU seul, refus `UPDATE_*` dans `error.data.code`),
-  l'extension `miaou/lifecycle` (lot AV : publiée toujours, sans garde d'origine,
+  l'extension `miaou/lifecycle` (lot AV : publiée par défaut, retirée par la clef
+  `lifecycle: false` — ni méthode ni déclaration —, sans garde d'origine,
   `status` relu à chaque appel — `instance` partagé avec les secrets, `restartable`,
   `config.state` unchanged/changed/invalid, chemins `mcpServers.<nom>` ou clef racine
   plafonnés à 20, ce qui compte comme changement —, `restart` et ses refus

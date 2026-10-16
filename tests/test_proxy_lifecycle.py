@@ -311,32 +311,61 @@ async def test_apply_is_refused_once_an_exit_is_pending(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# main() : extension toujours publiée, une seule identité de processus
+# main() : extension publiée par défaut, une seule identité de processus
 # ---------------------------------------------------------------------------
 
-def test_main_always_builds_the_extension_and_shares_the_instance(tmp_path, monkeypatch):
+def _main_build_app_kwargs(tmp_path, monkeypatch, extra: dict | None = None) -> dict:
     conf = _write(tmp_path / "config.json", {"port": 8765, "mcpServers": {
         "secret": {"type": "inprocess", "module": "volatile_fixture_server",
                    "config": {"password": {"volatile": "k"}}},
-    }})
+    }, **(extra or {})})
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["mcp_proxy", "--config", str(conf)])
     monkeypatch.setattr(entry, "enable_system_trust_store", lambda: None)
-    seen: dict = {}
+    seen: dict = {"conf": conf}
     real_build_app = entry.build_app
 
     def spy(*a, **kw):
         seen.update(kw)
+        seen["server"] = a[0]
         return real_build_app(*a, **kw)
 
     monkeypatch.setattr(entry, "build_app", spy)
     monkeypatch.setattr(entry, "serve_http", lambda *a, **kw: None)
     entry.main()
+    return seen
+
+
+def test_main_builds_the_extension_by_default_and_shares_the_instance(tmp_path, monkeypatch):
+    seen = _main_build_app_kwargs(tmp_path, monkeypatch)
+    conf = seen["conf"]
     lifecycle, secrets = seen["lifecycle"], seen["secrets"]
+    assert lc.EXTENSION_ID in seen["server"].extensions
     assert isinstance(lifecycle, lc.Lifecycle)
     assert secrets.instance == lifecycle.identity.instance
     assert lifecycle.exit_code == entry.RESTART_EXIT_CODE
     assert lifecycle.watch.options.config == (str(conf),)
+
+
+def test_main_without_the_lifecycle_key_publishes_nothing(tmp_path, monkeypatch):
+    """`lifecycle: false` : ni `Lifecycle`, ni extension déclarée, ni méthode ;
+    l'identité reste celle des secrets."""
+    seen = _main_build_app_kwargs(tmp_path, monkeypatch, {"lifecycle": False})
+    assert seen["lifecycle"] is None
+    server = seen["server"]
+    assert lc.EXTENSION_ID not in server.extensions
+    for method in (lc.STATUS_METHOD, lc.RESTART_METHOD):
+        with pytest.raises(MCPError) as info:
+            asyncio.run(_rpc(server, method, {}))
+        assert info.value.error.code == types.METHOD_NOT_FOUND
+    assert seen["secrets"].instance
+
+
+@pytest.mark.parametrize("value, expected", [(None, True), (True, True), (False, False)])
+def test_resolve_lifecycle(value, expected):
+    cfg = {} if value is None else {"lifecycle": value}
+    assert cw.resolve_lifecycle(cfg) is expected
+    assert cw.resolve_lifecycle({"lifecycle": None}) is True
 
 
 # ---------------------------------------------------------------------------

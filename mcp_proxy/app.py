@@ -64,8 +64,8 @@ def build_app(
     secret volatil : ni méthode, ni extension). L'extension n'est publiée que
     s'il reste un consommateur après le démarrage.
 
-    `lifecycle` : un `Lifecycle` (lot AV), que `main()` passe toujours ; None
-    (tests) : ni méthode, ni extension `miaou/lifecycle`.
+    `lifecycle` : un `Lifecycle` (lot AV), ou None (`lifecycle` à false, et
+    tests) : ni méthode, ni extension `miaou/lifecycle`.
     """
     from contextlib import asynccontextmanager
 

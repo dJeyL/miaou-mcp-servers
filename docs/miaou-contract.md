@@ -246,8 +246,11 @@ Tout refus laisse le proxy en marche et l'arbre dans son état d'avant (sauf le 
 ## Cycle de vie du proxy (extension `miaou/lifecycle`, lot AV)
 
 La config a-t-elle changé depuis le démarrage du proxy, et redémarrage à la demande.
-**Publiée toujours**, sans clef de config, **ère 2026-07-28 seulement** :
-`extensions["miaou/lifecycle"] = {}` dans `server/discover`. Deux méthodes JSON-RPC hors
+**Publiée par défaut**, retirée par la clef de config `"lifecycle": false` (méthodes et
+déclaration ensemble), **ère 2026-07-28 seulement** :
+`extensions["miaou/lifecycle"] = {}` dans `server/discover`. Un client traite un proxy
+qui ne la déclare pas comme un proxy antérieur à l'extension : ni état de config, ni
+redémarrage proposé. Deux méthodes JSON-RPC hors
 outils, absentes de `tools/list`. **Aucune garde d'origine** : MIAOU en `file://` s'en
 sert comme MIAOU servi sous `/app/` ; le bloc `auth`, quand il est posé, est la seule
 barrière (limite : toute page ouverte dans le navigateur peut demander un redémarrage).

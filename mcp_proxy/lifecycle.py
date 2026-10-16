@@ -5,9 +5,10 @@ Deux méthodes JSON-RPC hors outils, sur le patron de `miaou/self-update`
 (`updater.py`) : absentes de `tools/list`, invisibles du modèle. **Ne jamais en
 faire des outils.** Ère 2026-07-28 seulement pour la découverte.
 
-Publiée sans clef de config : `status` est en lecture seule, et `restart`
-n'est accepté que sous un superviseur qui relance sur `RESTART_EXIT_CODE`
-(`restartable`, la même condition que le SIGUSR1). **Aucune garde
+Publiée par défaut, retirée par la clef de config `lifecycle: false`
+(`configwatch.resolve_lifecycle`) : `status` est en lecture seule, et
+`restart` n'est accepté que sous un superviseur qui relance sur
+`RESTART_EXIT_CODE` (`restartable`, la même condition que le SIGUSR1). **Aucune garde
 d'origine** (décision AV-g, comme AT) : MIAOU ouvert en `file://` doit pouvoir
 s'en servir. Limite assumée : toute page ouverte dans le navigateur peut
 demander un redémarrage (CORS `*`) ; pas de fuite, mais des coupures et des

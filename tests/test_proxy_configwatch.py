@@ -263,7 +263,7 @@ def test_validation_logs_nothing_and_writes_nothing(chain, capsys):
 
 #: Inventaire des `except` de config de `main()` : lecture des couches
 #: (`read_layer`, `load_layers`), hôte et port, `miaou_dist`, `self_update`,
-#: auth entrante, `build_upstreams`, `build_upstream_authorizers`.
+#: `lifecycle`, auth entrante, `build_upstreams`, `build_upstream_authorizers`.
 INVALID_CONFIGS = {
     "json": '{"port": ',
     "not-an-object": "[1]",
@@ -273,6 +273,7 @@ INVALID_CONFIGS = {
     "miaou_dist-type": {"miaou_dist": 3},
     "miaou_dist-git": {"miaou_dist": "."},
     "self_update-type": {"self_update": "yes"},
+    "lifecycle-type": {"lifecycle": "false"},
     "auth-not-object": {"auth": "x"},
     "auth-no-issuer": {"auth": {"resource_url": "http://x/mcp"}},
     "inprocess-no-module": {"mcpServers": {"x": {"type": "inprocess"}}},

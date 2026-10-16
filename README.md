@@ -197,6 +197,7 @@ Le proxy accepte en plus :
 `type` absent → `stdio`. `port` est obligatoire, `host` optionnel.
 `miaou_dist` (clé racine, facultative) → le proxy sert MIAOU sous `/app/` (voir plus bas).
 `self_update` (clé racine, `false` par défaut) → le proxy propose à MIAOU de se mettre à jour (voir plus bas).
+`lifecycle` (clé racine, `true` par défaut) → le proxy dit à MIAOU si sa config a changé et accepte d'être redémarré par lui (voir plus bas) ; `false` pour un déploiement qui ne s'en sert pas (image Docker).
 `"disabled": true` sur une entrée → upstream ignoré au démarrage.
 L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'est plus celle qu'on écrit — dans ce fichier, un souligné en tête signale ailleurs (`_comment`) une clé ignorée, ce que cet interrupteur n'est justement pas. Le proxy le signale au démarrage, une ligne par bloc concerné, pour que la migration se voie plutôt que de traîner indéfiniment ; une config déjà en `disabled` ne dit rien.
 `env` sur une entrée inprocess → variables d'environnement injectées avant l'import.
@@ -318,6 +319,7 @@ pas le proxy. Détail : `docs/proxy.md`.
 Sous `supervise.sh`, MIAOU sait aussi redémarrer le proxy sans mise à jour, et le
 proxy lui dit si sa config a changé depuis son démarrage (et si elle redémarrerait :
 une config invalide refuse le redémarrage au lieu de laisser un proxy arrêté).
+`"lifecycle": false` retire les deux : MIAOU n'en parle plus.
 
 ### Mot de passe saisi dans MIAOU (secret volatil)
 

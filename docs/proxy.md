@@ -343,7 +343,11 @@ sans redirection.
 
 Le proxy dit si sa config a changé depuis son démarrage, et se redémarre à la demande
 d'un client (MIAOU), sous superviseur. Contrat sur le fil (méthodes, forme de l'état,
-refus) : `docs/miaou-contract.md`. **Publiée toujours**, sans clef de config ; aucune
+refus) : `docs/miaou-contract.md`. **Publiée par défaut** ; clef `lifecycle`
+(`configwatch.resolve_lifecycle`, booléen strict, absente ou `null` = `true`) : à `false`,
+`main()` ne construit pas le `Lifecycle`, donc ni méthode ni extension — pour un
+déploiement où la config ne bouge pas sur place et où rien ne relance le proxy
+(conteneur). Le SIGUSR1 n'en dépend pas, ni l'`instance` des secrets volatils. Aucune
 garde d'origine.
 
 **Empreinte** (`configwatch.py`). `LoadedConfig.merged` est la fusion des couches AVANT
@@ -357,7 +361,7 @@ chaîne par défaut relative au dossier courant) et relue dans un thread ; rien 
 `OSError` et `ValueError` deviennent `invalid` avec leur message.
 
 **Validation partagée.** `prepare_config(loaded, options)` est la suite de `main()` après
-la lecture des couches : hôte et port, `miaou_dist`, `self_update`, `--with-dev-auth`,
+la lecture des couches : hôte et port, `miaou_dist`, `self_update`, `lifecycle`, `--with-dev-auth`,
 auth entrante, `build_upstreams`, `build_upstream_authorizers`. `main()` l'appelle ; la
 validation la rejoue, avec les mêmes `LaunchOptions` (surcharges de la ligne de commande),
 et substitue les `${VAR}` contre l'environnement du démarrage, recopié en tête de

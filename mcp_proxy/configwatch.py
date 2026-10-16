@@ -58,6 +58,9 @@ from .layers import LoadedConfig, load_layers, resolve_chain, strip_comments
 from .logging import muted
 from .netproxy import compute_proxy_env_overrides
 from .updater import resolve_self_update
+
+#: Clef de config de l'extension `miaou/lifecycle` (lot AV) : true par défaut.
+LIFECYCLE_KEY = "lifecycle"
 from .webapp import resolve_miaou_dist
 
 UNCHANGED = "unchanged"
@@ -110,12 +113,28 @@ class Prepared:
     port: int
     miaou_dist: Path | None
     self_update: bool
+    lifecycle: bool
     auth: dict[str, Any] | None
     upstreams: dict[str, Any]
     authorizers: dict[str, Any]
     tokens_path: Path | str
     dev_auth_url: str | None
     proxy_overrides: dict[str, str | None] | None
+
+
+def resolve_lifecycle(cfg: dict[str, Any]) -> bool:
+    """La clef `lifecycle` : booléen, absente (ou null) = `true`. À false, le
+    proxy ne publie pas `miaou/lifecycle` : un déploiement qui ne relit ni ne
+    relance rien (conteneur) n'a rien à en dire, et MIAOU s'y comporte comme
+    devant un proxy antérieur à l'extension."""
+    value = cfg.get(LIFECYCLE_KEY, True)
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"'{LIFECYCLE_KEY}' doit être true ou false, reçu {type(value).__name__}."
+        )
+    return value
 
 
 def prepare_config(loaded: LoadedConfig, options: LaunchOptions) -> Prepared:
@@ -130,6 +149,7 @@ def prepare_config(loaded: LoadedConfig, options: LaunchOptions) -> Prepared:
         raise ValueError(f"'port' doit être un entier, reçu {cfg['port']!r}.") from None
     miaou_dist = resolve_miaou_dist(cfg, loaded.miaou_dist_base)
     self_update = resolve_self_update(cfg)
+    lifecycle = resolve_lifecycle(cfg)
 
     proxy_overrides = compute_proxy_env_overrides(options.proxy, options.noproxy)
     cli_auth = options.cli_auth
@@ -158,7 +178,7 @@ def prepare_config(loaded: LoadedConfig, options: LaunchOptions) -> Prepared:
     )
     return Prepared(
         loaded=loaded, cfg=cfg, host=host, port=port, miaou_dist=miaou_dist,
-        self_update=self_update, auth=auth, upstreams=upstreams,
+        self_update=self_update, lifecycle=lifecycle, auth=auth, upstreams=upstreams,
         authorizers=authorizers, tokens_path=tokens_path,
         dev_auth_url=dev_auth_url, proxy_overrides=proxy_overrides,
     )
