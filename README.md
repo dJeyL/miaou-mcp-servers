@@ -154,7 +154,10 @@ Tous les serveurs acceptent :
 Le proxy accepte en plus :
 
 ```
---config FICHIER            Chemin vers config.json (défaut: config.json)
+--config FICHIER            Fichier de configuration ; répétable, les suivants patchant
+                             les précédents. Remplace la chaîne par défaut :
+                             config.defaults.json → config.site.json → config.json,
+                             chacun lu s'il existe
 --proxy [http://]host:port  Force http_proxy/https_proxy (+ variantes majuscules) vus
                              par tous les serveurs servis, même si déjà définis dans
                              l'environnement ou config.json ("http://" ajouté si absent)
