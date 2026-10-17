@@ -170,9 +170,30 @@ class MiaouStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope: Any) -> Response:
         if path in ("", "."):
             path = MIAOU_HTML
-        elif any(part.startswith(".") for part in Path(path).parts):
+        elif self._is_hidden(path):
             return Response("Not Found", status_code=404)
         return await super().get_response(path, scope)
+
+    def _is_hidden(self, path: str) -> bool:
+        """Le chemin demandé désigne-t-il un fichier caché, ou un nom que le
+        système de fichiers traduit en autre chose que ce qu'on a lu ?
+
+        Trois filtres. Le chemin demandé lui-même (`.gitkeep`, `sub/.DS_Store`).
+        Tout `:`, qui n'a rien à faire dans un chemin de `dist/` : sous Windows
+        il ouvre un flux NTFS (`miaou.html::$DATA`) qui contourne les tests de
+        nom. Et le chemin RÉSOLU, relatif à la racine : `realpath` rend le nom
+        long sous Windows, si bien que le nom court 8.3 d'un fichier caché
+        (`GITKEE~1`) est jugé sur son vrai nom. Hors de la racine, la décision
+        revient à `StaticFiles`."""
+        if ":" in path or any(part.startswith(".") for part in Path(path).parts):
+            return True
+        root = os.path.realpath(self.directory)
+        resolved = os.path.realpath(os.path.join(root, path))
+        try:
+            relative = Path(resolved).relative_to(root)
+        except ValueError:
+            return False
+        return any(part.startswith(".") for part in relative.parts)
 
     def file_response(
         self,

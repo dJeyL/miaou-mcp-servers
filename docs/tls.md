@@ -12,7 +12,7 @@ disparaissent de `tools/list`.
 `enable_system_trust_store()` (`servers/mcp_base.py`) appelle
 `truststore.inject_into_ssl()`, qui **remplace la classe `ssl.SSLContext` elle-même**.
 C'est ce qui rend cet appel unique suffisant pour toute la sortie HTTPS du process,
-quelle que soit la bibliothèque : urllib (`make_opener()`, dans weather/ddg/brave/web)
+quelle que soit la bibliothèque : urllib (`make_opener()` de weather, openers de `mcp_web/netguard.py`)
 construit son contexte via `ssl.create_default_context()`, donc via la classe patchée.
 Depuis le SDK MCP 2.x, le client HTTP des upstreams `http` et du parcours OAuth est
 `httpx2`, qui **consulte de lui-même le magasin système** (`truststore.SSLContext` par
@@ -22,9 +22,9 @@ réécrit, et rien n'est passé explicitement à un client** — c'est la raison
 d'injection unique, et pourquoi il n'y a pas eu de migration `requests`→`httpx` ici : ce
 dépôt n'a jamais utilisé `requests`.
 
-Trois points d'appel, un par mode de lancement, et pas un de plus :
+Quatre points d'appel — un par mode de lancement, plus le second banc manuel — et pas un de plus :
 
-- **`MiaouMCPBase.main()`** — seul point traversé par les sept lancements standalone.
+- **`MiaouMCPBase.main()`** — seul point traversé par les cinq lancements standalone.
 - **`mcp_proxy.main()`**, en **tête**, avant `build_upstreams` (qui importe les modules de
   serveurs) et avant tout handshake TLS. L'ordre est contractuel : un contexte SSL déjà
   construit garde la classe d'origine et continue d'ignorer le magasin système.
@@ -36,6 +36,10 @@ Trois points d'appel, un par mode de lancement, et pas un de plus :
   toute évolution du helper d'origine est à répercuter dans cette copie. Sans elle, viser
   une URL `https://` sous AC interne échoue côté client seul, ce qui se lit à tort comme
   une panne du serveur.
+- **`tests/live_auth_probe.py`**, avant `asyncio.run`, pour la même raison et avec le
+  même statut : **seconde copie** du helper, à tenir alignée elle aussi.
+  (`tests/live_discovery_probe.py` n'en a pas : il rejoue la découverte OAuth avec
+  httpx2, qui consulte le magasin système de lui-même.)
 
 Le mode inprocess ne passe pas par `main()` des serveurs — d'où l'appel propre du proxy,
 qui couvre alors tout le process, upstreams inprocess compris.

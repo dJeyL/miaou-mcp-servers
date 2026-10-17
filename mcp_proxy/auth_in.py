@@ -7,6 +7,7 @@ de signature et d'audience (RFC 8707, non désactivable).
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from .contract import is_disabled
@@ -155,6 +156,10 @@ def _audience_matches(claim: Any, expected: str) -> bool:
     return any(isinstance(v, str) and v.rstrip("/") == wanted for v in values)
 
 
+_DISCOVERY_RETRY_DELAY_S = 10.0
+"""Délai avant de retenter la découverte du JWKS après un échec."""
+
+
 class JwtTokenVerifier:
     """TokenVerifier qui valide un JWT signé par l'AS déclaré, et surtout son
     AUDIENCE (RFC 8707).
@@ -185,6 +190,10 @@ class JwtTokenVerifier:
         self._configured_jwks_uri = jwks_uri
         self.required_scopes = required_scopes or []
         self._jwk_client: Any = None
+        # Échec de découverte mémorisé : sans lui, chaque requête portant
+        # un jeton relançait les `urlopen` bloquants tant que l'AS dormait.
+        self._discovery_retry_not_before = 0.0
+        self._discovery_error: Exception | None = None
 
     def _client(self) -> Any:
         """Construit (une fois) le PyJWKClient. Découvre le jwks_uri au premier
@@ -194,7 +203,16 @@ class JwtTokenVerifier:
         if self._jwk_client is None:
             from jwt import PyJWKClient
 
-            uri = self._configured_jwks_uri or _discover_jwks_uri(self.issuer_url)
+            if time.monotonic() < self._discovery_retry_not_before:
+                raise self._discovery_error  # type: ignore[misc]
+            try:
+                uri = self._configured_jwks_uri or _discover_jwks_uri(self.issuer_url)
+            except Exception as e:
+                self._discovery_error = e
+                self._discovery_retry_not_before = (
+                    time.monotonic() + _DISCOVERY_RETRY_DELAY_S
+                )
+                raise
             self._jwk_client = PyJWKClient(uri, cache_keys=True)
         return self._jwk_client
 

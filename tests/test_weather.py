@@ -309,3 +309,62 @@ async def test_get_weather_non_dict_json_returns_clear_string():
         result = await tm.call_tool("get_weather", {"city": "Paris"}, None)
     assert isinstance(result, str)
     assert "invalide" in result.lower()
+
+
+# --- Z9-3 .. Z9-5 : nom de ressource, lieu vide, assainissement ------------------------
+
+async def _extract_uri(city: str, **kw) -> str:
+    mock_resp = _make_mock_resp(_WTTR_SAMPLE)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": city, "extract": True, **kw}, None)
+    return str(result[1].resource.uri)
+
+
+@pytest.mark.asyncio
+async def test_extract_name_distinguishes_non_latin_locations():
+    a = await _extract_uri("\u65e5\u672c")
+    b = await _extract_uri("\u041c\u043e\u0441\u043a\u0432\u0430")
+    assert a != b
+    assert a.startswith("miaou://weather/weather-lieu-")
+    assert a.endswith("-20260628.json")
+
+
+@pytest.mark.asyncio
+async def test_extract_name_is_bounded_in_length():
+    uri = await _extract_uri("x" * 3000)
+    name = uri.rsplit("/", 1)[1]
+    assert len(name) <= 100
+    assert name.endswith("-20260628.json")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("city", ["", "   ", "\n"])
+async def test_blank_city_is_refused_without_request(city):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    with patch("urllib.request.OpenerDirector.open") as op:
+        tm = weather_server.mcp._tool_manager
+        with pytest.raises(ToolError):
+            await tm.call_tool("get_weather", {"city": city}, None)
+    op.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_location_is_percent_encoded_in_url_and_uri():
+    mock_resp = _make_mock_resp(_WTTR_SAMPLE)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp) as op:
+        tm = weather_server.mcp._tool_manager
+        result = await tm.call_tool("get_weather", {"city": "Paris/../x"}, None)
+    requested = op.call_args.args[0]
+    requested = requested if isinstance(requested, str) else requested.full_url
+    assert "/../" not in requested
+    uri = str(result.resource.uri)
+    assert "/../" not in uri
+
+    mock_resp = _make_mock_resp(_WTTR_SAMPLE)
+    with patch("urllib.request.OpenerDirector.open", return_value=mock_resp):
+        result = await tm.call_tool("get_weather", {"city": "a b#c?d"}, None)
+    uri = str(result.resource.uri)
+    assert uri.startswith("miaou://weather/")
+    assert not any(ch in uri.removeprefix("miaou://") for ch in " #?")

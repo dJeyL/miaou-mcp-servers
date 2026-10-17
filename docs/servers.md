@@ -32,10 +32,15 @@ ignorés.
 enregistrée) ; leur contenu est relu à chaque `skills/list`, `skills/get` et
 `resources/read`. Un fichier modifié est servi sans redémarrage ; un fichier AJOUTÉ ou
 SUPPRIMÉ en demande un. Une skill devenue invalide sur disque est omise de `skills/list`
-et rend `-32603` sur `skills/get` — c'est le sort d'une skill dont un fichier a été
-supprimé à chaud, même une annexe : la relecture de l'ensemble figé échoue sur le
-fichier disparu (`SkillError` « illisible »), et la skill entière disparaît avec lui,
-`SKILL.md` compris. Serveur seul, `resources/list` (celui du SDK, qui liste les
+(une ligne au journal par cause, pas une par requête) et rend `-32603` sur `skills/get` —
+c'est le sort d'une skill dont un fichier a été supprimé à chaud, même une annexe : la
+relecture de l'ensemble figé échoue sur le fichier disparu (`SkillError` « illisible »), et
+la skill entière disparaît du listage. Les fichiers de l'ensemble figé restent pourtant
+« servis » (`Skills.served_uris`) : lire le fichier disparu rend `-32603` « indisponible »,
+lire un autre fichier de la skill réussit. Un lien symbolique dont la cible résolue
+(`Path.resolve()`) sort du dossier de la skill fait échouer le démarrage (`SkillError` qui
+nomme le fichier : copier le fichier dans la skill ou retirer le lien) ; un lien qui reste
+dans le dossier est servi. Serveur seul, `resources/list` (celui du SDK, qui liste les
 ressources enregistrées) annonce pourtant toujours le fichier ; derrière le proxy, qui
 dérive `resources/list` des entrées, la skill en disparaît aussi.
 
@@ -84,9 +89,16 @@ Sert à exercer les différents chemins de traitement des résultats dans MIAOU 
 | `get_image()` | bloc `image` (PNG) | D8.1 : binaire → IDB → `<img>` dans l'UI, descripteur statique au modèle |
 | `get_json_resource()` | `EmbeddedResource` texte JSON | D8.2 : resource inline → IDB → chip `resource_stored`, texte brut + descripteur au modèle |
 
-Les outils ont un `asyncio.sleep(2)` intentionnel pour simuler la latence réseau et
-vérifier que le patienteur animé et les acks MCP (`mcp_call`) s'affichent correctement
-pendant le round-trip.
+Les six outils autres que `sleep` ont un `asyncio.sleep(2)` intentionnel pour simuler
+la latence réseau et vérifier que le patienteur animé et les acks MCP (`mcp_call`)
+s'affichent correctement pendant le round-trip.
+
+`dns_lookup` et `reverse_dns` rendent toute entrée irrésoluble en texte « Échec de
+résolution… » et non en erreur nue : outre `OSError`, un label idna de plus de 63
+caractères lève `UnicodeError` et un octet NUL dans `gethostbyaddr` un `TypeError`, que
+le SDK 2.x rendrait en « Error executing tool » sans motif. `dns_lookup` refuse en outre
+tout nom contenant un NUL sans le résoudre : certains OS résolvent le préfixe avant le
+NUL, et le texte rendu citerait un nom qui n'est pas celui résolu.
 
 `sleep(seconds)` sert le même objectif mais sur une durée **choisie par l'appelant**,
 pour les cas que 2 secondes en dur n'atteignent pas (timeout client, patienteur sur une
@@ -168,7 +180,12 @@ comportement est celui d'avant leur ajout, à l'octet près.
 Le nom de la ressource est `weather-<lieu slugifié>-<yyyymmdd>.json`. Le slug passe le
 lieu en ASCII minuscule à tirets (`Saint-Étienne,France` → `saint-etienne-france`) —
 sans ça accents, espaces et virgule se retrouveraient dans un nom de fichier côté
-client. La date est celle du premier jour du bulletin (`weather[0].date`) quand elle
+client. Il est tronqué à 60 caractères, et un lieu sans aucun caractère ASCII (`日本`,
+`Москва`) prend `lieu-<8 hex>` (condensé SHA-256 du lieu) : un simple `lieu` donnerait le
+même nom à deux villes le même jour. Le lieu est encodé en pourcentage (seule la virgule
+reste lisible) dans l'URL wttr.in comme dans l'URI de la ressource non-extract, et un
+`city` vide ou blanc est refusé (`ToolError`) : wttr.in répondrait pour le lieu déduit de
+l'IP du serveur, présenté comme une météo demandée. La date est celle du premier jour du bulletin (`weather[0].date`) quand elle
 est au format attendu, sinon la date locale du serveur : un nom de ressource ne doit
 pas dépendre de la bonne volonté du champ renvoyé par wttr.in.
 
@@ -188,12 +205,13 @@ distinctes — serveur, cache disque, extraction de structure) :
 servers/mcp_web/
 ├── __init__.py    # serveur MCP (MCPServer) + définition des outils (fetch_url/fetch_read/fetch_list/fetch_resource)
 ├── __main__.py    # point d'entrée `python -m mcp_web` / `uv run servers/mcp_web`
-├── cache.py        # cache disque par checksum d'URL (texte, HTML brut, structure JSON)
-├── pagemeta.py     # `_meta` de fetch_url : en-tête de page, favicon validée, cache par origine
+├── cache.py        # cache disque par checksum d'URL (texte, HTML brut, structure JSON, alias d'URL finale)
+├── pagemeta.py     # `_meta` de fetch_url : en-tête de page, favicon validée, cache par origine, filtre de `canonical_url`
+├── netguard.py     # openers http(s) seulement ; la sonde de favicon refuse IP/localhost à chaque saut
 ├── structure.py    # extraction stdlib (html.parser) des headings/liens, sans dépendance tierce
 └── search/         # recherche multi-moteurs (search, image_search) — section « Recherche » plus bas
     ├── __init__.py # config `search`, build_chain, SearchChain (repli, pauses, budget)
-    ├── common.py   # EngineFailure, http_read, clean_snippet, resolve_api_key, constantes de pause
+    ├── common.py   # EngineFailure, http_read, clean_snippet, is_result_url, resolve_api_key, constantes de pause
     ├── brave.py    # Brave Search (clef ; web et images)
     ├── ollama.py   # recherche web d'Ollama (clef ; web)
     └── ddg.py      # DuckDuckGo HTML (sans clef ; web), espacement et défi anti-bot, ENGINE unique
@@ -211,8 +229,11 @@ démarrage le signale. `fetch_url(url, max_bytes=5242880)` branch sur le `Conten
 | `text/*` | texte brut | `TextResourceContents` avec le vrai mime |
 | tout le reste | base64 | `BlobResourceContents` |
 
-Taille *téléchargée* bornée à `max_bytes` (défaut 5 Mo), troncature notée dans le texte.
-Erreurs réseau retournées comme chaînes (pas de stack trace). Une `HTTPError` est
+Taille *utile* bornée à `max_bytes` (défaut 5 Mo), **décompression comprise** (ci-dessous),
+troncature notée dans le texte. Erreurs réseau retournées comme chaînes (pas de stack
+trace) ; une URL qu'`urlsplit` refuse (`http://[::1`) rend « URL invalide », et un charset
+annoncé par le serveur que Python ne sait pas lire comme un charset (`idna`, `punycode` :
+`UnicodeError`, pas `LookupError`) retombe sur UTF-8 (`_decode`). Une `HTTPError` est
 **fermée** avant d'être convertie (`_guarded_fetch`) : elle EST la réponse, socket
 comprise, qui restait sinon ouverte jusqu'au GC — cyclique le plus souvent, l'exception
 ayant traversé `to_thread`. Les tests la fermaient eux-mêmes, ce qui masquait le défaut.
@@ -230,19 +251,37 @@ non géré (`br`, `zstd`) rend le corps **inchangé**, soit ce qui partait avant
 couvert ne doit pas faire échouer un fetch qui aboutissait. `zlib` est stdlib : rien à
 ajouter à `requirements.txt` ni à `[project.dependencies]`.
 
-Deux conséquences sur les bornes, qui tiennent au fait que le cap mord sur les octets
-**compressés** :
+**Le plafond porte sur ce qu'on rend, décompression comprise.** Le serveur
+impose lui-même son encodage : un gzip de quelques Mo se décompresse en gigaoctets (mesuré :
+200 Mo de zéros = 194 Ko compressés, ratio ~1000:1, soit ~5 Go pour le plafond de 5 Mo). Le
+paramètre `max_bytes` de `fetch_url` et de `fetch_resource` compte donc les **octets utiles
+reçus**, après décompression. `_decompress` vide le flux par morceaux bornés
+(`decompressobj.decompress(données, max_length)`, `_inflate`) et ne tient jamais plus de
+`max_bytes + 1` octets décompressés ; la lecture du flux compressé est elle-même bornée à
+`max_bytes + _INFLATE_SLACK` (1 Ko : un gzip d'un contenu peu compressible dépasse un peu sa
+taille). La troncature est annoncée exactement comme pour un corps non compressé (« [Tronqué
+à N octets] » pour `fetch_url`, « Tronqué à N octets. » dans le descripteur de
+`fetch_resource`), qu'elle vienne du plafond décompressé ou d'un flux compressé coupé. Un
+contenu d'exactement `max_bytes` octets n'est pas tronqué.
 
-- La troncature se décide dans `_fetch_bytes`, sur les octets tels qu'ils arrivent du
-  réseau, et **jamais en aval** : après décompression le corps est légitimement plus gros
-  que `max_bytes` sans avoir rien perdu, si bien qu'un `len(corps) > max_bytes` calculé
-  plus loin annoncerait une troncature qui n'a pas eu lieu. `_guarded_fetch` relaie
-  désormais le flag au lieu de le calculer, et son corps rendu peut dépasser `max_bytes`.
+Deux autres points tiennent à la nature du flux :
+
+- La troncature se décide dans `_fetch_bytes`, sur ce que le corps contient réellement, et
+  **jamais en aval** : `_guarded_fetch` relaie le flag au lieu de le calculer.
 - Un flux gzip coupé au milieu ne se décompresse pas intégralement, d'où
   `zlib.decompressobj()` (qui rend ce qu'il a pu lire) plutôt que `gzip.decompress()` (qui
   lèverait sur la fin absente) : une page tronquée reste lisible jusqu'à sa coupure.
 
-`max_bytes` borne donc le **transfert**, pas ce qui atteint le modèle : côté texte c'est
+**Redirections : http/https seulement.** `urllib.request.build_opener` embarque FTP,
+fichier et `data:`, et son gestionnaire de redirection suit `ftp://` : une page http qui
+redirigeait vers `ftp://hôte-interne/…` faisait ouvrir une connexion FTP depuis le serveur
+(mesuré sur un serveur loopback). `netguard.web_opener()` — `ProxyHandler()` sans argument
+comme `make_opener`, donc `no_proxy` respecté, mais ni FTP ni fichier ni data — et son
+`SchemeRedirectHandler` refusent toute redirection hors http/https (« redirection vers un
+schéma non autorisé »). **L'adresse, elle, n'est pas restreinte** : joindre `127.0.0.1` ou un
+nom d'intranet sur ordre du modèle est un usage légitime d'un banc d'essai.
+
+`max_bytes` ne dit donc rien de ce qui atteint le modèle côté texte : c'est
 `MIAOU_WEB_READ_CAP` qui plafonne la sortie (paragraphe suivant), et `fetch_read` qui
 pagine au-delà.
 
@@ -250,10 +289,26 @@ Le texte produit (HTML converti ou `text/*`) est en plus plafonné en sortie à
 `MIAOU_WEB_READ_CAP` caractères (défaut 20000, cf. `servers/mcp_web/cache.py`) — une page
 HTML de plusieurs Mo convertie par html2text peut sinon saturer la fenêtre de contexte de
 l'appelant malgré `max_bytes`. Le texte complet (et le HTML brut, si `text/html`) est écrit
-sur disque (`servers/mcp_web/cache.py`), clé = SHA256 de l'URL — pas de session_id ni de
+sur disque (`servers/mcp_web/cache.py`), clé = SHA256 de l'URL demandée — pas de session_id ni de
 contrat REF_UNKNOWN comme mcp_docs : ce cache est indépendant de toute conversation MIAOU,
 une URL déjà récupérée reste paginable même depuis un autre client. Sweep TTL opportuniste
 (`MIAOU_WEB_CACHE_TTL_H`, défaut 24h), même pattern que le TTL de session de `mcp_docs`.
+Le sweep (`sweep_expired`) ne supprime **que** les noms que le module écrit —
+`<sha256 en 64 hexa>.(txt|html|json|alias)` — jamais un autre fichier : `MIAOU_WEB_WORKDIR`
+est libre et peut pointer un dossier qui n'est pas le nôtre (mesuré : un `notes.txt`
+de 25 h y disparaissait au premier outil).
+
+**Alias d'URL finale.** MIAOU cite `canonical_url`, l'URL finale après
+redirections ; le modèle peut rappeler `fetch_read(<finale>)`, alors que le cache est rangé
+sous l'URL demandée. `fetch_url` pose donc, sous la clé de l'URL finale, un petit fichier
+`<hash>.alias` qui contient l'URL demandée (`store_alias`), et `fetch_read`/`fetch_list`
+passent par `resolve` : une entrée propre de l'URL l'emporte sur son alias, sinon la cible
+de l'alias est lue (et l'alias rafraîchi comme les trois autres fichiers). Reproduit avant
+correctif : `CacheMiss` sur l'URL finale. Limites assumées : un alias est écrasé par le
+fetch suivant qui aboutit à la même URL finale par un autre chemin (le dernier gagne) ; si
+l'URL demandée est re-fetchée et mène ailleurs, l'alias ancien désigne alors son nouveau
+contenu ; un alias dont la cible a expiré ou a été purgée (re-fetch binaire) ne résout plus.
+Pas de plafond de volume du cache (reporté : borné par le TTL).
 
 `fetch_read(url, char_start=0, char_end=None)` relit le texte déjà mis en cache sans
 retélécharger, pour paginer au-delà du cap (offset caractère uniquement, pas de mode ligne —
@@ -275,7 +330,7 @@ outil poser le `_meta` de son résultat — et y range, sous la clé `miaou/web`
 |---|---|---|
 | `title` | `<title>` de l'en-tête, sinon `og:title` | HTML |
 | `site_name` | `og:site_name` | HTML |
-| `canonical_url` | URL finale après les redirections suivies par urllib (`geturl()`), http(s) seulement | tout succès |
+| `canonical_url` | URL finale après les redirections suivies par urllib (`geturl()`), http(s) seulement, **omise si le client la rejetterait** (voir ci-dessous) | tout succès |
 | `favicon` | data-URL base64, type reconnu aux octets | HTML, si trouvée et sous le plafond |
 
 Tous facultatifs, clé absente plutôt que vide ; aucun `_meta` sur un résultat d'erreur.
@@ -283,7 +338,19 @@ Rien de tout cela n'entre dans `content` : le modèle cite une URL et n'a pas be
 titre, et les octets d'une favicon y seraient payés à chaque tour. Préfixe `miaou/` pour
 la même raison que `miaou/unauthorized_upstreams` côté proxy (`_meta` est un espace
 partagé). `canonical_url` n'est PAS le `<link rel="canonical">` de la page : c'est l'adresse
-réellement atteinte, ce qui répond à « où ai-je lu ça ? » sans croire la page sur parole.
+réellement atteinte, ce qui répond à « où ai-je lu ça ? » sans croire la page sur parole
+(ni `<link rel=canonical>` ni `og:url` ne sont lus : verrouillé par
+`test_canonical_url_is_the_final_url_never_the_pages_own_claim`).
+
+**Grammaire client de `canonical_url`.** MIAOU garde la clef si elle fait au plus 2048
+unités UTF-16 et vérifie `/^https?:\/\/[^\s]+$/i` (`webMetaFromResult`, `src/js/utils.js`),
+et ne pose la note `[web_ref:URL]` que si l'URL tient dans
+`/\[web_ref:(https?:\/\/[^\s\]]+)\]/` (`WEB_REF_MARKER_RE`) : ni blanc ni `]`. Le serveur
+applique la même règle (`client_accepts_canonical_url`, `pagemeta.py`) : au-delà de 2048
+unités UTF-16, ou avec un caractère <= 0x20, un blanc Unicode (`\s` de JS : NBSP, U+2028,
+U+FEFF…) ou `]`, `canonical_url` est **omis** du `_meta` (les autres champs restent). Le
+client retombe alors sur l'URL demandée pour sa note de source, comme il le faisait en
+écartant la clef.
 
 L'en-tête est lu par `html.parser` (stdlib) sur le HTML coupé à `</head>` ou au premier
 `<body>` (et à 256 Ko) : un `<title>` de `<svg>` dans le corps n'est jamais pris pour celui
@@ -299,6 +366,22 @@ toute circonstance (il porte du script). Plafond : data-URL de 16 384 caractère
 (`FAVICON_MAX_CHARS`) ; au-delà, absente. Le téléchargement, lui, est borné plus large
 (`FAVICON_DOWNLOAD_MAX`, 64 Ko) : un ICO multi-résolution dépasse souvent le plafond
 AVANT réduction.
+
+**La sonde refuse les adresses internes.** Un `<link rel=icon>` d'une page non
+fiable déclenchait un GET vers `http://127.0.0.1:…/admin`, `169.254.169.254` ou le proxy
+lui-même, à l'insu du modèle (mesuré : les trois URL étaient demandées). La sonde
+(`_probe_bytes`, opener `netguard.favicon_opener()`) refuse donc toute URL dont l'hôte est
+une **adresse IP** — toute forme que la pile réseau lit comme telle, pas seulement celles
+d'`ipaddress` : `127.1`, `2130706433`, `0x7f.0.0.1`, `017700000001` (formes `inet_aton`),
+IPv6 entre crochets dont `[::ffff:127.0.0.1]`, chiffres pleine chasse et points
+idéographiques que l'IDNA ramène à de l'ASCII — ainsi que `localhost` et `*.localhost`
+(RFC 6761), casse et point final ignorés. Le test est syntaxique et ne dépend pas de la libc
+(`is_forbidden_probe_host` : étiquettes toutes numériques, plus `socket.inet_aton` en
+renfort) ; aucun `getaddrinfo`, parce qu'en entreprise les noms Internet ne se résolvent pas
+forcément. La règle s'applique à l'URL candidate ET à **chaque saut de redirection**
+(`ProbeRedirectHandler`). Conséquence : une page servie par une adresse IP (banc local) n'a
+jamais de favicon. **Trou résiduel ACCEPTÉ** : un *nom* qui résout vers une adresse interne
+(nom d'intranet, `*.nip.io`…) passe. `fetch_url` lui-même n'est pas restreint.
 
 **Réduction d'un ICO (`shrink_ico`).** Un ICO porte souvent plusieurs images (16, 32,
 48 px…) : on n'en garde qu'une, la plus petite d'au moins `FAVICON_TARGET_PX` (32 px, soit
@@ -318,7 +401,11 @@ non réduit, 10 030. Toute erreur rend une favicon absente, jamais un `fetch_url
 La sonde tourne **pendant** la conversion html2text (`asyncio.gather`), et son résultat est
 gardé en mémoire **par origine** (`favicon_cache`, 256 origines, durée de vie
 `MIAOU_WEB_CACHE_TTL_H`), échec compris : lire dix pages d'un site ne sonde qu'une fois, et
-un site sans favicon valide ne coûte pas trois requêtes à chaque page.
+un site sans favicon valide ne coûte pas trois requêtes à chaque page. Un échec
+**transitoire** (timeout, erreur réseau, 5xx, 408, 429 sur un candidat, `probe_favicon`) n'est
+gardé que `FAVICON_FAILURE_TTL_S` (5 min) : il ne fige pas « pas de favicon » pour 24 h ; un
+échec définitif (404, corps qui n'est pas une image, trop gros, hôte refusé) garde la durée
+entière. Un `href` d'icône que `urljoin` refuse (`http://[::1`) écarte ce seul candidat.
 
 Effet de bord du retour `CallToolResult` : `fetch_url` ne publie plus d'`outputSchema`, et
 son résultat plus de `structuredContent` — lequel recopiait le contenu entier sur le fil,
@@ -351,8 +438,8 @@ encodé en binaire (`.blob`), même pour du texte ou du JSON — pour rester exp
 client (réinjection vers `docs__*` via `content_b64`, ou `js__eval`) plutôt que lu inline.
 Fetch autonome : ne requiert pas de `fetch_url` préalable, et ne lit ni n'écrit le cache
 `mcp_web` (qui ne contient que du texte rendu, pas les octets bruts) — chaque appel
-re-télécharge. Téléchargement borné à `max_bytes` (défaut 5 Mo, `MIAOU_WEB_RESOURCE_MAX_BYTES`),
-troncature notée dans le descripteur. Erreurs réseau et schéma non http/https retournés comme
+re-télécharge. Borné à `max_bytes` octets utiles, décompression comprise (défaut 5 Mo,
+`MIAOU_WEB_RESOURCE_MAX_BYTES`), troncature notée dans le descripteur. Erreurs réseau et schéma non http/https retournés comme
 chaînes (un seul bloc `text`), pas de stack trace. Le descripteur ne contient ni timestamp ni
 id (stabilité KV-cache) ; l'id `res_…` est généré par le client, pas par le serveur. Le
 paramètre transverse `miaou_intent` (breadcrumb rédigé par le modèle) n'est **pas** déclaré :
@@ -372,7 +459,8 @@ Variables d'environnement (toutes optionnelles, défauts constants) :
 
 ### Recherche (`search`, `image_search`)
 
-Ces deux outils remplacent `mcp_ddg` et `mcp_brave`, dépréciés. Un seul outil par
+Ces deux outils ont remplacé les serveurs `mcp_ddg` et `mcp_brave` (supprimés le
+2026-10-17). Un seul outil par
 type de recherche, qui choisit lui-même son moteur : `search` essaie les moteurs dans
 l'ordre configuré et s'arrête au premier qui **répond**. `image_search` fait de même
 parmi les moteurs qui savent chercher des images (aujourd'hui Brave seul).
@@ -380,15 +468,15 @@ parmi les moteurs qui savent chercher des images (aujourd'hui Brave seul).
 **Config.** Bloc `config` de l'entrée `web` de `config.json`, clé `search` :
 `order` (défaut `["brave", "ollama", "ddg"]`), et un bloc par moteur à clef
 (`brave.api_key`, `ollama.api_key`, sinon `BRAVE_API_KEY` / `OLLAMA_API_KEY`). Le
-bloc prime sur l'environnement pour la même raison que `mcp_brave` : plusieurs
-entrées `web` peuvent porter des clefs différentes (`build(config)`, une instance par
+bloc prime sur l'environnement parce que `os.environ` est partagé par tout le
+processus : plusieurs entrées `web` peuvent porter des clefs différentes (`build(config)`, une instance par
 entrée). Règles de `build_chain` :
 
 - un moteur absent de `order` est désactivé ; `order: []` ou `"search": false`
   coupe la recherche (`"search": true` vaut l'absence de la clé) ;
 - un moteur à clef sans clef est écarté, avec une ligne au démarrage ;
 - si `order` cite des moteurs et qu'**aucun** n'est utilisable, la construction
-  lève `SearchConfigError`, comme `mcp_brave` sans clef. Le proxy écarte alors
+  lève `SearchConfigError` (pas d'outil sans config fonctionnelle). Le proxy écarte alors
   l'upstream entier, outils `fetch_*` compris, avec la cause sur sa ligne
   « unavailable » ;
 - un nom inconnu ou répété lève aussi `SearchConfigError` : une faute de frappe qui
@@ -443,7 +531,13 @@ entités, et coupe à `SNIPPET_MAX_CHARS` (400) avec « … ». C'est surtout po
 dont `content` est du contenu de page (« des milliers de tokens » selon sa doc). Sans
 cette coupe, le coût en tokens d'un appel dépendrait du moteur qui a répondu.
 `max_results` est ramené dans [1, `MAX_RESULTS`] = [1, 10] pour tous les moteurs
-(l'API Ollama plafonne d'ailleurs à 10).
+(l'API Ollama plafonne d'ailleurs à 10). Les URL de résultat passent par
+`common.is_result_url` : chaîne non vide, schéma absent ou http/https — un
+`javascript:`, `data:` ou `file:`, un entier ou un objet sont écartés (pour les images,
+`image_url` invalide écarte le résultat, `page_url`/`thumbnail_url` invalides deviennent
+`""`). Un lien SANS schéma passe volontairement : les liens de redirection de DuckDuckGo
+ont la forme `//duckduckgo.com/l/?uddg=…` (de mémoire, non remesuré faute d'appel réseau
+autorisé) et un filtre « http(s) seulement » viderait ce moteur.
 
 **Pauses d'un appel à l'autre.** Selon sa cause, un échec met le moteur en pause
 (`down_until`, `down_reason`). Pendant la pause, le moteur est sauté sans requête et
@@ -466,8 +560,7 @@ absente. **Brave** répond **422**, pas 401, avec
 `{"error": {"code": "SUBSCRIPTION_TOKEN_INVALID", "meta": {"component":
 "authentication"}}}`. Comme Brave sert aussi le 422 pour des paramètres invalides,
 seul le composant `authentication` désigne la clef. Le corps de l'erreur est lu (au
-plus 4 Ko) avant la fermeture de la `HTTPError`. NB : `mcp_brave`, déprécié, n'a
-jamais vu ce 422 et rend « HTTP 422 » nu sur une clef invalide.
+plus 4 Ko) avant la fermeture de la `HTTPError`.
 
 **Budget de temps.** Un appel `search` dispose de `SEARCH_BUDGET_S` (25 s) pour toute
 la chaîne : il faut rester sous les 30 s de timeout MIAOU→MCP suggérés par défaut. Or
@@ -477,17 +570,28 @@ raboté d'autant (`min(ENGINE_TIMEOUT_S, restant)`), et en dessous de 2 s il n'e
 même pas tenté. Le timeout urllib porte sur chaque opération socket : c'est une
 marge, pas une garantie.
 
-**Moteur DDG.** C'est le code de `mcp_ddg` repris tel quel (parser, défi
-`anomaly-modal`, espacement `_MIN_INTERVAL_S` / `_MAX_WAIT_S`), avec deux différences.
-D'abord, l'attente du créneau est aussi bornée par le budget restant : un appel
-arrivé en fin de chaîne refuse sans requête s'il ne reste pas `_MIN_FETCH_S` (3 s) de
-requête après l'attente. Ensuite, l'état (créneau, pause) est celui de l'**adresse
-IP** : un seul `ddg.ENGINE` par processus, partagé par toutes les instances de
-`mcp_web`. Il ne l'est **pas** avec `mcp_ddg`. Si les deux tournent, DuckDuckGo
-reçoit deux flux espacés chacun de son côté, d'où l'avertissement de `mcp_ddg` au
-démarrage. Le parser est dupliqué plutôt qu'importé : importer `mcp_ddg` construirait
-son serveur, et `mcp_ddg` ne peut pas importer `mcp_web` (html2text absent de son
-bloc PEP 723). La copie disparaîtra avec `mcp_ddg`.
+**Moteur DDG.** POST sur l'endpoint HTML de DuckDuckGo (`html.duckduckgo.com/html/`),
+parsing stdlib (classes `result__a` / `result__snippet`) : fragile si DDG change son
+markup. L'autre mode de panne, plus fréquent : DDG remplace les résultats par un défi
+anti-bot (HTTP 202, captcha « select the ducks », formulaire vers `anomaly.js?cc=botnet`)
+dès qu'une IP sortante enchaîne quelques requêtes — mesuré le 2026-10-05, curl compris,
+après une poignée d'appels en quelques minutes. Le blocage a duré 2 h 15 à 2 h 30 (sonde
+d'une requête par quart d'heure, qui ne l'a ni prolongé ni relancé une fois levé) ; seuil
+et durée pour une autre IP inconnus. Sans garde, le parser n'y trouve aucun `result__a`
+et rend `[]`, indiscernable d'une recherche vide : la page est reconnue à sa classe
+`anomaly-modal` (seulement quand aucun résultat n'a été extrait) et le moteur échoue en
+`EngineFailure` avec sa pause. Le défi n'est pas contourné.
+
+Pour ne pas le déclencher soi-même, les requêtes sortantes sont espacées d'au moins
+`_MIN_INTERVAL_S` (15 s) : un appel attend son créneau, réservé sans verrou (aucun
+`await` entre lecture et écriture du créneau), et refuse sans requête si l'attente
+dépasserait `_MAX_WAIT_S` (15 s) ou si, après l'attente, il ne reste pas `_MIN_FETCH_S`
+(3 s) de budget pour la requête. Attendre plutôt que refuser d'emblée : un refus pousse le
+modèle à relancer aussitôt. Valeurs calibrées à l'aveugle, le seuil de DDG n'ayant pas été
+mesuré (chaque essai coûte deux heures de blocage). L'état (créneau, pause) est celui de
+l'**adresse IP** : un seul `ddg.ENGINE` par processus, partagé par toutes les instances de
+`mcp_web` ; plusieurs processus derrière la même IP de sortie (collègues sur le même
+réseau) ne se coordonnent pas, seul un proxy partagé les couvre.
 
 **Ajouter un moteur** (ddgs, envisagé entre Ollama et DDG) : un module dans
 `search/` avec `name`, `kinds`, `down_until`/`down_reason` et
@@ -496,82 +600,6 @@ bloc PEP 723). La copie disparaîtra avec `mcp_ddg`.
 `_KEYED` s'il prend une clef. Pour ddgs en particulier, avant de l'intégrer : son
 backend `duckduckgo` frappe le même DDG hors de notre espacement, et `primp` a sa
 propre pile TLS, a priori hors de portée de `truststore` (non mesuré).
-
-## `servers/mcp_ddg.py` — recherche DuckDuckGo (port 8769)
-
-> **Déprécié** : remplacé par `search` de `mcp_web` (moteur `ddg`, mêmes protections),
-> `disabled: true` dans `config.defaults.json`. Il imprime un avertissement à chaque
-> démarrage (`build()`, qui rend le singleton, et le lancement standalone). Actif à
-> côté de `mcp_web`, il ne partage pas son espacement vers DuckDuckGo.
-
-Un seul outil `ddg_search(query, max_results=5)`. POST sur l'endpoint HTML de DDG
-(`html.duckduckgo.com/html/`), parsing stdlib uniquement (classes `result__a` /
-`result__snippet`). Renvoie `TextResourceContents` `application/json` — tableau
-`[{title, url, snippet}]`. Fragile si DDG change son markup.
-
-L'autre mode de panne, plus fréquent que le markup : DDG remplace les résultats
-par un défi anti-bot (HTTP 202, captcha « select the ducks », formulaire vers
-`anomaly.js?cc=botnet`) dès qu'une IP sortante enchaîne quelques requêtes —
-mesuré le 2026-10-05, curl compris, après une poignée d'appels en quelques
-minutes. Le blocage a duré 2 h 15 à 2 h 30 (sonde d'une requête par quart
-d'heure, qui ne l'a ni prolongé indéfiniment ni relancé une fois levé) ; seuil
-et durée pour une autre IP inconnus. Le parser n'y trouvait aucun `result__a` et
-l'outil rendait `[]`, indiscernable d'une recherche vide. La page est reconnue à
-sa classe `anomaly-modal` (seulement quand aucun résultat n'a été extrait) et
-l'outil rend un message explicite à la place. Le défi n'est pas contourné : la
-seule issue est d'attendre, ou de passer par un autre moteur (`search` de `mcp_web`).
-
-Pour ne pas le déclencher soi-même, les requêtes sortantes d'un processus sont
-espacées d'au moins `_MIN_INTERVAL_S` (15 s) : un appel attend son créneau,
-réservé sans verrou (aucun `await` entre lecture et écriture de `_next_slot`),
-et il est refusé sans requête si l'attente dépasserait `_MAX_WAIT_S` (15 s).
-Plafond imposé par le timeout MIAOU→MCP suggéré par défaut, 30 s, à ne pas
-atteindre : `_MAX_WAIT_S + _FETCH_TIMEOUT_S` doit rester en dessous (test
-dédié). Attendre plutôt que refuser d'emblée : un refus pousse le modèle à
-relancer aussitôt. Les valeurs sont calibrées à l'aveugle, le seuil de DDG
-n'ayant pas été mesuré (chaque essai coûte deux heures de blocage). L'espacement
-ne protège qu'un processus : plusieurs instances derrière la même IP de sortie
-(collègues sur le même réseau) ne se coordonnent pas, seul un proxy partagé les
-couvre.
-
-## `servers/mcp_brave.py` — recherche Brave Search (port 8770)
-
-> **Déprécié** : remplacé par `search` / `image_search` de `mcp_web` (moteur `brave`),
-> `disabled: true` dans `config.defaults.json`. Il imprime un avertissement à chaque
-> démarrage (`build()` et le lancement standalone).
-
-Deux outils. Requièrent une clef d'API, résolue par `resolve_api_key()` dans cet
-ordre : clé `api_key` du bloc `config` de l'entrée `config.json` (mode inprocess),
-sinon `BRAVE_API_KEY` dans l'environnement. Le bloc `config` prime pour permettre
-plusieurs entrées du même module avec des clefs différentes — `os.environ` est
-partagé par tout le process et ne peut pas les distinguer (cf. pattern
-`build(config)`). Une clef vide ou blanche compte comme absente.
-
-**Refus d'initialisation sans clef.** Le serveur ne s'initialise pas sans clef,
-plutôt que d'exposer deux outils qui échoueraient à chaque appel : `build(config)`
-lève `MissingAPIKeyError`, et le lancement standalone sort en code 1 avec un message
-clair. Côté proxy, l'upstream est signalé au démarrage puis **retiré de la table de
-routage** — les autres serveurs démarrent normalement et `tools/list` ne contient
-alors aucun outil `brave__*`. Le singleton `server`/`mcp` du module reste construit
-sans clef (`require_api_key=False`) : `import mcp_brave` doit rester possible sans
-clef, sinon un simple import casserait. Clef présente mais invalide → toujours un
-message d'erreur clair par appel (401), sans stack trace.
-
-Les descriptions d'outils exposées aux clients MCP ne mentionnent pas la clef d'API :
-c'est une affaire d'exploitation, pas une information actionnable pour le modèle
-appelant, qui ne peut rien en faire — un outil visible est un outil configuré.
-
-- `brave_search(query, count=5)` : recherche web. Renvoie `TextResourceContents`
-  `application/json` — tableau `[{title, url, description}]`.
-- `brave_image_search(query, count=5)` : recherche d'images. Renvoie
-  `TextResourceContents` `application/json` — tableau
-  `[{title, page_url, image_url, thumbnail_url, source}]`. Les entrées sans
-  `properties.url` sont écartées. URI : `miaou://brave-images/{query}`.
-
-`count` est plafonné à [1, 20] symétriquement sur les deux outils (l'API Brave web
-plafonne aussi à 20 au-delà, 422). Les deux outils partagent un helper commun
-`_brave_call` (requête HTTP, chaîne d'erreurs réseau) — seul le mapping des résultats
-diffère.
 
 ## `servers/mcp_secret_demo.py` — démonstration des secrets volatils (port 8772)
 
@@ -597,13 +625,22 @@ qu'un serveur à secret volatil doit tenir :
   clef), chacune est testée, et la première refusée fait tout refuser. `delay_s`
   (borné à [0, 10] s, NaN ramené à 0) simule un annuaire lent. Synchrone, comme un vrai
   appel bloquant : le proxy appelle `build` hors de sa boucle d'événements.
+- `--help` (`-h`) est servi avant toute authentification : le bloc `__main__` ne
+  demande `MIAOU_SECRET_DEMO_PASSWORD` qu'ensuite.
 - Jamais la valeur dans un message d'exception, une description d'outil ou les
   `instructions` (le proxy masque quand même, et n'écrit pas dans son cache une
   instance qui la cite).
 
 Un outil, `whoami()` : le login et le nombre d'instances, jamais le mot de passe.
 `instructions` publiées, pour voir celles d'un upstream en attente servies depuis le
-cache. Pas de singleton `mcp` : un secret volatil exige `build(config)`. En autonome, le
+cache. Une skill **facultative**, `secret-demo` (`servers/skills/secret_demo/`, publiée
+`skill://secret_demo/secret-demo/SKILL.md`), pour la même raison : resservie du cache
+pendant l'attente, lecture refusée en `SECRET_REQUIRED`. Aucun outil ne l'exige (pas de
+`requires_skill`) : un client qui appelle `whoami` n'a rien à lire d'abord — le verify
+Playwright de MIAOU l'appelle par un modèle stubé. Son texte ne cite pas la valeur, sans
+quoi rien du serveur n'irait au cache, et ne dit rien de la conduite à tenir sans mot de
+passe : c'est précisément quand elle n'est pas lisible (lecture en `SECRET_REQUIRED`). `skills_dir` est passé par le constructeur, donc
+par `build(config)`. Pas de singleton `mcp` : un secret volatil exige `build(config)`. En autonome, le
 mot de passe vient de `MIAOU_SECRET_DEMO_PASSWORD` (login : `MIAOU_SECRET_DEMO_LOGIN`,
 défaut `demo`).
 

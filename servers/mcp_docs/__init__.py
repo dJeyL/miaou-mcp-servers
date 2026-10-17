@@ -218,9 +218,9 @@ class DocsServer(MiaouMCPBase):
                 Field(
                     description=(
                         "Unité à lire, format dépendant du document : numéro de page "
-                        "(pdf), nom de feuille ou plage type 'Feuille!A1:C10' (xlsx), "
-                        "titre exact de heading (docx/pptx). Sans selector, renvoie la "
-                        "première unité."
+                        "ou plage N-M (pdf), numéro de slide ou plage N-M (pptx), nom "
+                        "de feuille ou plage type 'Feuille!A1:C10' (xlsx), titre exact "
+                        "de heading (docx). Sans selector, renvoie la première unité."
                     )
                 ),
             ] = None,

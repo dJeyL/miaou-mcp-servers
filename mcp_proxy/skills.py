@@ -64,6 +64,37 @@ def resolve_skill_uri(uri: str, live_upstreams: set[str] | dict[str, Any]) -> tu
     raise MCPError(types.INVALID_PARAMS, f"No skill resource is served at {uri}")
 
 
+def resolve_published_uri(
+    uri: str, upstreams: dict[str, Upstream], authorizers: dict[str, Any]
+) -> tuple[str, str]:
+    """`resolve_skill_uri` sur les upstreams vivants, avec ce que l'on doit au
+    client quand le premier segment nomme un upstream CONNU mais pas vivant :
+    sa panne, pas un « non servi ».
+
+    Les trois refus reprennent ceux de `tools/call` : secret volatil attendu,
+    autorisation OAuth à accorder, sinon upstream injoignable — `-32603`, comme
+    toute panne d'upstream de l'extension, avec le même texte que l'outil. Le
+    `-32602` reste réservé à ce qui n'est pas servi."""
+    from .server import (
+        UpstreamNotAuthorized,
+        UpstreamSecretRequired,
+        _secret_pending,
+        _unreachable_message,
+    )
+
+    live = _live_names(upstreams, authorizers)
+    if uri.startswith(SKILL_SCHEME):
+        name, sep, rest = uri[len(SKILL_SCHEME):].partition("/")
+        if sep and rest and name in upstreams and name not in live:
+            upstream = upstreams[name]
+            if _secret_pending(upstream):
+                raise UpstreamSecretRequired(name, uri)
+            if name in authorizers:
+                raise UpstreamNotAuthorized(name)
+            raise MCPError(types.INTERNAL_ERROR, _unreachable_message(name, upstream))
+    return resolve_skill_uri(uri, live)
+
+
 def prefix_skill_entry(upstream_name: str, entry: dict[str, Any]) -> dict[str, Any]:
     """Entrée d'upstream → entrée publiée : `uri` ET chaque `resources[].uri`."""
     resources = entry.get("resources")
@@ -120,8 +151,35 @@ def _log_skipped_entry(name: str, upstream: Upstream, reason: str) -> None:
         _log(f"Skill de '{name}' ignorée, {reason}")
 
 
+def _listed_names(
+    upstreams: dict[str, Upstream], authorizers: dict[str, Any], catalog: Any
+) -> list[tuple[str, bool]]:
+    """(upstream, vivant) de chaque upstream dont les skills sont listées, dans
+    l'ordre de la config : les vivants, et ceux qui attendent leur secret
+    volatil quand un cache est fourni — ceux-là resservis depuis le cache, comme
+    leurs outils. Un upstream OAuth non autorisé n'en fait pas partie."""
+    from .server import _secret_pending
+
+    live = set(_live_names(upstreams, authorizers))
+    return [
+        (name, name in live)
+        for name, upstream in upstreams.items()
+        if name in live or (catalog is not None and _secret_pending(upstream))
+    ]
+
+
+def _remembers_skills(upstream: Upstream, catalog: Any) -> bool:
+    """Le cache ne garde les skills que des upstreams à secret volatil, seuls à
+    les resservir, et jamais d'une instance qui cite la valeur de son secret."""
+    return (
+        catalog is not None
+        and getattr(upstream, "volatile_key", None) is not None
+        and getattr(upstream, "cache_forbidden", False) is not True
+    )
+
+
 async def _collect(
-    upstreams: dict[str, Upstream], authorizers: dict[str, Any]
+    upstreams: dict[str, Upstream], authorizers: dict[str, Any], catalog: Any = None
 ) -> tuple[list[tuple[str, dict[str, Any]]], int | None, str | None]:
     """`collect_skills`, plus les indices de cache les plus restrictifs posés
     par les upstreams listés (None si aucun n'en a transmis)."""
@@ -130,14 +188,25 @@ async def _collect(
 
     collected: list[tuple[str, dict[str, Any]]] = []
     hints: list[dict[str, Any]] = []
-    for name in _live_names(upstreams, authorizers):
+    for name, live in _listed_names(upstreams, authorizers, catalog):
         upstream = upstreams[name]
-        try:
-            entries, ttl_ms, cache_scope = await upstream.list_skills_with_hints()
-        except Exception as e:
-            _log(f"Skills de '{name}' non listées ({_describe_failure(e)}).")
-            continue
-        hints.append({"ttlMs": ttl_ms, "cacheScope": cache_scope})
+        if not live:
+            # En attente de son secret : les entrées de la dernière liste
+            # vivante, telles quelles et sans indice (un inprocess n'en
+            # transmet pas). Au premier démarrage, le cache est vide.
+            entries = catalog.recall_skills(name)
+        else:
+            try:
+                entries, ttl_ms, cache_scope = await upstream.list_skills_with_hints()
+            except Exception as e:
+                _log(f"Skills de '{name}' non listées ({_describe_failure(e)}).")
+                continue
+            hints.append({"ttlMs": ttl_ms, "cacheScope": cache_scope})
+            if _remembers_skills(upstream, catalog):
+                try:
+                    catalog.remember_skills(name, entries)
+                except Exception as e:
+                    _log(f"Skills de '{name}' non mémorisées ({_describe_failure(e)}).")
         for entry in entries:
             reason = _unprefixable(entry)
             if reason is not None:
@@ -148,17 +217,18 @@ async def _collect(
 
 
 async def collect_skills(
-    upstreams: dict[str, Upstream], authorizers: dict[str, Any] | None = None
+    upstreams: dict[str, Upstream], authorizers: dict[str, Any] | None = None, catalog: Any = None
 ) -> list[tuple[str, dict[str, Any]]]:
     """(upstream, entrée d'ORIGINE) pour toutes les skills des upstreams
-    vivants. Une entrée non préfixable est écartée et signalée
-    (`_unprefixable`), sans faire tomber les autres.
+    vivants, et, avec un `catalog`, celles qu'un upstream en attente de son
+    secret volatil avait à sa dernière liste vivante. Une entrée non préfixable
+    est écartée et signalée (`_unprefixable`), sans faire tomber les autres.
 
     Chaque upstream est isolé : celui dont le listage échoue (session morte,
     autorisation réclamée en cours de route, réponse illisible) est omis et
     signalé, les autres répondent — un `skills/list` vide ou partiel est
     admis par la spec, une erreur pour tous ne le serait pas."""
-    return (await _collect(upstreams, authorizers or {}))[0]
+    return (await _collect(upstreams, authorizers or {}, catalog))[0]
 
 
 def _published_cache_hints(ttl_ms: int | None, cache_scope: str | None) -> dict[str, Any]:
@@ -228,7 +298,17 @@ def _remote_failure(name: str, target: str, exc: BaseException) -> MCPError:
 
     cause = _unwrap_exception_group(exc)
     if isinstance(cause, MCPError):
-        return cause
+        # `-32602` (non servi) et les contrats à `data` (autorisation, secret)
+        # sont des réponses de l'upstream que le client sait lire. Toute autre
+        # erreur — « Connection closed » du transport, typiquement — ne nomme
+        # ni le serveur ni la skill : le code est gardé, le texte encadré.
+        if cause.error.code == types.INVALID_PARAMS or cause.error.data is not None:
+            return cause
+        return MCPError(
+            cause.error.code,
+            f"Le serveur '{name}' n'a pas pu servir {target} ({cause.error.message}).",
+            cause.error.data,
+        )
     if isinstance(cause, AuthorizationRequired):
         return UpstreamNotAuthorized(name)
     return MCPError(
@@ -241,6 +321,7 @@ async def install_skills(
     server: Server,
     upstreams: dict[str, Upstream],
     authorizers: dict[str, Any] | None = None,
+    catalog: Any = None,
 ) -> bool:
     """Enregistre `skills/list`, `skills/get`, `resources/list` et
     `resources/read` sur le `Server` du proxy, et publie l'extension — si et
@@ -263,23 +344,26 @@ async def install_skills(
         upstreams[name].serves_skills and not isinstance(upstreams[name], InProcessUpstream)
         for name in _live_names(upstreams, authorizers)
     )
-    if not declared and not await collect_skills(upstreams, authorizers):
+    # Les skills en cache d'un upstream en attente comptent : sans elles, un
+    # proxy dont il est le seul à en servir ne publierait pas l'extension
+    # avant la saisie.
+    if not declared and not await collect_skills(upstreams, authorizers, catalog):
         return False
 
     async def handle_list_skills(ctx: Any, params: Any) -> ListSkillsResult:
-        collected, ttl_ms, cache_scope = await _collect(upstreams, authorizers)
+        collected, ttl_ms, cache_scope = await _collect(upstreams, authorizers, catalog)
         entries = [prefix_skill_entry(name, entry) for name, entry in collected]
         return ListSkillsResult(skills=entries, **_published_cache_hints(ttl_ms, cache_scope))
 
     async def handle_get_skill(ctx: Any, params: GetSkillParams) -> GetSkillResult:
-        name, origin = resolve_skill_uri(params.uri, _live_names(upstreams, authorizers))
+        name, origin = resolve_published_uri(params.uri, upstreams, authorizers)
         try:
             entry, ttl_ms, cache_scope = await upstreams[name].get_skill_with_hints(origin)
         except MCPError as e:
             if e.error.code == types.INVALID_PARAMS:
                 # Message réécrit : l'URI d'origine ne dit rien au client.
                 raise MCPError(types.INVALID_PARAMS, f"No skill is served at {params.uri}") from e
-            raise
+            raise _remote_failure(name, params.uri, e) from e
         except Exception as e:
             raise _remote_failure(name, params.uri, e) from e
         reason = _unprefixable(entry)
@@ -293,7 +377,7 @@ async def install_skills(
 
     async def handle_list_resources(ctx: Any, params: Any) -> types.ListResourcesResult:
         resources: list[types.Resource] = []
-        for name, entry in await collect_skills(upstreams, authorizers):
+        for name, entry in await collect_skills(upstreams, authorizers, catalog):
             resources.extend(_skill_file_resources(name, entry))
         return types.ListResourcesResult(resources=resources)
 
@@ -301,13 +385,13 @@ async def install_skills(
         ctx: Any, params: types.ReadResourceRequestParams
     ) -> types.ReadResourceResult:
         uri = str(params.uri)
-        name, origin = resolve_skill_uri(uri, _live_names(upstreams, authorizers))
+        name, origin = resolve_published_uri(uri, upstreams, authorizers)
         try:
             contents = await upstreams[name].read_skill_file(origin)
         except MCPError as e:
             if e.error.code == types.INVALID_PARAMS:
                 raise MCPError(types.INVALID_PARAMS, f"No skill resource is served at {uri}") from e
-            raise
+            raise _remote_failure(name, uri, e) from e
         except Exception as e:
             raise _remote_failure(name, uri, e) from e
         return types.ReadResourceResult(
@@ -323,7 +407,7 @@ async def install_skills(
 
 
 async def build_skills_blocks(
-    upstreams: dict[str, Upstream], authorizers: dict[str, Any] | None = None
+    upstreams: dict[str, Upstream], authorizers: dict[str, Any] | None = None, catalog: Any = None
 ) -> dict[str, str]:
     """Bloc GÉNÉRÉ qui termine la section d'instructions de chaque upstream
     servant des skills : une ligne par skill, obligatoire ou facultative.
@@ -344,15 +428,19 @@ async def build_skills_blocks(
 
     authorizers = authorizers or {}
     entries_by_upstream: dict[str, list[dict[str, Any]]] = {}
-    for name, entry in await collect_skills(upstreams, authorizers):
+    for name, entry in await collect_skills(upstreams, authorizers, catalog):
         entries_by_upstream.setdefault(name, []).append(entry)
 
     blocks: dict[str, str] = {}
-    for name in _live_names(upstreams, authorizers):
+    for name, live in _listed_names(upstreams, authorizers, catalog):
         entries = entries_by_upstream.get(name, [])
         served = {entry["uri"] for entry in entries}
         try:
-            tools = published_tools(upstreams[name], await upstreams[name].list_tools())
+            # En attente de son secret : skills ET outils du cache, pour que
+            # le bloc soit celui de la dernière liste vivante et que le
+            # message système ne change pas à la saisie.
+            listed = await upstreams[name].list_tools() if live else catalog.recall(name)[0]
+            tools = published_tools(upstreams[name], listed)
         except Exception as e:
             # Sans ses outils, le bloc ne sait pas dire lesquels exigent quelle
             # skill : l'upstream n'a pas de bloc, les autres gardent le leur.
@@ -464,6 +552,17 @@ def _tool_error(text: str) -> types.CallToolResult:
     return types.CallToolResult(content=[types.TextContent(type="text", text=text)], is_error=True)
 
 
+def _read_failure(uri: str, failure: MCPError) -> types.CallToolResult:
+    """Le refus d'une lecture de repli, tel que le modèle le lit : « non servi »
+    pour `-32602` seulement, la cause de la panne dite telle quelle sinon."""
+    if failure.error.code == types.INVALID_PARAMS:
+        return _tool_error(
+            f"Aucun fichier de skill servi à {uri}. Seuls les fichiers des "
+            f"skills annoncées dans les instructions sont lisibles."
+        )
+    return _tool_error(f"Lecture de {uri} impossible : {failure.error.message}")
+
+
 async def call_read_skill(
     upstreams: dict[str, Upstream],
     authorizers: dict[str, Any] | None,
@@ -481,9 +580,11 @@ async def call_read_skill(
     uri = arguments.get("uri")
     if not isinstance(uri, str) or not uri:
         return _tool_error("`uri` manquant : URI complète d'un fichier de skill (skill://…).")
-    name = ""
     try:
-        name, origin = resolve_skill_uri(uri, _live_names(upstreams, authorizers))
+        name, origin = resolve_published_uri(uri, upstreams, authorizers)
+    except MCPError as e:
+        return _read_failure(uri, e)
+    try:
         contents = await upstreams[name].read_skill_file(origin)
         entry = None
         if origin.endswith("/SKILL.md"):
@@ -495,13 +596,7 @@ async def call_read_skill(
                 # complément, son absence ne fait pas échouer la lecture.
                 entry = None
     except Exception as e:
-        failure = e if isinstance(e, MCPError) else _remote_failure(name, uri, e)
-        if failure.error.code == types.INVALID_PARAMS:
-            return _tool_error(
-                f"Aucun fichier de skill servi à {uri}. Seuls les fichiers des "
-                f"skills annoncées dans les instructions sont lisibles."
-            )
-        return _tool_error(f"Lecture de {uri} impossible : {failure.error.message}")
+        return _read_failure(uri, _remote_failure(name, uri, e))
 
     label = f"[Fichier de skill servi par le serveur MCP `{name}` — {uri}]"
     blocks: list[Any] = [types.TextContent(type="text", text=label)]

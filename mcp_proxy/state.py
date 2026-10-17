@@ -42,7 +42,8 @@ def tools_cache_beside(tokens_path: str | Path) -> Path:
     le nom qu'il avait avant `state/` — un emplacement choisi par l'opérateur
     ne se déplace pas dans son dos."""
     path = Path(tokens_path)
-    return path.with_name(path.stem.replace("-tokens", "") + "-tools.json")
+    stem = path.stem[: -len("-tokens")] if path.stem.endswith("-tokens") else path.stem
+    return path.with_name(stem + "-tools.json")
 
 
 def migrate_legacy_state(local_config: str | Path) -> list[str]:

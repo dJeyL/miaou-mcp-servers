@@ -3,6 +3,8 @@ d'upstreams."""
 
 from __future__ import annotations
 
+import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,7 @@ from .upstream import (
     InProcessUpstream,
     StdioUpstream,
     Upstream,
+    _CALL_TIMEOUT_S,
     _HTTP_HANDSHAKE_TIMEOUT_S,
 )
 
@@ -33,6 +36,42 @@ def _protocol_era(name: str, srv: dict[str, Any]) -> str:
             f"{' ou '.join(repr(v) for v in _PROTOCOL_ERA_VALUES)}."
         )
     return era
+
+
+# Le nom d'un upstream préfixe ses outils (`<nom>__<outil>`, coupé au premier
+# `__`) et ouvre les URI de ses skills (`skill://<nom>/…`, coupé au premier
+# `/`) : il ne peut contenir ni l'un ni l'autre, ni finir par `_` (le `__`
+# du préfixe se lirait alors un caractère trop tôt).
+_UPSTREAM_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _check_upstream_name(name: str) -> None:
+    if (
+        not _UPSTREAM_NAME_RE.fullmatch(name)
+        or "__" in name
+        or name.endswith("_")
+    ):
+        raise ValueError(
+            f"Serveur {name!r} : nom d'upstream invalide. Lettres, chiffres, `-` et `_` "
+            f"seulement, sans `__` ni `_` final : le nom préfixe les outils "
+            f"(`<nom>__<outil>`) et les URI de skills (`skill://<nom>/…`)."
+        )
+
+
+def _call_timeout(name: str, srv: dict[str, Any]) -> float:
+    """Borne d'un appel d'outil vers un upstream stdio ou http, en secondes."""
+    value = srv.get("call_timeout", _CALL_TIMEOUT_S)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(
+            f"Serveur '{name}' : 'call_timeout' vaut {value!r}, attendu un nombre de "
+            f"secondes fini et supérieur à 0."
+        )
+    return value
 
 
 def _config_instructions(name: str, srv: dict[str, Any]) -> str | None:
@@ -79,6 +118,44 @@ def _volatile_key(name: str, config: Any) -> tuple[str | None, str | None]:
     return (keys[0] if keys else None), None
 
 
+# Entrées que `config.defaults.json` portait pour des serveurs supprimés : un
+# `config.json` qui les patchait encore n'en garde, fusionné, qu'un reste sans
+# `type` ni `command`, que le message doit expliquer.
+_REMOVED_ENTRIES = {"duckduckgo": "mcp_ddg", "brave": "mcp_brave"}
+
+
+def _typed(name: str, srv: dict[str, Any], key: str, kinds: type | tuple, label: str) -> Any:
+    """`srv[key]` s'il est de l'un des `kinds` (ou absent, ou `null`), sinon une
+    ValueError qui nomme la clé : la forme d'une entrée se refuse ici, au
+    chargement, et non en AttributeError au premier usage."""
+    value = srv.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, kinds):
+        raise ValueError(
+            f"Serveur '{name}' : '{key}' doit être {label}, reçu {type(value).__name__}."
+        )
+    return value
+
+
+def _check_entry_shape(name: str, srv: dict[str, Any], srv_type: Any) -> None:
+    if srv_type == "inprocess":
+        _typed(name, srv, "module", str, "une chaîne")
+        _typed(name, srv, "env", dict, "un objet")
+        _typed(name, srv, "config", dict, "un objet")
+    elif srv_type == "stdio":
+        _typed(name, srv, "command", str, "une chaîne")
+        _typed(name, srv, "env", dict, "un objet")
+        _typed(name, srv, "cwd", str, "une chaîne")
+        args = _typed(name, srv, "args", list, "une liste de chaînes")
+        if args is not None and not all(isinstance(a, str) for a in args):
+            raise ValueError(f"Serveur '{name}' : 'args' doit être une liste de chaînes.")
+    elif srv_type == "http":
+        _typed(name, srv, "url", str, "une chaîne")
+        _typed(name, srv, "headers", dict, "un objet")
+        _typed(name, srv, "timeout", (int, float), "un nombre")
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     """Config effective d'un fichier seul (fusion et chaîne : `layers`)."""
     return load_layers([Path(path)]).cfg
@@ -100,10 +177,19 @@ def build_upstreams(
         "hors du bloc 'config' d'un serveur inprocess : seul endroit où le "
         "proxy le résout.",
     )
-    for name, srv in cfg.get("mcpServers", {}).items():
+    servers = cfg.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise ValueError(f"'mcpServers' doit être un objet, reçu {type(servers).__name__}.")
+    for name, srv in servers.items():
+        if not isinstance(srv, dict):
+            raise ValueError(
+                f"mcpServers.{name} doit être un objet, reçu {type(srv).__name__}."
+            )
         if is_disabled(srv, f"mcpServers.{name}"):
             continue
+        _check_upstream_name(name)
         srv_type = srv.get("type", "stdio")
+        _check_entry_shape(name, srv, srv_type)
         _refuse_markers(
             f"mcpServers.{name}",
             {k: v for k, v in srv.items() if not (srv_type == "inprocess" and k == "config")},
@@ -114,11 +200,12 @@ def build_upstreams(
             module = srv.get("module")
             if not module:
                 raise ValueError(f"Serveur '{name}' inprocess sans clé 'module'.")
-            if "protocol_era" in srv:
-                raise ValueError(
-                    f"Serveur '{name}' : la clé 'protocol_era' n'a de sens que sur un "
-                    f"upstream 'stdio' ou 'http' (un inprocess n'a pas de fil)."
-                )
+            for key in ("protocol_era", "call_timeout"):
+                if key in srv:
+                    raise ValueError(
+                        f"Serveur '{name}' : la clé '{key}' n'a de sens que sur un "
+                        f"upstream 'stdio' ou 'http' (un inprocess n'a pas de fil)."
+                    )
             upstream = InProcessUpstream(
                 module, env=srv.get("env"), config=srv.get("config")
             )
@@ -129,6 +216,16 @@ def build_upstreams(
         elif srv_type == "stdio":
             command = srv.get("command")
             if not command:
+                if name in _REMOVED_ENTRIES and "type" not in srv:
+                    # Reste d'une entrée que `config.defaults.json` portait : la
+                    # fusion n'en garde que ce que `config.json` y ajoutait.
+                    raise ValueError(
+                        f"Serveur '{name}' : {_REMOVED_ENTRIES[name]} a été supprimé "
+                        f"(remplacé par search/image_search de 'web') et n'est plus "
+                        f"dans config.defaults.json. Retirer mcpServers.{name} de "
+                        f"config.json (une clef Brave va dans "
+                        f"mcpServers.web.config.search.brave.api_key)."
+                    )
                 raise ValueError(f"Serveur '{name}' stdio sans clé 'command'.")
             env = merge_proxy_env_overrides(srv.get("env"), proxy_env_overrides)
             upstreams[name] = StdioUpstream(
@@ -137,6 +234,7 @@ def build_upstreams(
                 env=env,
                 cwd=srv.get("cwd"),
                 protocol_era=_protocol_era(name, srv),
+                call_timeout=_call_timeout(name, srv),
             )
         elif srv_type == "http":
             url = srv.get("url")
@@ -147,6 +245,7 @@ def build_upstreams(
                 headers=srv.get("headers"),
                 timeout=srv.get("timeout", _HTTP_HANDSHAKE_TIMEOUT_S),
                 protocol_era=_protocol_era(name, srv),
+                call_timeout=_call_timeout(name, srv),
             )
         else:
             raise ValueError(f"Type de serveur inconnu pour '{name}': '{srv_type}'.")

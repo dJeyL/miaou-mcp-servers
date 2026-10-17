@@ -27,7 +27,6 @@ def _redact_url(url: Any) -> str:
     ce sont eux qu'on lit pour comprendre un parcours (corrélation d'un
     callback, présence de PKCE).
     """
-    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
     try:
         parts = urlsplit(str(url))

@@ -28,8 +28,10 @@ de la mémoire Python reste au mieux (chaînes immuables) : ne pas le promettre.
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import hmac
+import json
 import os
 import secrets as _secrets
 from dataclasses import dataclass, field
@@ -40,7 +42,7 @@ from mcp.server import Server
 from mcp.shared.exceptions import MCPError
 
 from .logging import _log, _warn
-from .volatile import mask
+from .volatile import cites, mask
 
 EXTENSION_ID = "miaou/volatile-secrets"
 STATUS_METHOD = "miaou/secrets/status"
@@ -66,6 +68,9 @@ UNTESTED = "untested"
 
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_VALUE_LENGTH = 4096
+# Empreintes de valeurs refusées gardées par clef (les plus récentes) : la
+# garde « jamais retestée » ne doit pas faire croître le processus sans borne.
+MAX_REJECTED = 64
 
 
 class StatusParams(types.RequestParams):
@@ -127,8 +132,19 @@ class _Consumer:
 class _Key:
     key: str
     consumers: list[_Consumer]
-    rejected: set[bytes] = field(default_factory=set)
+    # Ordre d'insertion = ancienneté : LRU de `MAX_REJECTED` empreintes.
+    rejected: collections.OrderedDict[bytes, None] = field(default_factory=collections.OrderedDict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Dépôt en cours : tâche détachée de la requête (elle seule tient le verrou)
+    # et empreinte de la valeur qu'elle valide.
+    task: asyncio.Task[None] | None = None
+    task_fingerprint: bytes | None = None
+
+    def reject(self, fingerprint: bytes) -> None:
+        self.rejected[fingerprint] = None
+        self.rejected.move_to_end(fingerprint)
+        while len(self.rejected) > MAX_REJECTED:
+            self.rejected.popitem(last=False)
 
     def entry(self) -> dict[str, Any]:
         return {
@@ -244,14 +260,34 @@ class VolatileSecrets:
                 f"Paramètre 'value' : chaîne non vide de {MAX_VALUE_LENGTH} caractères au plus attendue.",
                 types.INVALID_PARAMS,
             )
-        # Verrou par clef : deux onglets qui renvoient la même valeur après un
-        # redémarrage du proxy se sérialisent, et le second trouve la valeur
-        # déjà acceptée — sans appel sortant.
+        # La validation tourne dans une tâche DÉTACHÉE de la requête, qui tient
+        # elle-même le verrou par clef : un `submit` annulé (onglet fermé,
+        # délai du client) laisse le thread de `build` courir, et la tâche
+        # finir (verdict, empreinte, publication). Un `submit` de la MÊME valeur
+        # pendant ce temps attend cette tâche et l'adopte au lieu de relancer
+        # un `build` concurrent ; une autre valeur se met en file sur le verrou.
+        fingerprint = self._fingerprint(value)
+        task = key.task
+        if task is None or task.done() or key.task_fingerprint != fingerprint:
+            task = asyncio.create_task(self._submit_locked(key, value))
+            task.add_done_callback(self._retrieve)
+            key.task, key.task_fingerprint = task, fingerprint
+        await asyncio.shield(task)
+        return SecretResult(secret=key.entry())
+
+    async def _submit_locked(self, key: _Key, value: str) -> None:
         async with key.lock:
             changed = await self._submit(key, value)
         if changed:
             await self._publish()
-        return SecretResult(secret=key.entry())
+
+    @staticmethod
+    def _retrieve(task: asyncio.Task[None]) -> None:
+        """Personne n'attend plus une tâche dont le demandeur est parti : son
+        échec se journalise (sans valeur : la tâche ne la porte pas) au lieu de
+        finir en « exception never retrieved »."""
+        if not task.cancelled() and task.exception() is not None:
+            _warn(f"Dépôt d'un secret volatil en échec ({type(task.exception()).__name__}).")
 
     async def handle_forget(self, ctx: Any, params: KeyParams) -> SecretResult:
         self._guard(ctx)
@@ -299,7 +335,7 @@ class VolatileSecrets:
                 consumer.verdict = verdict
                 consumer.detail = mask(f"{type(e).__name__}: {e}", value)
                 if verdict == REJECTED:
-                    key.rejected.add(fingerprint)
+                    key.reject(fingerprint)
                     stopped = True
                 kept = "" if consumer.upstream.secret_pending else ", instance précédente gardée"
                 _log(f"Secret volatil « {key.key} » : {consumer.name} {verdict}{kept} ({consumer.detail})")
@@ -314,27 +350,39 @@ class VolatileSecrets:
 
     async def _remember(self, consumer: _Consumer, value: str) -> None:
         """Laisse dans le cache ce que le prochain démarrage en attente
-        resservira : outils et `instructions`. Jamais si la valeur y figure (un
-        serveur qui interpolerait sa config dans une description) : le cache
-        est sur disque."""
+        resservira : outils, `instructions` et entrées de skills. Jamais si la
+        valeur y figure (un serveur qui interpolerait sa config dans une
+        description, ou qui tirerait ses skills de sa config) : le cache est
+        sur disque."""
         upstream = consumer.upstream
         if self.catalog is None:
             return
+        # Tant que le contrôle n'a pas passé, rien de cette instance ne part en
+        # cache : ni ici, ni par le listage de `tools/list` (server.py), s'il
+        # échoue ou rend avant (le côté sûr : interdit jusqu'à preuve).
+        upstream.cache_forbidden = True
         try:
             tools = await upstream.list_tools()
+            skills = await upstream.list_skills()
         except Exception as e:
             _log(f"Outils de '{consumer.name}' non listés ({mask(str(e), value)}).")
             return
         dumped = "".join(t.model_dump_json(by_alias=True) for t in tools)
-        if value in dumped or value in (upstream.instructions or ""):
+        # `ensure_ascii=False` : `cites` cherche aussi la forme JSON brute.
+        dumped += json.dumps(skills, ensure_ascii=False, default=str)
+        if cites(dumped, value) or cites(upstream.instructions or "", value):
             upstream.cache_forbidden = True
             _warn(
-                f"'{consumer.name}' cite la valeur de son secret volatil dans ses outils ou ses "
-                f"instructions : rien de lui n'est écrit dans le cache d'outils."
+                f"'{consumer.name}' cite la valeur de son secret volatil dans ses outils, ses "
+                f"instructions ou ses skills : rien de lui n'est écrit dans le cache d'outils."
             )
             return
+        # Contrôle passé pour CETTE instance : le listage de `tools/list` peut
+        # de nouveau écrire le catalogue.
+        upstream.cache_forbidden = False
         self.catalog.remember(consumer.name, tools)
         self.catalog.remember_instructions(consumer.name, upstream.instructions)
+        self.catalog.remember_skills(consumer.name, skills)
 
     async def _publish(self) -> None:
         if self.publish_surface is not None:

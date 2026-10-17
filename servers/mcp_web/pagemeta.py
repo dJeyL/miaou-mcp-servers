@@ -8,6 +8,8 @@ titre, et les octets d'une favicon y seraient payés à chaque tour.
 
 Contrat (tous les champs facultatifs, clé absente plutôt que vide) :
     {"title": str, "site_name": str, "canonical_url": str, "favicon": str}
+`canonical_url` est l'URL finale (jamais celle que la page déclare) ; elle est omise
+si le client la rejetterait (`client_accepts_canonical_url`).
 `favicon` est une data-URL base64 dont le type a été reconnu AUX OCTETS (PNG,
 ICO, GIF, JPEG, WebP ; SVG refusé : il porte du script), plafonnée à
 `FAVICON_MAX_CHARS` caractères encodés — au-delà, absente. Un ICO à plusieurs
@@ -16,8 +18,10 @@ images est réduit à UNE (`shrink_ico`) : la plus petite d'au moins
 256 px dont personne n'a l'usage.
 
 La favicon coûte une ou plusieurs requêtes : elle est cherchée une fois par
-origine et gardée en mémoire (`_FaviconCache`), échecs compris, pour que lire
-dix pages d'un même site ne sonde pas dix fois son `/favicon.ico`."""
+origine et gardée en mémoire (`_FaviconCache`), échecs compris (un échec transitoire peu de
+temps : `FAVICON_FAILURE_TTL_S`), pour que lire dix pages d'un même site ne sonde
+pas dix fois son `/favicon.ico`. La sonde refuse les hôtes IP et localhost, redirections
+comprises (`netguard`)."""
 
 from __future__ import annotations
 
@@ -31,7 +35,7 @@ import urllib.request
 from collections import OrderedDict
 from html.parser import HTMLParser
 
-from mcp_base import make_opener
+from .netguard import favicon_opener, is_forbidden_probe_host
 
 META_KEY = "miaou/web"
 """Clé du `_meta` de `fetch_url`. Préfixe `miaou/` pour la même raison que
@@ -49,6 +53,12 @@ dépasse souvent ce dernier AVANT réduction (15 Ko pour docs.python.org, dont
 FAVICON_TIMEOUT_S = 3
 FAVICON_MAX_ATTEMPTS = 3
 FAVICON_CACHE_MAX = 256
+FAVICON_FAILURE_TTL_S = 300
+"""Durée de vie en cache d'un échec TRANSITOIRE (timeout, erreur réseau, 5xx,
+429) : de quoi ne pas resonder à chaque page, sans figer « pas de favicon »
+pendant 24 h pour une panne d'une minute. Un échec définitif (404, corps qui
+n'est pas une image, trop gros, hôte refusé) garde la durée du cache."""
+CANONICAL_URL_MAX = 2048
 TEXT_MAX_CHARS = 300
 HEAD_SCAN_MAX_CHARS = 256 * 1024
 
@@ -263,8 +273,11 @@ def favicon_candidates(page_url: str, icons: list[tuple[str, str]]) -> list[str]
         if href.lower().startswith("data:"):
             out.append(href)
             continue
-        absolute = urllib.parse.urljoin(page_url, href)
-        parts = urllib.parse.urlsplit(absolute)
+        try:
+            absolute = urllib.parse.urljoin(page_url, href)
+            parts = urllib.parse.urlsplit(absolute)
+        except ValueError:
+            continue  # href forgé (« http://[::1 ») : une icône de moins, pas un fetch en échec
         if parts.scheme.lower() not in ("http", "https"):
             continue
         if parts.path.lower().endswith(".svg"):
@@ -282,38 +295,60 @@ def origin_of(url: str) -> str:
     return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
 
 
-def _fetch_favicon_bytes(url: str, user_agent: str) -> bytes | None:
-    """I/O bloquante (pour asyncio.to_thread). None sur toute erreur ou au-delà
-    du plafond : une favicon ne fait jamais échouer un `fetch_url`."""
+def _probe_bytes(url: str, user_agent: str) -> tuple[bytes | None, bool]:
+    """(octets, transitoire). I/O bloquante (pour asyncio.to_thread). Octets None
+    sur toute erreur ou au-delà du plafond : une favicon ne fait jamais échouer
+    un `fetch_url`. `transitoire` distingue la panne qui peut passer (timeout,
+    erreur réseau, 5xx, 429) du refus définitif (hôte refusé, 4xx, trop gros).
+
+    Un hôte IP ou localhost est refusé ici même, et à chaque redirection par
+    `favicon_opener` (cf. netguard)."""
+    if is_forbidden_probe_host(url):
+        return None, False
     req = urllib.request.Request(url, headers={"User-Agent": user_agent})
     try:
-        with make_opener().open(req, timeout=FAVICON_TIMEOUT_S) as resp:
+        with favicon_opener().open(req, timeout=FAVICON_TIMEOUT_S) as resp:
             data = resp.read(FAVICON_DOWNLOAD_MAX + 1)
     except urllib.error.HTTPError as e:
         # Une HTTPError porte la réponse ouverte : la fermer, sinon chaque
         # `/favicon.ico` en 404 laisse une connexion au GC.
         e.close()
-        return None
+        return None, e.code >= 500 or e.code in (408, 429)
     except Exception:  # noqa: BLE001 — best-effort par contrat
-        return None
+        return None, True
     if not isinstance(data, bytes) or len(data) > FAVICON_DOWNLOAD_MAX:
-        return None
-    return data
+        return None, False
+    return data, False
 
 
-def resolve_favicon_blocking(page_url: str, icons: list[tuple[str, str]], user_agent: str) -> str | None:
-    """Premier candidat qui donne une favicon valide, ou None."""
+def _fetch_favicon_bytes(url: str, user_agent: str) -> bytes | None:
+    return _probe_bytes(url, user_agent)[0]
+
+
+def probe_favicon(
+    page_url: str, icons: list[tuple[str, str]], user_agent: str
+) -> tuple[str | None, bool]:
+    """(favicon, échec_transitoire) : premier candidat qui donne une favicon
+    valide. Sans favicon, l'échec est dit transitoire si un candidat au moins a
+    échoué pour une cause qui peut passer — le cache le garde alors peu."""
+    transient = False
     for candidate in favicon_candidates(page_url, icons):
         if candidate.lower().startswith("data:"):
             data = decode_data_url(candidate)
         else:
-            data = _fetch_favicon_bytes(candidate, user_agent)
+            data, failed_transiently = _probe_bytes(candidate, user_agent)
+            transient = transient or (data is None and failed_transiently)
         if data is None:
             continue
         url = favicon_data_url(data)
         if url is not None:
-            return url
-    return None
+            return url, False
+    return None, transient
+
+
+def resolve_favicon_blocking(page_url: str, icons: list[tuple[str, str]], user_agent: str) -> str | None:
+    """Premier candidat qui donne une favicon valide, ou None."""
+    return probe_favicon(page_url, icons, user_agent)[0]
 
 
 class _FaviconCache:
@@ -321,32 +356,51 @@ class _FaviconCache:
 
     Un échec est mis en cache comme un succès (valeur None) : c'est le cas le
     plus coûteux à re-sonder, puisqu'il épuise tous les candidats. Durée de vie
-    alignée sur le cache disque des pages (`MIAOU_WEB_CACHE_TTL_H`)."""
+    alignée sur le cache disque des pages (`MIAOU_WEB_CACHE_TTL_H`), sauf pour un
+    échec transitoire (`put(..., ttl_s=FAVICON_FAILURE_TTL_S)`)."""
 
     def __init__(self, max_entries: int, ttl_s: float) -> None:
         self.max_entries = max_entries
         self.ttl_s = ttl_s
-        self._entries: OrderedDict[str, tuple[float, str | None]] = OrderedDict()
+        self._entries: OrderedDict[str, tuple[float, str | None, float]] = OrderedDict()
 
     def get(self, origin: str) -> tuple[bool, str | None]:
         """(trouvé, valeur) — `trouvé` distingue « pas de favicon » de « pas encore cherché »."""
         hit = self._entries.get(origin)
         if hit is None:
             return False, None
-        stored_at, value = hit
-        if time.time() - stored_at > self.ttl_s:
+        stored_at, value, ttl_s = hit
+        if time.time() - stored_at > ttl_s:
             del self._entries[origin]
             return False, None
         return True, value
 
-    def put(self, origin: str, value: str | None) -> None:
-        self._entries[origin] = (time.time(), value)
+    def put(self, origin: str, value: str | None, ttl_s: float | None = None) -> None:
+        """`ttl_s` raccourcit la durée de vie de CETTE entrée (échec transitoire)."""
+        self._entries[origin] = (time.time(), value, self.ttl_s if ttl_s is None else min(ttl_s, self.ttl_s))
         self._entries.move_to_end(origin)
         while len(self._entries) > self.max_entries:
             self._entries.popitem(last=False)
 
     def clear(self) -> None:
         self._entries.clear()
+
+
+# Ce que le client MIAOU accepte pour `canonical_url` : `webMetaFromResult`
+# (src/js/utils.js) garde la clef si `length <= 2048` (unités UTF-16) et
+# `/^https?:\/\/[^\s]+$/i` ; `webCiteNoteFor` ne pose `[web_ref:URL]` que si
+# l'URL tient dans `WEB_REF_MARKER_RE` = `\[web_ref:(https?:\/\/[^\s\]]+)\]`,
+# soit ni blanc ni « ] ». Les deux règles réunies : `\s` de JS (blancs ASCII,
+# NBSP, U+2028/9, U+FEFF…, que `\s` de Python couvre sauf U+FEFF), tout
+# caractère <= 0x20, et « ] ».
+_CLIENT_URL_RE = re.compile(r"https?://[^\s\]\x00-\x20\ufeff]+", re.IGNORECASE)
+
+
+def client_accepts_canonical_url(url: str) -> bool:
+    """True si le client garderait cette URL telle quelle (sinon il l'écarte, et
+    sa note de source retombe sur l'URL demandée : autant ne pas l'envoyer)."""
+    utf16_units = len(url.encode("utf-16-le", errors="surrogatepass")) // 2
+    return utf16_units <= CANONICAL_URL_MAX and _CLIENT_URL_RE.fullmatch(url) is not None
 
 
 def build_web_meta(
@@ -362,7 +416,7 @@ def build_web_meta(
             meta["title"] = head["title"]
         if head.get("site_name"):
             meta["site_name"] = head["site_name"]
-    if canonical_url:
+    if canonical_url and client_accepts_canonical_url(canonical_url):
         meta["canonical_url"] = canonical_url
     if favicon:
         meta["favicon"] = favicon

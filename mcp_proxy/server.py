@@ -8,10 +8,13 @@ rapport de statut et l'agrégation des `instructions`.
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 from pathlib import Path
 from typing import Any
 
+import anyio
 import mcp.types as types
 from mcp.server import Server
 from mcp.shared.exceptions import MCPError
@@ -64,6 +67,7 @@ class ToolCatalogCache:
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
+        self._unreadable = False
 
     def _read(self) -> dict[str, Any]:
         if not self._path.exists():
@@ -72,6 +76,7 @@ class ToolCatalogCache:
             data = json.loads(self._path.read_text())
         except (json.JSONDecodeError, OSError) as e:
             _log(f"Cache d'outils illisible ({e}) — ignoré.")
+            self._unreadable = True
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -84,7 +89,32 @@ class ToolCatalogCache:
             # volatil est resservi d'ici sans notice, pour que le cache KV du
             # modèle ne bouge pas à la saisie (lot AU). Trié, `url` et
             # `max_bytes` s'inversaient.
-            self._path.write_text(json.dumps(data, indent=2))
+            text = json.dumps(data, indent=2)
+            try:
+                if not self._unreadable and self._path.read_text() == text:
+                    return
+            except OSError:
+                pass
+            if self._unreadable:
+                # Le fichier illisible est sur le point d'être remplacé par un
+                # contenu qui ne reprend QUE l'upstream en cours : garder
+                # l'original à côté, pour qu'une réparation à la main reste
+                # possible.
+                self._unreadable = False
+                try:
+                    os.replace(self._path, self._path.with_name(self._path.name + ".corrupt"))
+                    _log(f"Cache d'outils illisible conservé dans {self._path.name}.corrupt.")
+                except OSError:
+                    pass
+            # Fichier temporaire puis remplacement : une coupure en cours
+            # d'écriture ne laisse jamais un JSON tronqué à la place du cache.
+            partial = self._path.with_name(self._path.name + ".partial")
+            try:
+                partial.write_text(text)
+                os.replace(partial, self._path)
+            except BaseException:
+                partial.unlink(missing_ok=True)
+                raise
         except OSError as e:
             # Un cache non écrit dégrade, il ne casse pas : le proxy sert
             # toujours l'upstream, il l'oubliera seulement au redémarrage.
@@ -108,9 +138,30 @@ class ToolCatalogCache:
                 for t in tools
             ],
         }
-        if isinstance(previous, dict) and isinstance(previous.get("instructions"), str):
-            data[upstream_name]["instructions"] = previous["instructions"]
+        if isinstance(previous, dict):
+            for key in ("instructions", "skills"):
+                if key in previous:
+                    data[upstream_name][key] = previous[key]
         self._write(data)
+
+    def remember_skills(self, upstream_name: str, entries: list[Any]) -> None:
+        """Entrées de skills d'un upstream à secret volatil, telles que
+        l'upstream les rend (URI d'ORIGINE : le préfixage reste au listage, sur
+        un seul chemin). Resservies pendant qu'il attend, à l'octet près comme
+        ses outils : MIAOU lie l'approbation d'une skill à son manifeste."""
+        data = self._read()
+        entry = data.get(upstream_name)
+        entry = dict(entry) if isinstance(entry, dict) else {"known_at": time.time(), "tools": []}
+        entry["skills"] = list(entries)
+        data[upstream_name] = entry
+        self._write(data)
+
+    def recall_skills(self, upstream_name: str) -> list[Any]:
+        """Les entrées mémorisées, [] si aucune. Non filtrées : le listage
+        écarte ce qu'il ne sait pas préfixer, comme pour une entrée vivante."""
+        entry = self._read().get(upstream_name)
+        skills = entry.get("skills") if isinstance(entry, dict) else None
+        return skills if isinstance(skills, list) else []
 
     def remember_instructions(self, upstream_name: str, instructions: str | None) -> None:
         """Consigne de portée serveur d'un upstream à secret volatil, gardée
@@ -136,8 +187,17 @@ class ToolCatalogCache:
         entry = self._read().get(upstream_name)
         if not isinstance(entry, dict):
             return [], None
+        raw_tools = entry.get("tools", [])
+        if not isinstance(raw_tools, list):
+            return [], None
+        # Une entrée d'un autre schéma (éditée à la main, version future) ne
+        # doit pas faire échouer `tools/list` : ce qui n'est pas lisible est
+        # ignoré, comme un fichier illisible.
+        known_at = entry.get("known_at")
+        if isinstance(known_at, bool) or not isinstance(known_at, (int, float)):
+            known_at = None
         tools = []
-        for raw in entry.get("tools", []):
+        for raw in raw_tools:
             try:
                 # Lecture tolérante : un cache écrit avant que le `_meta` y
                 # soit mémorisé n'a pas la clé, et un `_meta` qui n'est pas un
@@ -153,7 +213,7 @@ class ToolCatalogCache:
                 )
             except Exception:
                 continue
-        return tools, entry.get("known_at")
+        return tools, known_at
 
 
 def format_stale_description(description: str | None, known_at: float | None) -> str:
@@ -241,21 +301,30 @@ class UpstreamNotAuthorized(MCPError):
 
 
 class UpstreamSecretRequired(MCPError):
-    """Appel d'un outil dont l'upstream attend son secret volatil (lot AU).
+    """Appel d'un outil, ou lecture d'une skill (`skill_uri`), dont l'upstream
+    attend son secret volatil (lot AU).
 
     Même forme qu'`UpstreamNotAuthorized` : erreur JSON-RPC, `data.code`
     testé par égalité. `data` ne porte que l'upstream, pas la clef : un appel
     d'outil n'est pas gardé par l'origine, et les noms des clefs ne se lisent
     que par l'extension `miaou/volatile-secrets`, qui l'est."""
 
-    def __init__(self, upstream_name: str) -> None:
+    def __init__(self, upstream_name: str, skill_uri: str | None = None) -> None:
         # Lu par un modèle : il dit qui peut agir (l'utilisateur), où (dans
-        # MIAOU), et que l'échec n'est pas définitif.
+        # MIAOU), et que l'échec n'est pas définitif. Une lecture de skill
+        # refusée se nomme comme telle : ses skills restent listées pendant
+        # l'attente, et « ses outils refusent » n'en dirait rien.
+        refused = (
+            f"La skill {skill_uri} ne se lit pas en attendant ; une fois la "
+            f"saisie acceptée, la même lecture fonctionnera."
+            if skill_uri is not None
+            else "Ses outils refusent tout appel en attendant ; une fois la "
+            "saisie acceptée, le même appel fonctionnera."
+        )
         message = (
             f"Le serveur '{upstream_name}' attend un mot de passe (ou une clef) "
             f"que seul l'utilisateur peut saisir, dans MIAOU (carte de ce "
-            f"serveur MCP). Ses outils refusent tout appel en attendant ; une "
-            f"fois la saisie acceptée, le même appel fonctionnera."
+            f"serveur MCP). {refused}"
         )
         super().__init__(
             INVALID_REQUEST,
@@ -422,7 +491,9 @@ def build_status_report(
             failure = getattr(authorizer, "last_error", None)
             if failure:
                 lines.append(f"  Dernière tentative en échec : {failure}")
-                if "403" in failure:
+                # « 403 » isolé seulement : un état OAuth aléatoire (base64 URL,
+                # donc [\w-]) peut le contenir, et n'est pas un statut HTTP.
+                if re.search(r"(?<![\w-])403(?![\w-])", failure):
                     # Un 403 n'est PAS une autorisation manquante : le jeton a
                     # été obtenu, le serveur le refuse pour scope insuffisant.
                     # Relancer le parcours ne répare rien — c'est la config qui
@@ -489,7 +560,8 @@ def _describe_failure(exc: BaseException) -> str:
     """Une panne d'upstream en une ligne de journal : type et message de la
     cause réelle, déballée du task group qui l'enveloppe peut-être."""
     cause = _unwrap_exception_group(exc)
-    return f"{type(cause).__name__}: {cause}"
+    # `TimeoutError()` nu a un message vide : sans cette garde, « TimeoutError: ».
+    return f"{type(cause).__name__}: {cause}" if str(cause) else type(cause).__name__
 
 
 def _unreachable_message(upstream_name: str, upstream: Upstream) -> str:
@@ -661,7 +733,12 @@ def build_proxy_server(
                     _log(f"Outils de '{prefix}' non listés ({_describe_failure(e)}).")
                     continue
                 if catalog is not None and getattr(upstream, "cache_forbidden", False) is not True:
-                    catalog.remember(prefix, upstream_tools)
+                    try:
+                        catalog.remember(prefix, upstream_tools)
+                    except Exception as e:
+                        # Un schéma hostile (imbriqué sans fin) ne se sérialise
+                        # pas : le cache l'oublie, la liste vivante reste servie.
+                        _log(f"Outils de '{prefix}' non mémorisés ({_describe_failure(e)}).")
                 stale_since = None
             elif catalog is not None and _secret_pending(upstream):
                 # En attente de son secret (lot AU) : resservi depuis le cache
@@ -685,19 +762,25 @@ def build_proxy_server(
                 upstream_tools = published_tools(upstream, upstream_tools)
             for tool in upstream_tools:
                 prefixed = f"{prefix}__{tool.name}"
-                tool_map[prefixed] = (prefix, tool.name)
                 description = tool.description
                 if not live and not _secret_pending(upstream):
                     description = format_stale_description(description, stale_since)
                 meta = relay_tool_meta(prefix, tool.meta)
-                tools.append(
-                    types.Tool(
+                try:
+                    built = types.Tool(
                         name=prefixed,
                         description=description,
                         input_schema=_object_schema(_strip_param_headers(tool.input_schema)),
                         **({"_meta": meta} if meta else {}),
                     )
-                )
+                except Exception as e:
+                    # Un seul outil dont le schéma ne se traite pas (imbrication
+                    # sans fin d'un upstream tiers) est omis et signalé : il ne
+                    # fait pas échouer le listage de tous les upstreams.
+                    _log(f"Outil '{prefixed}' omis ({_describe_failure(e)}).")
+                    continue
+                tool_map[prefixed] = (prefix, tool.name)
+                tools.append(built)
         if authorizers:
             tools.append(_status_tool())
         # Le repli n'existe que si l'extension est servie : `install_skills` la
@@ -706,9 +789,9 @@ def build_proxy_server(
         if _skills_served():
             tools.append(read_skill_tool())
 
-        # `**{"_meta": ...}` et non `meta=...` : pydantic ne sérialise sous
-        # l'alias que si le champ a été peuplé PAR l'alias, et la propriété qui
-        # compte est que la clé arrive sur le fil en `_meta`. Un test le vérifie
+        # `**{"_meta": ...}` : le SDK 2.x accepte aussi `meta=` (les deux sortent
+        # en `_meta`), mais la propriété qui compte est que la clé arrive sur le
+        # fil en `_meta`. Un test le vérifie
         # sur la CHAÎNE JSON émise, pas sur l'objet Python — `result.meta` rend
         # la même chose quelle que soit la clé sérialisée, donc un test sur
         # l'objet passerait aussi bien sur une sortie invalide.
@@ -778,8 +861,21 @@ def build_proxy_server(
             # Refus AVANT l'appel : l'upstream n'a rien à dire tant qu'il n'est
             # pas autorisé.
             raise UpstreamNotAuthorized(upstream_name)
+        bound = getattr(upstream, "call_timeout", None)
+        bound = bound if isinstance(bound, (int, float)) and not isinstance(bound, bool) else None
         try:
-            return await upstream.call_tool(orig_name, arguments)
+            with anyio.move_on_after(bound) as scope:
+                result = await upstream.call_tool(orig_name, arguments)
+            if scope.cancelled_caught:
+                # L'appel est abandonné (et le compte InFlight libéré par la
+                # sortie du `with` de l'appelant) : sans borne, un upstream
+                # muet retiendrait indéfiniment la mise à jour du proxy.
+                return _error_result(
+                    f"Le serveur '{upstream_name}' n'a pas répondu à '{orig_name}' "
+                    f"sous {bound:g} s ; appel abandonné (clé `call_timeout` de "
+                    f"son entrée de config)."
+                )
+            return result
         except MCPError as e:
             # Erreur protocolaire voulue par l'outil (REF_UNKNOWN) : elle
             # traverse, `data` intact. Seulement d'un upstream inprocess — celle
@@ -799,7 +895,7 @@ def build_proxy_server(
             # task group, la cause réelle n'est pas toujours au premier plan.
             if isinstance(_unwrap_exception_group(e), AuthorizationRequired):
                 raise UpstreamNotAuthorized(upstream_name) from e
-            return _error_result(str(e))
+            return _error_result(str(e) or _describe_failure(e))
 
     def _skills_served() -> bool:
         return SKILLS_EXTENSION_ID in server.extensions

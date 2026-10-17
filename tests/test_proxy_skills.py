@@ -752,3 +752,30 @@ async def test_a_failing_upstream_loses_only_its_own_skills_block(optional_skill
     blocks = await build_skills_blocks(upstreams)
     assert list(blocks) == ["fx"]
     assert "Bloc des skills de 'broken' non généré" in capsys.readouterr().err
+
+
+# --- Fichier listé puis disparu : une cause lisible, pas « non servi » ----------------
+
+
+async def test_a_listed_file_that_vanished_is_unavailable_not_unserved(optional_skills_dir):
+    """Le fichier est toujours dans l'ensemble figé au démarrage : le lire pendant
+    qu'il manque sur disque n'est pas « non servi » (`-32602`) mais une panne de
+    la skill, dite comme telle, avec le fichier en cause. Les autres fichiers de
+    la skill restent lisibles."""
+    fx = InProcessUpstream(FIXTURE, config={"skills_dir": str(optional_skills_dir)})
+    server, _ = await _proxy({"fx": fx})
+    (optional_skills_dir / "tips" / "annexes" / "detail.md").unlink()
+    uri = "skill://fx/tips/annexes/detail.md"
+    with pytest.raises(MCPError) as info:
+        await _read(server, uri)
+    assert info.value.error.code == types.INTERNAL_ERROR
+    assert "detail.md" in info.value.error.message
+    assert "fx" in info.value.error.message
+
+    result = await call_tool(server, "read_skill", {"uri": uri})
+    assert result.is_error
+    assert "Aucun fichier de skill servi" not in result.content[0].text
+    assert "detail.md" in result.content[0].text
+
+    [content] = (await _read(server, "skill://fx/tips/SKILL.md")).contents
+    assert content.text == OPTIONAL_SKILL_MD

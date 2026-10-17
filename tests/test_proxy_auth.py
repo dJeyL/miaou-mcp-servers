@@ -618,6 +618,32 @@ async def test_unreachable_jwks_refuses_instead_of_crashing(rsa_key, monkeypatch
     assert await v.verify_token(_issue(rsa_key)) is None
 
 
+async def test_unreachable_jwks_discovery_is_not_repeated_on_every_request(rsa_key, monkeypatch):
+    """Z8-5 : un échec de découverte n'était pas mémorisé, donc chaque requête
+    porteuse d'un jeton relançait jusqu'à deux `urlopen` bloquants."""
+    import urllib.request
+
+    calls = []
+
+    def fake_urlopen(url, timeout=None):
+        calls.append(url)
+        raise OSError("injoignable")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    v = mcp_proxy.JwtTokenVerifier(issuer_url=_ISSUER, resource_url=_RESOURCE)
+    token = _issue(rsa_key)
+    assert await v.verify_token(token) is None
+    first = len(calls)
+    assert first >= 1
+    for _ in range(5):
+        assert await v.verify_token(token) is None
+    assert len(calls) == first
+
+    v._discovery_retry_not_before = 0.0      # le délai de repli est écoulé
+    assert await v.verify_token(token) is None
+    assert len(calls) > first
+
+
 # ---------------------------------------------------------------------------
 # --with-dev-auth : les deux serveurs dans un process (lot AB-1.4)
 #

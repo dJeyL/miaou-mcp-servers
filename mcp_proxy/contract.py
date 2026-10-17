@@ -66,6 +66,20 @@ class AuthorizationRequired(Exception):
         self.upstream_name = upstream_name
 
 
+def _disabled_flag(block: dict, key: str, where: str) -> bool:
+    # Un booléen strict, `null` valant absence : `bool("false")` est vrai, et une
+    # chaîne issue d'un `${VAR:-false}` neutralisait le bloc en silence.
+    value = block[key]
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"{where} : '{key}' doit être true ou false, reçu "
+            f"{type(value).__name__} ({value!r})."
+        )
+    return value
+
+
 def is_disabled(block: dict, where: str) -> bool:
     """Neutralisation d'un bloc de config : `disabled`, ou l'ancien `_disabled`.
 
@@ -85,6 +99,9 @@ def is_disabled(block: dict, where: str) -> bool:
     silencieuse. Sans lui, la tolérance serait invisible —
     ce qui marche sans rien dire ne se migre jamais, et l'orthographe morte
     survivrait dans les configs jusqu'au jour où on la retirerait pour de bon.
+
+    La valeur est un booléen (`null` = absent) ; toute autre est une `ValueError`
+    — la même sortie en 1 de `main()` que `resolve_lifecycle`.
     """
     legacy = "_disabled" in block
     if "disabled" in block:
@@ -93,11 +110,11 @@ def is_disabled(block: dict, where: str) -> bool:
                 f"config: {where} sets both 'disabled' and '_disabled' — "
                 f"'disabled' wins, '_disabled' is ignored. Drop '_disabled'."
             )
-        return bool(block["disabled"])
+        return _disabled_flag(block, "disabled", where)
     if legacy:
         _log(
             f"config: {where} uses '_disabled', the former spelling of "
             f"'disabled'. Still honoured — rename it."
         )
-        return bool(block["_disabled"])
+        return _disabled_flag(block, "_disabled", where)
     return False

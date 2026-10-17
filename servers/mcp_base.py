@@ -86,7 +86,7 @@ def enable_system_trust_store() -> bool:
     `truststore.inject_into_ssl()` remplace `ssl.SSLContext` par sa propre
     implémentation, adossée au magasin système. C'est ce qui rend cet appel
     unique suffisant pour TOUTE la sortie HTTPS du process, quelle que soit la
-    bibliothèque : urllib (make_opener, utilisé par weather/ddg/brave/web) comme
+    bibliothèque : urllib (make_opener de weather, openers de mcp_web) comme
     httpx (HttpUpstream du proxy, et le client OAuth du SDK MCP) construisent
     leur contexte via `ssl.create_default_context()`, donc via la classe
     patchée. Aucun appel HTTP n'est à réécrire, et rien n'est à passer
@@ -282,12 +282,22 @@ def _skill_files(root: Path) -> list[str]:
     point est écarté (`.DS_Store`, `.git/`…) : ce n'est pas du contenu de skill,
     et le servir ferait changer l'empreinte au gré du système de fichiers."""
     files: list[str] = []
+    resolved_root = root.resolve()
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root)
         if any(part.startswith(".") for part in rel.parts):
             continue
         if not path.is_file():
             continue
+        # Un lien symbolique dont la cible sort du dossier de la skill ferait
+        # servir (et empreinter) un fichier étranger à la skill : refusé au
+        # démarrage plutôt que suivi en silence. Un lien qui reste dedans passe.
+        target = path.resolve()
+        if not target.is_relative_to(resolved_root):
+            raise SkillError(
+                f"fichier « {rel.as_posix()} » : lien symbolique vers {target}, hors du "
+                f"dossier de la skill — copier le fichier dans la skill ou retirer le lien"
+            )
         for part in rel.parts:
             if not _SKILL_PATH_SEGMENT_RE.match(part):
                 raise SkillError(
@@ -418,6 +428,7 @@ class Skills(Extension):
     def __init__(self, skills_dir: str | Path) -> None:
         self.sources = scan_skills_dir(skills_dir)
         self._by_uri = {source.uri: source for source in self.sources}
+        self._reported: set[str] = set()
 
     def skill_uri(self, name: str) -> str | None:
         """URI du `SKILL.md` de la skill `name`, ou None si ce serveur ne la sert pas."""
@@ -435,8 +446,20 @@ class Skills(Extension):
             try:
                 entries.append(build_skill_entry(source))
             except SkillError as e:
-                print(f"Skill « {source.name} » omise : {e}", file=sys.stderr)
+                # Une ligne par cause : le catalogue est relu à chaque requête,
+                # le journal ne doit pas répéter la même panne à chacune.
+                message = f"Skill « {source.name} » omise : {e}"
+                if message not in self._reported:
+                    self._reported.add(message)
+                    print(message, file=sys.stderr)
         return entries
+
+    def served_uris(self) -> set[str]:
+        """URI de tous les fichiers de l'ensemble figé au démarrage — celui que
+        `resources/read` peut servir —, que leur contenu soit lisible ou non
+        maintenant. Distincte de `list_entries`, qui omet une skill devenue
+        invalide : un fichier disparu est une panne, pas un fichier « non servi »."""
+        return {source.file_uri(rel) for source in self.sources for rel in source.files}
 
     def get_entry(self, uri: str) -> dict[str, Any]:
         source = self._by_uri.get(uri)
@@ -630,7 +653,7 @@ class MiaouMCPBase:
     def run_http(self, host: str = "127.0.0.1", port: int | None = None) -> None:
         import uvicorn
 
-        port = port or self.default_port
+        port = self.default_port if port is None else port
         print(f"{self.mcp.name} → http://{host}:{port}/mcp  (Ctrl-C pour arrêter)")
         uvicorn.run(self._make_app(), host=host, port=port, log_level="info")
 
@@ -645,7 +668,7 @@ class MiaouMCPBase:
             server.py [--transport http|stdio] [--host H] [--port P]
 
         Active le magasin de confiance système ici plutôt que dans chaque
-        serveur : c'est le seul point traversé par les sept lancements
+        serveur : c'est le seul point traversé par les cinq lancements
         standalone. Le mode inprocess ne passe pas par là — le proxy fait le
         même appel de son côté, avant d'importer le moindre module de serveur.
         """
@@ -653,7 +676,13 @@ class MiaouMCPBase:
 
         # Detect legacy positional syntax: first arg looks like a host (no "--")
         args_raw = sys.argv[1:]
-        positional = args_raw and not args_raw[0].startswith("--")
+        # -h/--help n'importe où : toujours servi par argparse, jamais pris pour
+        # un lancement positionnel (qui démarrerait le serveur).
+        positional = (
+            args_raw
+            and not args_raw[0].startswith("-")
+            and not {"-h", "--help"} & set(args_raw)
+        )
 
         if positional:
             host = args_raw[0]

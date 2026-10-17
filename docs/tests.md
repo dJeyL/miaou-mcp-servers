@@ -4,8 +4,8 @@ Les commandes canoniques sont dans `CLAUDE.md`. Ici : ce que chaque suite mocke,
 et le script d'appel réel.
 
 Les tests de bench mockent `asyncio.sleep` pour éviter les délais de 2 s.
-Les tests de weather, fetch, ddg et brave mockent `urllib.request.OpenerDirector.open`.
-Les tests de brave mockent aussi `os.environ` — aucun appel réseau réel, aucune clef requise.
+Les tests de weather et de fetch mockent `urllib.request.OpenerDirector.open` — aucun appel
+réseau réel, aucune clef requise.
 `test_web_search.py` (recherche multi-moteurs de `mcp_web`) mocke le même `open` avec un
 routeur par fragment d'URL (`_Router`) : chaque moteur reçoit sa réponse, les requêtes
 sont comptées par moteur pour prouver qu'un moteur en pause ou après une réponse vide
@@ -158,6 +158,16 @@ vident en fixture autouse : sans quoi un test hériterait de la sonde ratée du 
 `fetch_url` rendant un `CallToolResult`, `test_web.py` passe par `_fetch_url`, qui en
 extrait le bloc unique et vérifie au passage `isError` faux.
 
+`tests/test_web_hardening.py` regroupe ce que la relecture de `mcp_web` (2026-10) a
+corrigé : URL invalide et charset `idna` (messages, pas d'exception), sweep qui épargne les
+fichiers étrangers, bombe gzip de 50 Mo décompressée sous un `max_bytes` de 1000 (une
+`decompressobj` espionnée vérifie qu'aucune sortie ne dépasse `max_bytes` + marge), sonde
+de favicon contre les formes d'IP et les redirections (le `ProbeRedirectHandler` se teste
+par `http_error_302` direct, l'opener étant patché ailleurs), alias d'URL finale, filtre de
+`canonical_url`, URL de résultats de recherche. Le seul vrai socket du fichier est un
+serveur HTTP loopback éphémère qui répond 302 vers `ftp://` : l'environnement proxy est
+neutralisé (`no_proxy=*`), sinon un proxy d'entreprise intercepterait même le loopback.
+
 Le mock de réponse de `test_web.py` (`_make_mock_resp`) porte un `Content-Encoding`
 optionnel, ce qui fait traverser `_decompress` (WEB9) au vrai chemin `fetch_url` /
 `fetch_resource` — le stub est l'opener, pas `_fetch_bytes`. Deux pièges de fixture y
@@ -166,10 +176,11 @@ sont posés, parce qu'aucun des deux ne fait échouer un test naïf :
 - une queue de remplissage **répétée** (`b"x" * 40000`) se gzippe en ~90 octets et ne
   franchit donc jamais `max_bytes` : le test de troncature mid-stream passerait sans avoir
   rien tronqué. D'où `os.urandom`, incompressible.
-- les deux tests de troncature restent **verts sur le code d'avant** (la décompression
-  n'est pas ce qu'ils gardent) ; seuls les cinq tests de décompression y tombent. Vérifié
+- les deux tests de troncature étaient **verts sur le code d'avant** (la décompression
+  n'est pas ce qu'ils gardent) ; seuls les cinq tests de décompression y tombaient. Vérifié
   en neutralisant `_decompress` — un test de non-régression qui passe des deux côtés ne
-  prouve rien.
+  prouve rien. Depuis que le plafond porte sur le décompressé, le second (corps de 5000 octets décompressés sous un plafond de
+  1000) attend au contraire la troncature annoncée : le plafond porte sur le décompressé.
 
 ### `tests/live_call.py` — appel réel d'un outil
 
@@ -220,7 +231,8 @@ AC d'entreprise interne échoue en `CERTIFICATE_VERIFY_FAILED` côté client alo
 serveurs, eux, joignent leurs upstreams : le banc d'essai diagnostiquerait un faux négatif.
 Le helper y est **recopié** plutôt qu'importé de `servers/mcp_base.py` — c'est un client
 autonome, et l'import tirerait le SDK serveur et starlette pour quatre lignes ; le prix est une
-duplication à répercuter (cf. `docs/tls.md`).
+duplication à répercuter, comme dans `tests/live_auth_probe.py` qui porte la seconde
+copie (cf. `docs/tls.md`).
 
 ### `tests/live_auth_probe.py` — ce qu'un upstream répond SANS jeton
 

@@ -124,7 +124,10 @@ class StatusParams(types.RequestParams):
 
 
 class ApplyParams(types.RequestParams):
-    target: str
+    # `Any` et non `str` : un `target` absent ou non textuel serait refusé par
+    # la validation du SDK, en erreur sans `data.code`. Il est jugé à la main,
+    # par `handle_apply`, qui le refuse en INVALID_TARGET comme tout autre refus.
+    target: Any = None
 
 
 class StatusResult(types.Result):
@@ -247,7 +250,7 @@ class SelfUpdater:
                 f"Le proxy n'est pas lancé par un superviseur ({SUPERVISED_ENV}=1 "
                 f"absente) : il ne redémarrerait pas. Mettre à jour à la main.",
             )
-        if not selfupdate.is_valid_target(params.target):
+        if not isinstance(params.target, str) or not selfupdate.is_valid_target(params.target):
             raise _refusal(
                 INVALID_TARGET, f"Cible invalide : {params.target!r} (sha complet attendu).",
                 types.INVALID_PARAMS,

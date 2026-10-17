@@ -77,18 +77,20 @@ from mcp import types
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
-from mcp_base import MiaouMCPBase, make_opener
+from mcp_base import MiaouMCPBase
 
 from . import cache as web_cache
 from .cache import CacheMiss
+from .netguard import web_opener
 from .pagemeta import (
     FAVICON_CACHE_MAX,
+    FAVICON_FAILURE_TTL_S,
     META_KEY,
     _FaviconCache,
     build_web_meta,
     extract_head_meta,
     origin_of,
-    resolve_favicon_blocking,
+    probe_favicon,
 )
 from .search import MAX_RESULTS, SEARCH_META_KEY, build_chain
 from .search import ddg as search_ddg
@@ -122,6 +124,17 @@ _TEXTUAL_APPLICATION_MIMES = frozenset({
 })
 
 
+def _decode(raw: bytes, charset: str) -> str:
+    """Décodage tolérant d'un corps selon le charset annoncé PAR LE SERVEUR : un
+    nom inconnu (LookupError) ou un codec qui n'est pas un charset (`idna`,
+    `punycode`… : UnicodeError, ValueError) retombe sur UTF-8 au lieu de faire
+    échouer l'appel."""
+    try:
+        return raw.decode(charset, errors="replace")
+    except (LookupError, UnicodeError, ValueError):
+        return raw.decode("utf-8", errors="replace")
+
+
 def _is_textual_mime(mime: str) -> bool:
     """True si le contenu doit être renvoyé en texte (TextResourceContents)
     plutôt qu'en blob base64 : text/*, plus les mimes application/* qui sont
@@ -134,13 +147,18 @@ def _is_textual_mime(mime: str) -> bool:
     )
 
 
-def _cache_and_cap(url: str, full_text: str, *, purge_html: bool = False) -> str:
+def _cache_and_cap(
+    url: str, full_text: str, *, purge_html: bool = False, final_url: str | None = None
+) -> str:
     """Met le texte complet en cache (clé = SHA256 de l'URL) et renvoie une version
     plafonnée à READ_CAP, avec notice de pagination si tronquée. purge_html=True
     (chemin text/*) invalide .html/.json d'une URL qui était auparavant du HTML
     (WEB3) ; le chemin HTML (_render_html_blocking) garde False, store_html vient
-    de (re)poser ces fichiers."""
+    de (re)poser ces fichiers. `final_url` (redirection suivie) pose l'alias qui
+    fait retrouver ce cache sous l'URL que le client cite."""
     web_cache.store(url, full_text, purge_html=purge_html)
+    if final_url:
+        web_cache.store_alias(final_url, url)
     cap = web_cache.READ_CAP
     if len(full_text) <= cap:
         return full_text
@@ -151,7 +169,9 @@ def _cache_and_cap(url: str, full_text: str, *, purge_html: bool = False) -> str
     )
 
 
-def _render_html_blocking(url: str, html_text: str, truncation_note: str) -> str:
+def _render_html_blocking(
+    url: str, html_text: str, truncation_note: str, final_url: str | None = None
+) -> str:
     """Mise en cache du HTML brut, conversion html2text (CPU-bound sur plusieurs Mo)
     et mise en cache du texte rendu, groupées pour un seul asyncio.to_thread —
     l'ordre compte (store_html avant la conversion, _cache_and_cap après)."""
@@ -160,7 +180,7 @@ def _render_html_blocking(url: str, html_text: str, truncation_note: str) -> str
     h.ignore_images = True
     h.body_width = 0
     cleaned = h.handle(html_text).strip() + truncation_note
-    return _cache_and_cap(url, cleaned)
+    return _cache_and_cap(url, cleaned, final_url=final_url)
 
 
 def _load_structure_blocking(url: str, html_text: str) -> list[dict]:
@@ -172,9 +192,30 @@ def _load_structure_blocking(url: str, html_text: str) -> list[dict]:
     return entries
 
 
-def _decompress(raw: bytes, encoding: str) -> bytes:
+_INFLATE_SLACK = 1024
+"""Marge d'octets COMPRESSÉS lus au-delà de max_bytes : un flux déjà peu
+compressible (dont le gzip dépasse un peu la taille de son contenu) doit pouvoir
+tenir en entier quand son contenu tient dans le plafond."""
+
+
+def _inflate(d, raw: bytes, max_out: int) -> tuple[bytes, bool]:
+    """Vide `raw` dans la decompressobj `d` par morceaux bornés (`max_length`),
+    sans jamais tenir plus de max_out+1 octets décompressés. Rend (octets
+    coupés à max_out, plafond atteint)."""
+    out = bytearray()
+    data = raw
+    while data and len(out) <= max_out:
+        out += d.decompress(data, max_out + 1 - len(out))
+        if d.eof:
+            break
+        data = d.unconsumed_tail
+    return bytes(out[:max_out]), len(out) > max_out
+
+
+def _decompress(raw: bytes, encoding: str, max_out: int) -> tuple[bytes, bool]:
     """Décompresse un corps selon son Content-Encoding, en tolérant une fin
-    manquante (WEB9).
+    manquante (WEB9). Rend (corps, tronqué) : au plus `max_out` octets
+    DÉCOMPRESSÉS, `tronqué` vrai si le contenu allait au-delà.
 
     On ne sollicite AUCUN encodage (pas d'Accept-Encoding dans la requête) :
     urllib n'en envoie pas et on ne décompresse donc que ce qu'un serveur
@@ -182,28 +223,32 @@ def _decompress(raw: bytes, encoding: str) -> bytes:
     2026-09-22 — et le corps gzip partait alors en decode(errors="replace"),
     d'où un texte de remplacement que le modèle lisait comme du contenu.
 
-    `raw` est déjà tronqué à max_bytes+1 OCTETS COMPRESSÉS, donc le flux est
-    coupé en plein milieu dès que le cap mord : `decompress()` lèverait sur la
-    fin absente. Les objets de décompression, eux, rendent ce qu'ils ont pu
-    lire — c'est exactement le comportement voulu, la troncature étant déjà
-    signalée par ailleurs.
+    Le plafond porte sur le résultat, pas sur le flux compressé : un
+    serveur hostile impose lui-même son encodage, et un gzip de quelques Mo se
+    décompresse en gigaoctets (ratio ~1000:1 mesuré). La décompression est donc
+    bornée en flux, jamais matérialisée au-delà de max_out+1 octets.
 
-    Un encodage inconnu (ou un corps illisible) rend `raw` inchangé : ce qui
-    était déjà envoyé avant cette fonction. Un cas non couvert ne doit pas
-    faire échouer un fetch qui aboutissait."""
+    `raw` peut être coupé en plein milieu (plafond des octets compressés) :
+    `decompress()` d'une fonction de haut niveau lèverait sur la fin absente.
+    Les objets de décompression, eux, rendent ce qu'ils ont pu lire — c'est
+    exactement le comportement voulu.
+
+    Un encodage inconnu (ou un corps illisible) rend `raw` inchangé, coupé au
+    plafond : ce qui était déjà envoyé avant cette fonction. Un cas non couvert
+    ne doit pas faire échouer un fetch qui aboutissait."""
     enc = encoding.strip().lower()
     try:
         if enc == "gzip" or enc == "x-gzip":
-            return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw)
+            return _inflate(zlib.decompressobj(16 + zlib.MAX_WBITS), raw, max_out)
         if enc == "deflate":
             try:
-                return zlib.decompressobj().decompress(raw)
+                return _inflate(zlib.decompressobj(), raw, max_out)
             except zlib.error:
                 # deflate « brut », sans en-tête zlib : toléré par les navigateurs.
-                return zlib.decompressobj(-zlib.MAX_WBITS).decompress(raw)
+                return _inflate(zlib.decompressobj(-zlib.MAX_WBITS), raw, max_out)
     except (zlib.error, OSError):
-        return raw
-    return raw
+        pass
+    return raw[:max_out], len(raw) > max_out
 
 
 def _fetch_bytes(
@@ -215,20 +260,25 @@ def _fetch_bytes(
     `url_finale` est l'adresse atteinte après les redirections suivies par
     urllib (`geturl()`), None si la réponse n'en donne pas une chaîne http(s).
 
-    La troncature est décidée ICI, sur les octets tels qu'ils arrivent du
-    réseau, et jamais en aval : après `_decompress` le corps est plus GROS que
-    `max_bytes` sans avoir rien perdu, si bien qu'un `len(corps) > max_bytes`
-    calculé plus loin signalerait une troncature qui n'a pas eu lieu."""
-    opener = make_opener()
+    `max_bytes` borne les octets UTILES, ceux qu'on rend : après décompression
+    éventuelle, jamais plus. La troncature est décidée ICI, sur ce que le
+    corps contient réellement, et jamais en aval. Pour un corps compressé, la
+    lecture du flux est elle-même bornée (max_bytes + `_INFLATE_SLACK`) ; si elle
+    est coupée avant la fin du flux, le contenu l'est aussi."""
+    opener = web_opener()
     with opener.open(req, timeout=10) as resp:
         content_type = resp.headers.get("Content-Type", "application/octet-stream")
         encoding = resp.headers.get("Content-Encoding") or ""
-        raw = resp.read(max_bytes + 1)
-        truncated = len(raw) > max_bytes
-        if truncated:
-            raw = raw[:max_bytes]
+        limit = max_bytes + _INFLATE_SLACK if encoding else max_bytes
+        raw = resp.read(limit + 1)
+        cut = len(raw) > limit
+        if cut:
+            raw = raw[:limit]
         if encoding:
-            raw = _decompress(raw, encoding)
+            raw, over = _decompress(raw, encoding, max_bytes)
+            truncated = cut or over
+        else:
+            truncated = cut
         return content_type, raw, truncated, _final_url(resp)
 
 
@@ -239,7 +289,11 @@ def _final_url(resp) -> str | None:
         return None
     if not isinstance(final, str):
         return None
-    if urllib.parse.urlsplit(final).scheme.lower() not in _ALLOWED_SCHEMES:
+    try:
+        scheme = urllib.parse.urlsplit(final).scheme.lower()
+    except ValueError:
+        return None
+    if scheme not in _ALLOWED_SCHEMES:
         return None
     return final
 
@@ -253,16 +307,21 @@ async def _guarded_fetch(
     (content_type, corps_tronqué, truncated, url_finale).
 
     La troncature et la décompression appartiennent à `_fetch_bytes` (WEB9) :
-    le corps rendu ici peut dépasser `max_bytes` — c'est le cas nominal d'une
-    réponse compressée non tronquée."""
-    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    le corps rendu ici ne dépasse jamais `max_bytes`, décompressé compris."""
+    try:
+        scheme = urllib.parse.urlsplit(url).scheme.lower()
+    except ValueError:
+        return f"URL invalide : {url}"
     if scheme not in _ALLOWED_SCHEMES:
         return f"Schéma d'URL non autorisé ({scheme or '?'}) — http/https uniquement : {url}"
     if max_bytes < 1:
         return f"max_bytes doit être >= 1 (reçu {max_bytes})"
     max_bytes = min(max_bytes, cap)
 
-    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    except ValueError:
+        return f"URL invalide : {url}"
     try:
         content_type, raw, truncated, final_url = await asyncio.to_thread(
             _fetch_bytes, req, max_bytes
@@ -289,8 +348,8 @@ async def _favicon_for(page_url: str, icons: list[tuple[str, str]]) -> str | Non
     found, value = favicon_cache.get(origin)
     if found:
         return value
-    value = await asyncio.to_thread(resolve_favicon_blocking, page_url, icons, _UA)
-    favicon_cache.put(origin, value)
+    value, transient = await asyncio.to_thread(probe_favicon, page_url, icons, _UA)
+    favicon_cache.put(origin, value, FAVICON_FAILURE_TTL_S if transient else None)
     return value
 
 
@@ -379,8 +438,9 @@ class WebServer(MiaouMCPBase):
                 int,
                 Field(
                     description=(
-                        f"Taille maximale en octets à télécharger ; une valeur plus "
-                        f"grande que le plafond ({_DEFAULT_MAX_BYTES}) y est silencieusement ramenée."
+                        f"Taille maximale en octets utiles reçus, après décompression "
+                        f"éventuelle ; une valeur plus grande que le plafond "
+                        f"({_DEFAULT_MAX_BYTES}) y est silencieusement ramenée."
                     )
                 ),
             ] = _DEFAULT_MAX_BYTES,
@@ -400,16 +460,13 @@ class WebServer(MiaouMCPBase):
             truncation_note = f"\n\n[Tronqué à {max_bytes} octets]" if truncated else ""
 
             if mime == "text/html":
-                try:
-                    html_text = raw.decode(charset, errors="replace")
-                except LookupError:
-                    html_text = raw.decode("utf-8", errors="replace")
+                html_text = _decode(raw, charset)
                 head = await asyncio.to_thread(extract_head_meta, html_text)
                 # Favicon sondée PENDANT la conversion html2text, pas après :
                 # sur une grosse page, la sonde ne rallonge alors rien.
                 text, favicon = await asyncio.gather(
                     asyncio.to_thread(
-                        _render_html_blocking, url, html_text, truncation_note
+                        _render_html_blocking, url, html_text, truncation_note, final_url
                     ),
                     _favicon_for(final_url or url, head["icons"]),
                 )
@@ -425,10 +482,7 @@ class WebServer(MiaouMCPBase):
                     build_web_meta(canonical_url=final_url, head=head, favicon=favicon),
                 )
             elif _is_textual_mime(mime):
-                try:
-                    text = raw.decode(charset, errors="replace")
-                except LookupError:
-                    text = raw.decode("utf-8", errors="replace")
+                text = _decode(raw, charset)
                 full_text = text + truncation_note
                 return _tool_result(
                     types.EmbeddedResource(
@@ -436,7 +490,7 @@ class WebServer(MiaouMCPBase):
                         resource=types.TextResourceContents(
                             uri=url,  # type: ignore[arg-type]
                             mimeType=mime,
-                            text=await asyncio.to_thread(_cache_and_cap, url, full_text, purge_html=True),
+                            text=await asyncio.to_thread(_cache_and_cap, url, full_text, purge_html=True, final_url=final_url),
                         ),
                     ),
                     build_web_meta(canonical_url=final_url),
@@ -458,8 +512,10 @@ class WebServer(MiaouMCPBase):
         fetch_url.__doc__ = f"""Télécharge une URL et renvoie son contenu : HTML converti
         en texte, mimes textuels (text/*, JSON, XML, JavaScript, suffixes
         +json/+xml) renvoyés tels quels avec leur mime d'origine, binaire
-        (image, etc.) encodé en base64. Téléchargement limité à max_bytes
-        (défaut et plafond {_DEFAULT_MAX_BYTES} octets).
+        (image, etc.) encodé en base64. Limité à max_bytes octets utiles reçus,
+        après décompression éventuelle d'un corps que le serveur a compressé de
+        lui-même (défaut et plafond {_DEFAULT_MAX_BYTES} octets) ; au-delà, le
+        contenu est tronqué et la fin du texte le dit.
 
         Le texte renvoyé est en plus plafonné à {web_cache.READ_CAP} caractères ;
         le texte complet est conservé en cache — paginer avec
@@ -519,10 +575,11 @@ class WebServer(MiaouMCPBase):
             entry_start: int = 0,
             entry_end: int | None = None,
         ) -> str:
+            target = await asyncio.to_thread(web_cache.resolve, url)
             try:
-                html_text = await asyncio.to_thread(web_cache.load_html, url)
+                html_text = await asyncio.to_thread(web_cache.load_html, target)
             except CacheMiss:
-                if web_cache.entry_path(url).exists():
+                if web_cache.entry_path(target).exists():
                     return f"Cette URL n'a pas renvoyé du HTML — fetch_list ne s'applique pas : {url}"
                 return f"Aucun HTML en cache pour cette URL — appeler fetch_url d'abord : {url}"
 
@@ -531,7 +588,7 @@ class WebServer(MiaouMCPBase):
             if entry_end is not None and entry_end < entry_start:
                 return f"entry_end ({entry_end}) < entry_start ({entry_start})"
 
-            entries = await asyncio.to_thread(_load_structure_blocking, url, html_text)
+            entries = await asyncio.to_thread(_load_structure_blocking, target, html_text)
 
             cap = web_cache.LIST_CAP
             requested_end = (
@@ -571,9 +628,9 @@ class WebServer(MiaouMCPBase):
                 int,
                 Field(
                     description=(
-                        f"Taille maximale en octets à transférer au client ; une valeur "
-                        f"plus grande que le plafond ({web_cache.RESOURCE_MAX_BYTES}) y "
-                        f"est silencieusement ramenée."
+                        f"Taille maximale en octets utiles transférés au client, après "
+                        f"décompression éventuelle ; une valeur plus grande que le "
+                        f"plafond ({web_cache.RESOURCE_MAX_BYTES}) y est silencieusement ramenée."
                     )
                 ),
             ] = web_cache.RESOURCE_MAX_BYTES,
@@ -609,8 +666,10 @@ class WebServer(MiaouMCPBase):
         descripteur factuel (mime, taille, URL) est renvoyé au modèle. Le contenu
         est toujours transféré en binaire, même pour du texte/JSON, afin de rester
         exploitable tel quel côté client (ex. réinjection vers un outil de
-        documents). Téléchargement limité à max_bytes (défaut et plafond
-        {web_cache.RESOURCE_MAX_BYTES} octets)."""
+        documents). Limité à max_bytes octets utiles, après décompression
+        éventuelle d'un corps que le serveur a compressé de lui-même (défaut et
+        plafond {web_cache.RESOURCE_MAX_BYTES} octets) ; au-delà, le descripteur
+        annonce la troncature."""
         self.mcp.tool(name="fetch_resource")(fetch_resource)
 
     def _register_search_tools(self) -> None:

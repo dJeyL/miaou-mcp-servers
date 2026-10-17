@@ -64,7 +64,10 @@ Trois propriétés à ne pas défaire :
   par requête. Le `jwks_uri` vient de la config, sinon il est découvert auprès de
   l'émetteur (`_discover_jwks_uri` sonde RFC 8414 puis OpenID Connect Discovery : un AS
   OIDC ne sert souvent que le second). La récupération est bloquante (urllib), donc passée
-  par `asyncio.to_thread` — pattern du dépôt pour toute I/O en contexte async.
+  par `asyncio.to_thread` — pattern du dépôt pour toute I/O en contexte async. Un échec de
+  découverte est **mémorisé 10 s** (`_DISCOVERY_RETRY_DELAY_S`, même erreur rendue sans
+  réseau) : sans cela, chaque requête portant un jeton relançait jusqu'à deux `urlopen`
+  bloquants tant que l'AS dormait. Les threads du pool ne sont pas bornés pour autant.
 
 `pyjwt[crypto]` est désormais importé directement, donc déclaré explicitement aux **deux**
 endroits qui gouvernent un environnement : `requirements.txt` et `pyproject.toml`. Il y en
@@ -136,7 +139,7 @@ Clefs RSA **générées à chaque démarrage**, stockage **en mémoire** : redé
 tout ce qui a été émis. C'est un choix, pas un raccourci — une clef privée de
 développement qui traînerait sur disque finirait réutilisée ailleurs.
 
-`--auto-approve` saute l'écran de consentement, pour les tests automatisés qui ne peuvent
+`--auto-approve` (`--dev-auth-auto-approve` sous `mcp_proxy --with-dev-auth`) saute l'écran de consentement, pour les tests automatisés qui ne peuvent
 pas cliquer. C'est le **seul** écart entre le mode manipulable au navigateur et la
 fixture déterministe : tout le reste est partagé, pour que la fixture éprouve exactement
 ce qu'on éprouve à la main.
@@ -429,6 +432,18 @@ jeton court jusqu'à son terme, `authorization_pending` reste bas, et
 tant que le jeton reste dans la fenêtre, la boucle repasse à chaque réveil — trois
 fois par durée de vie — et répéter le non-événement noierait le reste.
 
+**Un AS en panne n'est pas martelé.** Sur un `lifetime` de quelques secondes, la
+période de la boucle tombe à son plancher de 1 s. Un renouvellement qui échoue
+sur exception (AS injoignable) arme donc un repli exponentiel par upstream
+(`_retry_not_before`, 2^n s plafonné à 5 min) pendant lequel `refresh_if_due`
+rend `False` sans requête, et le message n'est journalisé qu'au premier échec de
+l'épisode (`_renewal_failures`, remis à zéro dès que l'AS répond).
+
+**Un `expires_in` aberrant ne plante rien.** `set_tokens()` le plafonne à dix ans
+(`_MAX_EXPIRES_IN_S`) : `10**400` levait `OverflowError` dans le flow du SDK, jeton
+non écrit. En lecture, un `expires_at` illisible du fichier (NaN, Infinity, non
+numérique) vaut « expiré » : on rafraîchit au lieu de planter `get_tokens()`.
+
 **Un jeton relu n'est pas un jeton frais**, et `set_tokens()` doit s'en garder.
 `get_tokens()` écrase `expires_in` par le RESTANT — nécessaire, le SDK ne
 repassant pas par `update_token_expiry()` au chargement — mais le SDK garde cet
@@ -614,7 +629,34 @@ diagnostic réseau générique : un enregistrement refusé (`403
 insufficient_scope`) ou un scope manquant est une erreur de configuration, et la
 présenter comme une panne fait recliquer sur un lien qui ne peut rien réparer.
 Les deux routes échappent tout ce qu'elles interpolent (`html.escape`) — elles
-sont publiques, et `name` vient du chemin d'URL.
+sont publiques, et `name` vient du chemin d'URL pour `/authorize/{name}`,
+`error` de la query string pour `/callback` (`render_callback_page` échappe
+`error` ET le nom d'upstream ; la version initiale ne le faisait pas, XSS
+réfléchi sur l'origine de MIAOU). Les pages de `/callback` et le refus de
+`/authorize` portent en plus `Content-Security-Policy: default-src 'none';
+style-src 'unsafe-inline'` : un échappement oublié ne devient pas exécutable.
+
+**`/callback` ne remet un callback qu'à l'upstream dont le `state` est EXACTEMENT
+celui de son URL d'autorisation** (`hmac.compare_digest`). Il n'y a plus de repli
+« un seul parcours en attente » : un appel sans `state`, ou au mauvais, tuait le
+parcours (`PendingAuthorization.resolve` garde le premier résultat) — déni de
+service par n'importe quelle page que le navigateur ouvre, la boucle locale étant
+atteignable en `GET`. Sans `state` dans la réponse de l'AS, le SDK échoue de
+toute façon : le repli n'avait aucune utilité. Réponse : 400 « aucune autorisation
+en attente », `pending` intact.
+
+**`/authorize/{name}` est un GET à effet de bord, public : il refuse ce qu'une
+page tierce peut déclencher.** Règle sur `Sec-Fetch-Site` : absent, `same-origin`
+ou `none` passent ; toute autre valeur (`same-site`, `cross-site`) est refusée en
+403 SAUF une navigation voulue par l'utilisateur, `Sec-Fetch-Mode: navigate` ET
+`Sec-Fetch-User: ?1`. En-tête absent = accepté : client non navigateur, ou origine
+non sûre où le navigateur n'émet pas ces en-têtes. Le motif de l'exception :
+MIAOU ouvre `authorize_path` par un `<a target=_blank>` cliqué ou un `window.open`
+synchrone dans un handler de clic, éventuellement depuis une autre origine
+(`file://`, autre hôte derrière Caddy) — deux gestes qui portent `navigate` +
+`?1`. Refusés donc : `<img>`, `fetch()`, navigation automatique cross-site. Le
+parcours n'est alors pas lancé ; la page dit d'ouvrir le lien depuis MIAOU ou la
+barre d'adresse.
 
 Le lien d'autorisation est **imprimé sur stderr**, copiable. C'est le mécanisme
 de référence, pas un repli : `mcp_proxy` est une CLI, et confier l'ouverture à
@@ -803,19 +845,15 @@ Un upstream non vivant **sans authorizer** n'y figure pas : il est injoignable,
 pas non autorisé, n'a aucun parcours à proposer, et le publier enverrait le
 client sur un `/authorize/{name}` qui répond 404.
 
-**Piège de construction.** `types.ListToolsResult(meta={...})` sérialise la clé
-en `meta`, pas `_meta` — pydantic ne sérialise sous l'alias que si le champ a
-été peuplé PAR l'alias. La forme correcte est `**{"_meta": {...}}`. La version
-actuelle du SDK refuse `meta=` d'un `TypeError`, mais **la propriété à garder
-n'est pas ce refus** : c'est que la clé arrive sur le fil en `_meta`. Le test
-assertionne donc sur la **chaîne JSON émise**, jamais sur l'objet Python —
-`result.meta` rend la même chose dans les deux cas, donc un test sur l'objet
-passerait aussi bien sur une sortie invalide.
+**Construction.** Avec le SDK 2.x (`mcp_types` 2.2.0, mesuré), le constructeur
+de `types.ListToolsResult` accepte `meta=` ET `_meta=`, et les deux sortent en
+`_meta` sur le fil. Le piège de 1.x (`meta=` sérialisé en `meta`, puis refusé
+d'un `TypeError`) n'existe plus ; le code garde `**{"_meta": {...}}`, qui reste
+correct. **La propriété à garder** est que la clé arrive sur le fil en `_meta` :
+le test assertionne donc sur la **chaîne JSON émise**, jamais sur l'objet Python
+— `result.meta` rend la même chose quelle que soit la clé sérialisée.
 
-`handle_list_tools` rend un `ListToolsResult` (style nouveau) et non une
-`list[types.Tool]` : le SDK enveloppe un retour de style ancien **sans `_meta`**,
-il n'existe aucun moyen d'en porter un sans migrer. Le dispatch se fait sur la
-**signature** du handler (`create_call_wrapper`), pas sur son type de retour.
+`handle_list_tools` rend un `ListToolsResult`, seul moyen de porter un `_meta`.
 
 **Outil `status`** — nom **nu**, sans préfixe : MIAOU préfixe déjà par le nom de
 la carte serveur, donc `proxy__status` donnerait `miaou-proxy__proxy__status`.
@@ -839,7 +877,9 @@ qu'elle est prête, attend l'ordre d'arrêt, puis referme au même endroit. Elle
 hébergée par le task group **du lifespan** (`host_tasks_in`), jamais par un task
 group créé dans `start()` : le scope appartiendrait alors à la tâche appelante,
 qui peut être éphémère (une requête `/authorize/{name}`), et resterait ouvert
-dans une tâche morte.
+dans une tâche morte. `StdioUpstream` suit le même patron (tâche asyncio propre, sans
+task group hôte : `docs/proxy.md`, « Ordre et concurrence du démarrage »), parce que le
+lifespan appelle les `start()` depuis des tâches filles qui ne lui survivent pas.
 
 Le symptôme, quand on s'y prend mal, est toujours le même et c'est ce qui rend le
 piège coûteux : `Attempted to exit cancel scope in a different task…`

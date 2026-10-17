@@ -134,13 +134,19 @@ class BenchServer(MiaouMCPBase):
         async def dns_lookup(hostname: str) -> str:
             """Résout un nom d'hôte en adresse(s) IP depuis le réseau local du serveur."""
             await asyncio.sleep(2)
+            if "\x00" in hostname:
+                # Certains OS résolvent le préfixe avant le NUL : le nom cité ne
+                # serait pas celui résolu.
+                return "Échec de résolution : nom d'hôte invalide (octet NUL)."
             try:
                 # socket.getaddrinfo est bloquant (T2) — déporté sur un thread
                 # pour ne pas geler l'event loop pendant la résolution DNS.
                 infos = await asyncio.to_thread(socket.getaddrinfo, hostname, None)
                 addrs = sorted({str(i[4][0]) for i in infos})
                 return f"{hostname} → " + ", ".join(addrs)
-            except OSError as e:
+            except (OSError, UnicodeError, ValueError, TypeError) as e:
+                # UnicodeError (label idna > 63 car.) n'est pas une OSError : sans
+                # ce filet, le SDK la rend en « Error executing tool » nu.
                 return f"Échec de résolution de {hostname} : {e}"
 
         @self.mcp.tool()
@@ -158,7 +164,8 @@ class BenchServer(MiaouMCPBase):
             try:
                 hostname, _, _ = await asyncio.to_thread(socket.gethostbyaddr, ip)
                 return f"{ip} → {hostname}"
-            except OSError as e:
+            except (OSError, UnicodeError, ValueError, TypeError) as e:
+                # TypeError : octet NUL dans l'argument de gethostbyaddr.
                 return f"Échec de résolution inverse de {ip} : {e}"
 
         @self.mcp.tool()

@@ -16,6 +16,8 @@ for p in (_ROOT, _SERVERS):
 import mcp.types as types
 
 import mcp_proxy
+import mcp_proxy.server
+from mcp_proxy.server import ToolCatalogCache
 from tests.proxy_client import call_tool, list_tools
 from mcp_proxy import (
     InProcessUpstream,
@@ -419,6 +421,8 @@ def test_compute_proxy_env_overrides_proxy_sets_all_case_variants():
         "https_proxy": "http://127.0.0.1:3128",
         "HTTP_PROXY": "http://127.0.0.1:3128",
         "HTTPS_PROXY": "http://127.0.0.1:3128",
+        "all_proxy": "http://127.0.0.1:3128",
+        "ALL_PROXY": "http://127.0.0.1:3128",
     }
 
 
@@ -429,6 +433,8 @@ def test_compute_proxy_env_overrides_noproxy_clears_all_case_variants():
         "https_proxy": None,
         "HTTP_PROXY": None,
         "HTTPS_PROXY": None,
+        "all_proxy": None,
+        "ALL_PROXY": None,
     }
 
 
@@ -897,7 +903,7 @@ async def _run_lifespan(asgi_app):
 
 
 class _FailingUpstream(InProcessUpstream):
-    """Upstream dont start() lève, comme mcp_brave sans clef d'API."""
+    """Upstream dont start() lève, comme mcp_web sans moteur de recherche utilisable."""
 
     def __init__(self, message: str = "clef d'API absente") -> None:
         super().__init__("mcp_bench")
@@ -1152,6 +1158,22 @@ def test_noproxy_overrides_reach_http_upstream_via_process_env(monkeypatch):
 
     for key in mcp_proxy._PROXY_ENV_KEYS:
         assert key not in os.environ
+    assert not upstream._build_http_client()._mounts
+
+
+@pytest.mark.parametrize("variable", ["ALL_PROXY", "all_proxy"])
+def test_noproxy_also_clears_all_proxy_for_the_http_upstream(monkeypatch, variable):
+    """httpx2 (trust_env) lit ALL_PROXY comme http_proxy ; urllib l'ignore.
+    Mesuré le 2026-10-17 : sans cette clé, --noproxy laissait un proxy monté."""
+    for key in mcp_proxy._PROXY_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(variable, "http://from-env:3128")
+    upstream = mcp_proxy.HttpUpstream("https://example.test/mcp")
+    assert upstream._build_http_client()._mounts  # témoin
+
+    apply_proxy_env_overrides_to_process(compute_proxy_env_overrides(proxy=None, noproxy=True))
+
+    assert variable not in os.environ
     assert not upstream._build_http_client()._mounts
 
 
@@ -1770,3 +1792,320 @@ def test_dev_auth_plain_shutdown_does_not_restart(uvicorn_double, monkeypatch):
         object(), "127.0.0.1", 8765, 8787, "http://127.0.0.1:8787"
     )
     assert uvicorn_double == []
+
+
+# ---------------------------------------------------------------------------
+# Lot de relecture L6 : upstreams, catalogue, arrêt, call_timeout, noms
+# ---------------------------------------------------------------------------
+
+
+def _tool(name: str, schema: dict | None = None) -> "types.Tool":
+    return types.Tool(name=name, description="", inputSchema=schema or {"type": "object"})
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["a/b", "", "a__b", "a b", "trailing_", "dot.ted", "accentué"],
+)
+def test_build_upstreams_rejects_a_name_the_routing_cannot_carry(name):
+    """Le nom préfixe les outils (`<nom>__<outil>`, coupé au premier `__`) et
+    ouvre les URI de skills (`skill://<nom>/…`, coupé au premier `/`) : un nom
+    qui contient l'un des séparateurs route mal, en silence."""
+    cfg = {"port": 8765, "mcpServers": {name: {"command": "uv"}}}
+    with pytest.raises(ValueError, match="nom d'upstream"):
+        build_upstreams(cfg)
+
+
+def test_build_upstreams_accepts_usual_names_and_ignores_disabled_ones():
+    cfg = {
+        "port": 8765,
+        "mcpServers": {
+            "bench": {"command": "uv"},
+            "my-server_2": {"command": "uv"},
+            "_example/with slash": {"disabled": True, "command": "uv"},
+        },
+    }
+    assert set(build_upstreams(cfg)) == {"bench", "my-server_2"}
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"command": "uv", "call_timeout": 12},
+        {"command": "uv", "call_timeout": 0.5},
+        {"type": "http", "url": "http://x/mcp", "call_timeout": 90},
+    ],
+)
+def test_build_upstreams_call_timeout_is_carried(entry):
+    [upstream] = build_upstreams({"port": 8765, "mcpServers": {"x": entry}}).values()
+    assert upstream.call_timeout == entry["call_timeout"]
+
+
+def test_call_timeout_defaults_to_300_seconds_for_stdio_and_http():
+    cfg = {
+        "port": 8765,
+        "mcpServers": {"s": {"command": "uv"}, "h": {"type": "http", "url": "http://x/mcp"}},
+    }
+    upstreams = build_upstreams(cfg)
+    assert upstreams["s"].call_timeout == 300
+    assert upstreams["h"].call_timeout == 300
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"command": "uv", "call_timeout": 0},
+        {"command": "uv", "call_timeout": -3},
+        {"command": "uv", "call_timeout": "60"},
+        {"command": "uv", "call_timeout": True},
+        {"command": "uv", "call_timeout": None},
+        {"command": "uv", "call_timeout": float("nan")},
+        {"command": "uv", "call_timeout": float("inf")},
+        {"type": "http", "url": "http://x/mcp", "call_timeout": 0},
+        {"type": "inprocess", "module": "mcp_bench", "call_timeout": 5},
+    ],
+)
+def test_build_upstreams_rejects_an_invalid_call_timeout(entry):
+    with pytest.raises(ValueError, match="'call_timeout'"):
+        build_upstreams({"port": 8765, "mcpServers": {"x": entry}})
+
+
+async def _hanging_server(timeout, in_flight):
+    import asyncio
+
+    upstream = MagicMock()
+    upstream.call_timeout = timeout
+    upstream.list_tools = AsyncMock(return_value=[_tool("slow")])
+
+    async def never(name, arguments):
+        await asyncio.sleep(3600)
+
+    upstream.call_tool = never
+    server = build_proxy_server({"hang": upstream}, {}, in_flight=in_flight)
+    await list_tools(server)
+    return server
+
+
+async def test_a_call_past_call_timeout_is_a_clear_tool_error_and_frees_in_flight():
+    from mcp_proxy.server import InFlight
+
+    in_flight = InFlight()
+    server = await _hanging_server(0.2, in_flight)
+    result = await call_tool(server, "hang__slow", {})
+    assert result.is_error is True
+    text = result.content[0].text
+    assert "'hang'" in text and "slow" in text and "0.2" in text
+    assert in_flight.count == 0
+
+
+async def test_call_without_a_bound_is_left_alone():
+    """Un upstream sans `call_timeout` (inprocess) n'est pas borné par le proxy."""
+    import asyncio
+
+    upstream = MagicMock()
+    upstream.call_timeout = None
+    upstream.list_tools = AsyncMock(return_value=[_tool("ok")])
+
+    async def slowish(name, arguments):
+        await asyncio.sleep(0.2)
+        return types.CallToolResult(content=[types.TextContent(type="text", text="done")])
+
+    upstream.call_tool = slowish
+    server = build_proxy_server({"u": upstream}, {})
+    await list_tools(server)
+    result = await call_tool(server, "u__ok", {})
+    assert result.content[0].text == "done"
+
+
+async def test_exception_with_an_empty_message_is_still_readable():
+    upstream = MagicMock()
+    upstream.call_timeout = None
+    upstream.list_tools = AsyncMock(return_value=[_tool("t")])
+    upstream.call_tool = AsyncMock(side_effect=TimeoutError())
+    server = build_proxy_server({"u": upstream}, {})
+    await list_tools(server)
+    result = await call_tool(server, "u__t", {})
+    assert result.is_error is True
+    assert result.content[0].text == "TimeoutError"
+
+
+# --- Catalogue en cache : schéma inattendu, écriture atomique -------------------
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"tools": None, "known_at": 1.0},
+        {"tools": 3, "known_at": 1.0},
+        {"tools": "abc", "known_at": 1.0},
+        {"tools": [], "known_at": "x"},
+        {"tools": [], "known_at": [1]},
+        {"tools": [], "known_at": True},
+    ],
+)
+def test_recall_tolerates_an_entry_of_another_schema(tmp_path, entry):
+    import json
+
+    path = tmp_path / "cache.json"
+    path.write_text(json.dumps({"u": entry}))
+    tools, known_at = ToolCatalogCache(path).recall("u")
+    assert tools == []
+    assert known_at is None
+
+
+def test_recall_keeps_the_good_part_of_a_partly_valid_entry(tmp_path):
+    import json
+
+    path = tmp_path / "cache.json"
+    path.write_text(
+        json.dumps({"u": {"known_at": 5, "tools": [{"name": "ok"}, "junk", {"nope": 1}]}})
+    )
+    tools, known_at = ToolCatalogCache(path).recall("u")
+    assert [t.name for t in tools] == ["ok"]
+    assert known_at == 5
+
+
+def test_cache_write_is_atomic_when_the_replace_fails(tmp_path, monkeypatch, capsys):
+    import json
+
+    path = tmp_path / "cache.json"
+    cache = ToolCatalogCache(path)
+    cache.remember("a", [_tool("one")])
+    before = path.read_text()
+
+    def broken_replace(src, dst):
+        raise OSError("disque plein")
+
+    monkeypatch.setattr(mcp_proxy.server.os, "replace", broken_replace)
+    cache.remember("b", [_tool("two")])
+    assert path.read_text() == before
+    assert list(json.loads(before)) == ["a"]
+    assert [p.name for p in tmp_path.iterdir()] == ["cache.json"]
+    assert "Cache d'outils non écrit" in capsys.readouterr().err
+
+
+def test_cache_write_leaves_no_partial_file_behind(tmp_path):
+    path = tmp_path / "cache.json"
+    cache = ToolCatalogCache(path)
+    cache.remember("a", [_tool("one")])
+    cache.remember("b", [_tool("two")])
+    assert [p.name for p in tmp_path.iterdir()] == ["cache.json"]
+
+
+def test_cache_is_not_rewritten_when_nothing_changed(tmp_path, monkeypatch):
+    cache = ToolCatalogCache(tmp_path / "cache.json")
+    cache.remember_instructions("u", "consigne")
+    calls = []
+    real = mcp_proxy.server.os.replace
+    monkeypatch.setattr(
+        mcp_proxy.server.os, "replace", lambda s, d: (calls.append(d), real(s, d))[1]
+    )
+    cache.remember_instructions("u", "consigne")
+    assert calls == []
+    cache.remember_instructions("u", "autre")
+    assert len(calls) == 1
+
+
+def test_an_unreadable_cache_is_kept_aside_not_silently_overwritten(tmp_path, capsys):
+    """Un fichier illisible n'est pas réécrit par-dessus : sa copie est gardée
+    à côté, et la perte des autres entrées est dite dans le journal."""
+    path = tmp_path / "cache.json"
+    path.write_text('{"a": {"known_at": 1, "tools": [')  # tronqué
+    ToolCatalogCache(path).remember("c", [_tool("t")])
+    assert (tmp_path / "cache.json.corrupt").read_text() == '{"a": {"known_at": 1, "tools": ['
+    assert "illisible" in capsys.readouterr().err
+
+
+async def test_a_hostile_nested_schema_does_not_take_down_tools_list():
+    deep: dict = {"type": "string"}
+    for _ in range(1500):
+        deep = {"type": "object", "properties": {"x": deep}}
+    hostile = MagicMock()
+    hostile.call_timeout = None
+    hostile.list_tools = AsyncMock(return_value=[_tool("evil", deep)])
+    fine = MagicMock()
+    fine.call_timeout = None
+    fine.list_tools = AsyncMock(return_value=[_tool("ok")])
+    server = build_proxy_server({"hostile": hostile, "fine": fine}, {})
+    names = [t.name for t in (await list_tools(server)).tools]
+    assert "fine__ok" in names
+    assert "hostile__evil" not in names
+
+
+# --- Lifespan : démarrage interrompu, erreurs d'arrêt ---------------------------------
+
+
+class _Recording(InProcessUpstream):
+    def __init__(self) -> None:
+        super().__init__("mcp_bench")
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+        await super().stop()
+
+
+class _HangingStart(InProcessUpstream):
+    def __init__(self) -> None:
+        super().__init__("mcp_bench")
+        self.reached = None
+
+    async def start(self) -> None:
+        import anyio
+
+        self.reached.set()
+        await anyio.sleep_forever()
+
+
+async def test_cancelled_startup_still_stops_the_upstreams_already_started():
+    import anyio
+
+    first = _Recording()
+    hanging = _HangingStart()
+    hanging.reached = anyio.Event()
+    upstreams = {"first": first, "hang": hanging}
+    app = build_app(build_proxy_server(upstreams, {}), upstreams)
+
+    async def receive():
+        return {"type": "lifespan.startup"} if not sent else await anyio.sleep_forever()
+
+    sent: list = []
+
+    async def send(message):
+        sent.append(message)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(lambda: app({"type": "lifespan"}, receive, send))
+        with anyio.fail_after(10):
+            await hanging.reached.wait()
+        tg.cancel_scope.cancel()
+    assert first.stopped is True
+
+
+async def test_a_failing_stop_is_logged_not_swallowed(capsys):
+    class _BadStop(_Recording):
+        async def stop(self) -> None:
+            raise RuntimeError("zombie récalcitrant")
+
+    good = _Recording()
+    upstreams = {"bad": _BadStop(), "good": good}
+    app = build_app(build_proxy_server(upstreams, {}), upstreams)
+    async with _run_lifespan(app):
+        pass
+    import anyio
+
+    await anyio.sleep(0.2)
+    err = capsys.readouterr().err
+    assert "'bad'" in err and "zombie récalcitrant" in err
+    assert good.stopped is True
+
+
+@pytest.mark.parametrize("name, module", [("duckduckgo", "mcp_ddg"), ("brave", "mcp_brave")])
+def test_a_leftover_patch_of_a_removed_server_says_what_to_do(name, module):
+    """mcp_ddg et mcp_brave supprimés : un config.json qui patchait leur entrée de
+    config.defaults.json (clef d'API, `disabled: false`) n'en garde qu'un reste sans
+    `type` ni `command`. Le message nomme la cause au lieu de « stdio sans command »."""
+    cfg = {"mcpServers": {name: {"disabled": False, "config": {"api_key": "k"}}}}
+    with pytest.raises(ValueError, match=f"{module} a été supprimé") as exc:
+        mcp_proxy.build_upstreams(cfg)
+    assert f"Retirer mcpServers.{name}" in str(exc.value)

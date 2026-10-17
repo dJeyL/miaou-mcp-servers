@@ -236,6 +236,7 @@ def _pending(config=None, name="api"):
 def _reset_fixture():
     fixture.CHECKS.clear()
     fixture.BUILDS.clear()
+    fixture.DELAY_S = 0.0
 
 
 async def test_pending_upstream_is_not_built_and_check_config_sees_the_marker():
@@ -602,3 +603,245 @@ def test_credentials_rejected_is_recognised_by_name_from_another_module():
     assert vs.classify_failure(Sub("x")) == vs.REJECTED
     assert vs.classify_failure(mcp_base.ConfigIncomplete("x")) == vs.INCOMPLETE
     assert vs.classify_failure(OSError("x")) == vs.INDETERMINATE
+
+
+# --- Z2 : formes échappées, tâche détachée, bornes (lot L4) -------------------
+
+# Antislash, apostrophe, guillemet, saut de ligne, non-ASCII : chaque forme
+# (brute, repr, JSON ASCII, JSON brut) y diffère des autres.
+TRICKY = "ab\\c'\"d\né"
+
+
+def _all_forms(value: str) -> set[str]:
+    return {value, repr(value)[1:-1], json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]}
+
+
+def test_the_four_forms_of_the_tricky_value_really_differ():
+    assert len(_all_forms(TRICKY)) == 4
+
+
+def test_mask_removes_the_escaped_forms_too():
+    for form in _all_forms(TRICKY):
+        masked = mask(f"cité : {form} fin", TRICKY)
+        assert masked == "cité : *** fin"
+        assert not any(f in masked for f in _all_forms(TRICKY))
+    assert mask("rien", "") == "rien"
+
+
+async def test_escaped_value_never_leaks_through_a_failing_build(tmp_path, capsys):
+    value = fixture.LEAKY_PREFIX + TRICKY
+    proxy = _Proxy(tmp_path, {"api": _api()})
+    async with _run_lifespan(proxy.app):
+        result = await proxy.rpc(vs.SUBMIT_METHOD, {"key": KEY, "value": value})
+        status = await proxy.rpc(vs.STATUS_METHOD)
+    detail = _consumer(result)["detail"]
+    assert detail.startswith("ValueError: config invalide") and "***" in detail
+    out = capsys.readouterr()
+    for text in (json.dumps(result), json.dumps(status), out.out, out.err):
+        for form in _all_forms(value):
+            assert form not in text
+
+
+@pytest.mark.parametrize("cite", ["cite", "cite_instructions"])
+async def test_escaped_value_cited_by_the_server_stays_out_of_the_cache_file(tmp_path, monkeypatch, cite):
+    monkeypatch.setattr(fixture, "EXPECTED", TRICKY)
+    proxy = _Proxy(tmp_path, {"api": _api(**{cite: True})})
+    async with _run_lifespan(proxy.app):
+        await proxy.rpc(vs.SUBMIT_METHOD, {"key": KEY, "value": TRICKY})
+        await list_tools(proxy.server)
+    assert proxy.upstreams["api"].cache_forbidden is True
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            text = path.read_text(errors="replace")
+            for form in _all_forms(TRICKY):
+                assert form not in text
+
+
+class _Ctx:
+    """Contexte minimal qui passe la garde Host/Origin, sans transport."""
+    request = type("R", (), {"headers": {"host": f"127.0.0.1:{PORT}", "origin": ORIGIN}})()
+
+
+async def test_cancelled_submit_does_not_allow_a_second_concurrent_build(tmp_path):
+    import asyncio
+
+    fixture.DELAY_S = 0.6
+    proxy = _Proxy(tmp_path, {"api": _api()})
+    async with _run_lifespan(proxy.app):
+        params = vs.KeyParams(key=KEY, value=fixture.EXPECTED)
+        first = asyncio.create_task(proxy.secrets.handle_submit(_Ctx, params))
+        await asyncio.sleep(0.2)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        second = await proxy.secrets.handle_submit(_Ctx, params)
+        assert _consumer(second.model_dump()) == {
+            "upstream": "api", "state": "ready", "verdict": "accepted", "detail": None}
+        assert len(fixture.BUILDS) == 1
+        # La surface a été republiée par la tâche détachée, pas par l'appelant.
+        assert "## api\n\nConsigne du serveur à secret." in proxy.server.instructions
+
+
+async def test_different_value_after_a_cancelled_submit_waits_for_the_lock(tmp_path):
+    import asyncio
+
+    fixture.DELAY_S = 0.4
+    proxy = _Proxy(tmp_path, {"api": _api()})
+    async with _run_lifespan(proxy.app):
+        first = asyncio.create_task(
+            proxy.secrets.handle_submit(_Ctx, vs.KeyParams(key=KEY, value="faux")))
+        await asyncio.sleep(0.15)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        second = await proxy.secrets.handle_submit(_Ctx, vs.KeyParams(key=KEY, value=fixture.EXPECTED))
+        assert _consumer(second.model_dump())["verdict"] == "accepted"
+        assert len(fixture.BUILDS) == 2
+
+
+async def test_rejected_fingerprints_are_bounded(tmp_path):
+    proxy = _Proxy(tmp_path, {"api": _api()})
+    async with _run_lifespan(proxy.app):
+        for i in range(vs.MAX_REJECTED + 6):
+            await proxy.secrets.handle_submit(_Ctx, vs.KeyParams(key=KEY, value=f"faux-{i}"))
+        assert len(proxy.secrets._keys[KEY].rejected) == vs.MAX_REJECTED
+        builds = len(fixture.BUILDS)
+        # La plus récente est toujours retenue (non retestée), la plus ancienne oubliée.
+        await proxy.secrets.handle_submit(_Ctx, vs.KeyParams(key=KEY, value=f"faux-{vs.MAX_REJECTED + 5}"))
+        assert len(fixture.BUILDS) == builds
+        await proxy.secrets.handle_submit(_Ctx, vs.KeyParams(key=KEY, value="faux-0"))
+        assert len(fixture.BUILDS) == builds + 1
+
+
+async def test_catalog_is_not_written_unchecked_when_the_citation_check_could_not_run(tmp_path, monkeypatch):
+    # `_remember` ne peut pas lister les outils (échec ponctuel) : il rend sans
+    # contrôle. Le listage suivant de `tools/list` ne doit pas écrire alors le
+    # catalogue — qui cite la valeur — sur disque.
+    monkeypatch.setattr(fixture, "EXPECTED", TRICKY)
+    proxy = _Proxy(tmp_path, {"api": _api(cite=True)})
+    async with _run_lifespan(proxy.app):
+        upstream = proxy.upstreams["api"]
+        real = upstream.list_tools
+        calls = []
+
+        async def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("panne ponctuelle")
+            return await real()
+
+        monkeypatch.setattr(upstream, "list_tools", flaky)
+        await proxy.rpc(vs.SUBMIT_METHOD, {"key": KEY, "value": TRICKY})
+        await list_tools(proxy.server)
+    assert len(calls) >= 2
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            text = path.read_text(errors="replace")
+            for form in _all_forms(TRICKY):
+                assert form not in text
+
+
+# --- Skills d'un upstream en attente de son secret ------------------------------
+
+DEMO_SKILL = "skill://secret_demo/secret-demo/SKILL.md"
+
+
+def _demo():
+    config = {"login": "demo", "password": {"volatile": KEY}, "expected": "miaou"}
+    return {"type": "inprocess", "module": "mcp_secret_demo", "config": config}
+
+
+async def _skills_wire(proxy: _Proxy) -> str:
+    """`skills/list` tel que le fil le rend, ordre des clés compris."""
+    return json.dumps(await proxy.rpc("skills/list"), ensure_ascii=False)
+
+
+async def test_pending_skills_come_from_the_cache_byte_identical(tmp_path):
+    # 1. Premier démarrage, cache vide : aucune skill, donc pas d'extension.
+    first = _Proxy(tmp_path, {"secret_demo": _demo()})
+    async with _run_lifespan(first.app):
+        assert mcp_base.SKILLS_EXTENSION_ID not in first.server.extensions
+        await first.rpc(vs.SUBMIT_METHOD, {"key": KEY, "value": "miaou"})
+        live = await _skills_wire(first)
+        live_instructions = first.server.instructions
+    assert [s["uri"] for s in json.loads(live)["skills"]] == [DEMO_SKILL]
+    assert f"`secret-demo` ({DEMO_SKILL}), facultative" in live_instructions
+
+    # 2. Proxy relancé, secret oublié : resservi du cache, à l'octet près.
+    second = _Proxy(tmp_path, {"secret_demo": _demo()})
+    async with _run_lifespan(second.app):
+        assert second.upstreams["secret_demo"].secret_pending is True
+        assert await _skills_wire(second) == live
+        assert second.server.instructions == live_instructions
+        resources = await second.rpc("resources/list")
+        assert [r["uri"] for r in resources["resources"]] == [DEMO_SKILL]
+        for method, params in (("skills/get", {"uri": DEMO_SKILL}), ("resources/read", {"uri": DEMO_SKILL})):
+            err = await second.refused(method, params)
+            assert err.error.data == {"code": SECRET_REQUIRED, "upstream": "secret_demo"}
+            assert f"La skill {DEMO_SKILL} ne se lit pas en attendant" in err.error.message
+            assert "Ses outils" not in err.error.message
+        # 3. Saisie acceptée : les entrées vivantes, identiques.
+        await second.rpc(vs.SUBMIT_METHOD, {"key": KEY, "value": "miaou"})
+        assert await _skills_wire(second) == live
+        assert second.server.instructions == live_instructions
+        got = await second.rpc("skills/get", {"uri": DEMO_SKILL})
+        assert got["skill"]["uri"] == DEMO_SKILL
+
+
+async def test_pending_skills_are_listed_in_config_order_among_live_ones(tmp_path):
+    first = _Proxy(tmp_path, {"secret_demo": _demo(), "bench": {"type": "inprocess", "module": "mcp_bench"}})
+    async with _run_lifespan(first.app):
+        await first.rpc(vs.SUBMIT_METHOD, {"key": KEY, "value": "miaou"})
+        live = await _skills_wire(first)
+    second = _Proxy(tmp_path, {"secret_demo": _demo(), "bench": {"type": "inprocess", "module": "mcp_bench"}})
+    async with _run_lifespan(second.app):
+        assert await _skills_wire(second) == live
+    assert [s["uri"].split("/")[2] for s in json.loads(live)["skills"]] == ["secret_demo", "bench"]
+
+
+def _skill_dir(tmp_path: Path, description: str) -> Path:
+    root = tmp_path / "skills"
+    (root / "tips").mkdir(parents=True)
+    (root / "tips" / "SKILL.md").write_text(f"---\nname: tips\ndescription: {description}\n---\n\nCorps.\n")
+    return root
+
+
+async def test_value_cited_by_a_skill_keeps_the_upstream_out_of_the_cache(tmp_path, capsys):
+    skills = _skill_dir(tmp_path, f"Mot de passe {fixture.EXPECTED}")
+    proxy = _Proxy(tmp_path, {"api": _api(skills_dir=str(skills))})
+    async with _run_lifespan(proxy.app):
+        await proxy.rpc(vs.SUBMIT_METHOD, {"key": KEY, "value": fixture.EXPECTED})
+        await proxy.rpc("skills/list")
+        await list_tools(proxy.server)
+    assert proxy.upstreams["api"].cache_forbidden is True
+    cache = tmp_path / "tools-cache.json"
+    assert not cache.exists() or fixture.EXPECTED not in cache.read_text()
+    assert "ses skills" in capsys.readouterr().err
+
+
+async def test_skills_of_a_cited_free_upstream_are_cached_at_acceptance(tmp_path):
+    skills = _skill_dir(tmp_path, "Conseils.")
+    proxy = _Proxy(tmp_path, {"api": _api(skills_dir=str(skills))})
+    async with _run_lifespan(proxy.app):
+        await proxy.rpc(vs.SUBMIT_METHOD, {"key": KEY, "value": fixture.EXPECTED})
+    assert [s["uri"] for s in proxy.catalog.recall_skills("api")] == ["skill://tips/SKILL.md"]
+
+
+def test_cache_keeps_skills_across_tool_and_instruction_writes(tmp_path):
+    import mcp.types as types
+
+    catalog = ToolCatalogCache(tmp_path / "c.json")
+    entry = {"uri": "skill://t/SKILL.md", "z": 1, "a": 2}
+    catalog.remember_skills("api", [entry])
+    catalog.remember("api", [types.Tool(name="t", input_schema={"type": "object"})])
+    catalog.remember_instructions("api", "Consigne.")
+    assert catalog.recall_skills("api") == [entry]
+    assert list(catalog.recall_skills("api")[0]) == ["uri", "z", "a"]
+    assert catalog.recall_skills("autre") == []
+
+
+async def test_upstream_without_volatile_key_writes_no_skills(tmp_path):
+    proxy = _Proxy(tmp_path, {"bench": {"type": "inprocess", "module": "mcp_bench"}})
+    async with _run_lifespan(proxy.app):
+        await proxy.rpc("skills/list")
+    assert proxy.catalog.recall_skills("bench") == []

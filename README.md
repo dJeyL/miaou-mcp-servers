@@ -11,8 +11,6 @@ de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
 | `servers/mcp_bench.py` | 8766 | Banc d'essai : echo, add, DNS, image PNG, resource JSON ; sert une skill exigée par ses outils |
 | `servers/mcp_weather.py` | 8767 | Météo réelle via wttr.in (resource JSON) |
 | `servers/mcp_web/` | 8768 | Téléchargement d'URL (HTML→texte, text/* et JSON/XML, binaire base64) et recherche web/images multi-moteurs (Brave → Ollama → DuckDuckGo, ordre configurable), package |
-| `servers/mcp_ddg.py` | 8769 | Recherche DuckDuckGo HTML, sans clef API — **déprécié** (remplacé par `search` de `mcp_web`) |
-| `servers/mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) — **déprécié** (remplacé par `search`/`image_search` de `mcp_web`) |
 | `servers/mcp_secret_demo.py` | 8772 | Démonstration des secrets volatils : un mot de passe saisi dans MIAOU, testé au démarrage ([détail](#mot-de-passe-saisi-dans-miaou-secret-volatil)) |
 | `servers/mcp_docs/` | 8771 | Extraction PDF/Office/Zip, paginée, sessions par conversation — **obsolète, désactivé par défaut** ([pourquoi](#mcp_docs--obsolète-mais-conservé-pour-le-hors-connexion)) |
 | `mcp_proxy/` | configurable | Proxy qui agrège les serveurs ci-dessus, leurs outils et leurs skills (extension Skills de MCP) |
@@ -62,8 +60,6 @@ pip install -r requirements.txt
 ```bash
 uv run servers/mcp_bench.py                   # HTTP 127.0.0.1:8766
 uv run servers/mcp_weather.py                 # HTTP 127.0.0.1:8767
-uv run servers/mcp_ddg.py                     # HTTP 127.0.0.1:8769
-BRAVE_API_KEY=<key> uv run servers/mcp_brave.py  # HTTP 127.0.0.1:8770
 MIAOU_SECRET_DEMO_PASSWORD=miaou uv run servers/mcp_secret_demo.py  # HTTP 127.0.0.1:8772
 
 # mcp_web et mcp_docs sont des packages (pas des scripts plats) — lancement différent :
@@ -120,9 +116,11 @@ dans l'ordre de `config.search.order` ; un moteur à clef sans clef
 (`config.search.brave.api_key` / `BRAVE_API_KEY`, `config.search.ollama.api_key` /
 `OLLAMA_API_KEY`) est écarté au démarrage, DuckDuckGo n'en demande pas. Si l'ordre
 ne cite que des moteurs non configurés, web refuse de démarrer et le proxy l'écarte
-en servant les autres serveurs. duckduckgo et brave, dépréciés au profit de cette
-recherche, sont désactivés ; docs l'est aussi, parce qu'il est devenu obsolète
-(voir plus bas). Retirer `disabled` suffit à réveiller chacun.
+en servant les autres serveurs. docs est désactivé, parce qu'il est devenu obsolète
+(voir plus bas) : retirer `disabled` suffit à le réveiller. Les anciens serveurs
+`mcp_ddg` et `mcp_brave` ont été supprimés (remplacés par cette recherche) : un
+`config.json` qui patchait encore leurs entrées `duckduckgo`/`brave` fait refuser le
+démarrage avec un message qui dit quoi retirer.
 
 ## Configuration MIAOU
 
@@ -132,8 +130,6 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 bench       → http://127.0.0.1:8766/mcp   (streamable-http)
 weather     → http://127.0.0.1:8767/mcp   (streamable-http)
 web         → http://127.0.0.1:8768/mcp   (streamable-http)
-duckduckgo  → http://127.0.0.1:8769/mcp   (streamable-http)   — déprécié
-brave       → http://127.0.0.1:8770/mcp   (streamable-http)   — déprécié
 docs        → http://127.0.0.1:8771/mcp   (streamable-http, obsolète — voir plus bas)
 proxy       → http://127.0.0.1:8765/mcp   (streamable-http)
 ```
@@ -158,11 +154,15 @@ Le proxy accepte en plus :
                              les précédents. Remplace la chaîne par défaut :
                              config.defaults.json → config.site.json → config.json,
                              chacun lu s'il existe
---proxy [http://]host:port  Force http_proxy/https_proxy (+ variantes majuscules) vus
+--print-config              Affiche la config effective (secrets masqués), puis quitte
+--migrate-config            Allège le dernier fichier de la chaîne de ce que les
+                             précédents portent déjà (sauvegarde <fichier>.bak), puis quitte
+--diff                      Avec --migrate-config : le diff de l'allègement, sans écrire
+--proxy [http://]host:port  Force http_proxy/https_proxy/all_proxy (+ majuscules) vus
                              par tous les serveurs servis, même si déjà définis dans
                              l'environnement ou config.json ("http://" ajouté si absent)
 --noproxy                   Force l'absence de proxy pour tous les serveurs servis,
-                             même si http_proxy/https_proxy sont définis ailleurs
+                             même si http_proxy/https_proxy/all_proxy sont définis ailleurs
                              (incompatible avec --proxy)
 --auth                      Force l'activation de l'auth OAuth entrante (exige la
                              clé "auth" dans config.json)
@@ -171,7 +171,13 @@ Le proxy accepte en plus :
 --with-dev-auth [PORT]      Lance aussi le serveur d'autorisation de développement
                              dans ce process (défaut 8787) et pointe l'auth dessus
 --dev-auth-auto-approve     Avec --with-dev-auth : pas d'écran de consentement
+--tokens-file FICHIER       Jetons OAuth des upstreams (défaut : state/tokens.json)
+--open                      Ouvre l'URL d'autorisation dans le navigateur (le lien
+                             reste affiché, c'est lui la référence)
+--debug-auth                Trace le parcours OAuth sortant (valeurs sensibles masquées)
 ```
+
+`uv run mcp_proxy --help` fait foi.
 
 ## Configuration du proxy (`config.json`)
 
@@ -204,6 +210,9 @@ Le proxy accepte en plus :
 `"disabled": true` sur une entrée → upstream ignoré au démarrage.
 L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'est plus celle qu'on écrit — dans ce fichier, un souligné en tête signale ailleurs (`_comment`) une clé ignorée, ce que cet interrupteur n'est justement pas. Le proxy le signale au démarrage, une ligne par bloc concerné, pour que la migration se voie plutôt que de traîner indéfiniment ; une config déjà en `disabled` ne dit rien.
 `env` sur une entrée inprocess → variables d'environnement injectées avant l'import.
+Nom d'une entrée : lettres, chiffres, `-` et `_`, sans `__` ni `_` final (il préfixe les outils, `<nom>__<outil>`, et les URI de skills) ; un autre nom fait refuser le démarrage.
+`call_timeout` sur une entrée stdio ou http → borne d'un appel d'outil en secondes (défaut 300) ; au-delà, l'appel est abandonné et rendu en erreur.
+Un secret d'upstream stdio va dans `env` (masqué en entier par `--print-config`), jamais dans `args` (jamais masqués).
 `"type": "http"` + `url` → serveur MCP **distant** en streamable-http (cf. `docs/proxy.md`).
 Avec un serveur stdio ou http, le proxy négocie la révision MCP 2026-07-28 et se replie
 sur `initialize` si le serveur ne la parle pas ; `"protocol_era": "legacy"` sur l'entrée
@@ -528,6 +537,11 @@ dans `tests/` parce que c'est un outil de vérification, pas un module du produi
 ```
 miaou-mcp-servers/
 ├── mcp_proxy/            # proxy (package, point d'entrée principal)
+│   ├── __init__.py       # ré-exporte la surface publique historique
+│   ├── __main__.py       # python -m mcp_proxy
+│   ├── contract.py       # constantes et exceptions partagées
+│   ├── logging.py        # journal au format uvicorn
+│   ├── netproxy.py       # override --proxy / --noproxy
 │   ├── upstream.py       # InProcess / Stdio / Http
 │   ├── config.py         # load_config, build_upstreams
 │   ├── layers.py         # chaîne de config, fusion, ${VAR}, --migrate-config
@@ -554,8 +568,6 @@ miaou-mcp-servers/
 │   ├── mcp_bench.py      # banc d'essai (port 8766)
 │   ├── mcp_weather.py    # météo wttr.in (port 8767)
 │   ├── mcp_web/          # fetch URL et recherche multi-moteurs (port 8768), package
-│   ├── mcp_ddg.py        # recherche DDG (port 8769) — déprécié
-│   ├── mcp_brave.py      # recherche Brave (port 8770) — déprécié
 │   ├── mcp_secret_demo.py # démonstration des secrets volatils (port 8772)
 │   ├── skills/           # skills des serveurs mono-fichier (bench)
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — obsolète
@@ -574,15 +586,21 @@ miaou-mcp-servers/
 │   ├── test_web.py
 │   ├── test_web_structure.py
 │   ├── test_web_search.py           # recherche multi-moteurs de mcp_web
-│   ├── test_ddg.py
-│   ├── test_brave.py
+│   ├── test_web_pagemeta.py         # _meta de fetch_url (titre, URL finale, favicon)
+│   ├── test_web_hardening.py        # URL invalide, bombe gzip, sonde de favicon, alias
 │   ├── test_docs.py
 │   ├── test_proxy.py
 │   ├── test_proxy_layers.py         # config en couches, state/
 │   ├── test_skills.py               # extension Skills des serveurs
 │   ├── test_proxy_skills.py         # skills servies par le proxy
 │   ├── test_proxy_remote_skills.py  # skills relayées d'upstreams stdio et http
+│   ├── test_proxy_era.py            # ère négociée avec les upstreams stdio/http
+│   ├── proxy_client.py              # harnais JSON-RPC legacy (non collecté)
 │   ├── skills_fixture_server.py     # upstream de test qui sert des skills (non collecté)
+│   ├── era_fixture_server.py        # upstream 2.x de test (non collecté)
+│   ├── fabricated_skills_server.py  # upstream aux entrées de skills fabriquées (non collecté)
+│   ├── legacy_stdio_fixture.py      # faux upstream stdio qui ne parle que initialize (non collecté)
+│   ├── volatile_fixture_server.py   # upstream inprocess à secret volatil (non collecté)
 │   ├── test_proxy_auth.py           # auth OAuth entrante
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante
 │   ├── test_proxy_webapp.py         # MIAOU servi sous /app/ (dont un vrai uvicorn)
@@ -592,11 +610,17 @@ miaou-mcp-servers/
 │   ├── test_proxy_lifecycle.py      # extension miaou/lifecycle, relance réelle sous supervise.sh
 │   ├── test_secret_demo.py          # serveur de démonstration des secrets volatils
 │   ├── test_dev_auth_server.py      # serveur d'autorisation de développement
-│   └── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
+│   ├── live_call.py      # appel manuel d'un outil sur un serveur lancé (non collecté)
+│   ├── live_auth_probe.py      # ce qu'un upstream répond sans jeton (non collecté)
+│   └── live_discovery_probe.py # ce que la découverte OAuth du SDK conclurait (non collecté)
 ├── config.defaults.json  # couche de base de la config (config.site.json, config.json par-dessus)
 ├── requirements.txt
 ├── pyproject.toml        # métadonnées + config pytest (asyncio_mode=auto) + groupe dev
-└── uv.lock               # lock uv, versionné
+├── uv.lock               # lock uv, versionné
+├── Dockerfile            # image du proxy (MIAOU copié depuis miaou_dist/)
+├── docker-compose.yml
+├── LICENSE
+└── .gitattributes        # *.sh en LF
 ```
 
 `CLAUDE.md` (à la racine) est le point d'entrée pour travailler dans le dépôt : forme

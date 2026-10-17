@@ -16,8 +16,7 @@ Trois types d'upstream supportés :
 Les entrées inprocess acceptent un champ `env` pour injecter des variables d'environnement
 avant l'import du module (`os.environ.setdefault`). `mcp_web` lit les clefs de ses moteurs
 de recherche en priorité dans le bloc `config.search` de son entrée (cf. `docs/servers.md`),
-et retombe sur `BRAVE_API_KEY` / `OLLAMA_API_KEY` dans l'environnement ; `mcp_brave`,
-déprécié, fait de même avec `config.api_key`.
+et retombe sur `BRAVE_API_KEY` / `OLLAMA_API_KEY` dans l'environnement.
 
 Une entrée `http` prend `url` (obligatoire, l'endpoint `/mcp` du serveur distant),
 `headers` (optionnel, en-têtes statiques — un serveur tiers peut exiger une clef d'API
@@ -38,11 +37,12 @@ l'autre.
 ### Override du proxy réseau vu par les upstreams (`--proxy` / `--noproxy`)
 
 Deux options CLI, mutuellement exclusives, pour contrôler `http_proxy`/`https_proxy`
-(et variantes `HTTP_PROXY`/`HTTPS_PROXY`) vus par les serveurs upstream servis :
+et `all_proxy` (et variantes `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`) vus par les
+serveurs upstream servis :
 
-- `--proxy [http://]host:port` : force les 4 variantes de casse à cette valeur
+- `--proxy [http://]host:port` : force les 6 variantes de casse à cette valeur
   (`http://` ajouté si le schéma est absent).
-- `--noproxy` : force l'absence de proxy (les 4 variantes supprimées/non transmises).
+- `--noproxy` : force l'absence de proxy (les 6 variantes supprimées/non transmises).
 
 Absolus : ils priment sur toute variable déjà présente dans l'environnement du process
 proxy **et** sur un `env` explicite d'une entrée `config.json` — pas seulement sur un
@@ -51,12 +51,14 @@ héritage implicite. Sans l'un ou l'autre, comportement inchangé.
 Trois chemins d'application distincts selon le type d'upstream :
 
 - **inprocess** : partage le process du proxy, donc `main()` pose/efface directement les
-  4 clés dans `os.environ` du process (`apply_proxy_env_overrides_to_process`) avant le
+  6 clés dans `os.environ` du process (`apply_proxy_env_overrides_to_process`) avant le
   premier `prepare` d'upstream, au lifespan (`build_upstreams` n'importe rien, et la
   validation d'une config modifiée le rejoue sans toucher à `os.environ`) — `make_opener()` (`servers/mcp_base.py`) relit `os.environ` à chaque
   requête via `ProxyHandler()`, aucun changement requis dans `InProcessUpstream`.
 - **stdio** : le SDK MCP (`mcp.client.stdio.get_default_environment`) n'hérite qu'une
-  whitelist restreinte (`HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER`) — les variables
+  whitelist restreinte (sous POSIX `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER` ;
+  sous Windows une liste propre, `APPDATA`, `PATH`, `PATHEXT`, `SYSTEMROOT`, `TEMP`,
+  `USERPROFILE`…) — les variables
   proxy du process proxy ne sont **jamais** vues par un subprocess sauf si explicitement
   posées dans son `env`. `build_upstreams` fusionne donc les overrides dans le `env` de
   chaque `StdioUpstream` via `merge_proxy_env_overrides` (CLI par-dessus `env` de
@@ -71,11 +73,13 @@ Trois chemins d'application distincts selon le type d'upstream :
   Ils visaient avant la migration le client que construisait le SDK
   (`create_mcp_http_client`) : restés verts, ils n'auraient plus rien prouvé.
 
-  **Limite connue** : httpx2 lit aussi `ALL_PROXY` et `NO_PROXY`, que `_PROXY_ENV_KEYS`
-  (les quatre variantes de casse de `http_proxy`/`https_proxy`) ne gère pas. Un
-  environnement portant `ALL_PROXY` verrait donc `--noproxy` partiellement inopérant
-  pour un upstream http. Non corrigé délibérément : étendre `_PROXY_ENV_KEYS` changerait
-  aussi le `env` transmis aux subprocess stdio existants, ce qui n'est pas gratuit.
+  **`ALL_PROXY`** (mesuré le 2026-10-17) : httpx2 le lit, comme `http_proxy` — un client
+  `trust_env` en monte un proxy —, urllib l'ignore (son `ProxyHandler` en tire un
+  `all_open` que rien n'appelle), et le SDK MCP ne le transmet pas à un subprocess stdio
+  (liste blanche). Il fige donc `--noproxy` pour un upstream http, d'où sa place dans
+  `_PROXY_ENV_KEYS` ; le prix, assumé : `--proxy`/`--noproxy` posent/retirent aussi
+  `all_proxy`/`ALL_PROXY` dans le `env` d'un upstream stdio. `NO_PROXY` reste à
+  l'environnement, httpx2 comme urllib le lisent sans qu'on y touche.
 
 
 ## Architecture de `mcp_proxy/`
@@ -115,8 +119,9 @@ mcp_proxy/ (paquet, à la racine du projet)
 │                  découpé : debug (traces) → probe (sonde) → storage (jetons)
 │                  → authorizer (parcours, renouvellement, routes)
 ├── app.py         build_app() : Starlette + StreamableHTTPSessionManager + CORS
-│   ├── lifespan : start/stop de chaque upstream, puis install_skills() et
-│   │              écriture des instructions (bloc des skills compris)
+│   ├── lifespan : start des distants en parallèle puis des inprocess, stop de
+│   │              chacun ; puis install_skills() et écriture des instructions
+│   │              (bloc des skills compris)
 │   ├── auth (facultative) : routes RFC 9728 + RequireAuthMiddleware sur /mcp
 │   └── MIAOU (facultatif) : routes de webapp.py, posées après /mcp
 ├── webapp.py      clé `miaou_dist` : resolve_miaou_dist(), miaou_dist_warnings(),
@@ -296,6 +301,17 @@ et la mention que le proxy ne s'y reconnecte qu'à son redémarrage. Seul un ups
 un parcours d'autorisation est refusé en AUTHORIZATION_REQUIRED — sans quoi un serveur
 sans OAuth, arrêté en cours de vie, envoyait l'utilisateur l'autoriser.
 
+**Un appel d'outil est borné** : clé `call_timeout` d'une entrée stdio ou http (secondes,
+nombre fini > 0, défaut 300 — `_CALL_TIMEOUT_S`, aligné sur le délai de lecture http ;
+`bench__sleep` plafonne à 60 s), validée au chargement (`ValueError` sinon, et sur une
+entrée inprocess, qui n'a pas de fil). `route_call_tool` l'applique autour de
+`upstream.call_tool` (`Upstream.call_timeout`, None = pas de borne) : au dépassement,
+l'appel est abandonné et rendu en `isError` « Le serveur '<up>' n'a pas répondu à
+'<outil>' sous <n> s », et le compteur `InFlight` est libéré — sans quoi une mise à jour
+ou un `restart` resteraient refusés tant que l'upstream muet ne répond pas. Une exception
+d'outil au message vide se lit par son type (`_describe_failure`), jamais en `isError`
+sans texte.
+
 **Une panne d'upstream reste la sienne.** `tools/list` liste chaque upstream vivant à
 part : celui dont le listage échoue est omis (une ligne au journal), les autres répondent.
 Le cas est celui d'un upstream mort en cours de vie — un subprocess stdio tué reste dans
@@ -330,7 +346,11 @@ réglages que partagent les serveurs autonomes (`servers/mcp_base.py`) :
 `docs/miaou-contract.md` sur `content_b64`) et `SESSION_IDLE_TIMEOUT_S = None` (le SDK
 expirerait sinon une session inactive au bout de 30 min). `security_settings` reste
 absent : dans le gestionnaire, `None` vaut protection DNS-rebinding désactivée, ce que
-l'`Origin: null` de MIAOU en `file://` exige.
+l'`Origin: null` de MIAOU en `file://` exige. Le plafond de corps est appliqué par le
+middleware du SDK, qui accumule le corps EN MÉMOIRE avant d'appeler l'application : N
+requêtes concurrentes proches du plafond coûtent N × 96 Mio, et sans `auth` n'importe
+quel hôte qui joint le port peut les envoyer — posture de banc d'essai sur réseau local,
+assumée.
 
 `build_app()` ne retourne pas directement le `Starlette` mais une fonction ASGI qui l'enveloppe :
 `Mount("/mcp", ...)` redirige `/mcp` → `/mcp/` en 307 par défaut (strict-slash Starlette), et
@@ -358,7 +378,8 @@ référence est le dict que `main()` a chargé, passé à `ConfigWatch` — jama
 ultérieure, qui ferait d'une édition faite pendant le démarrage l'état initial. À chaque
 `status`, la chaîne est **re-résolue** avec les mêmes arguments (`--config` tel quel,
 chaîne par défaut relative au dossier courant) et relue dans un thread ; rien n'y lève,
-`OSError` et `ValueError` deviennent `invalid` avec leur message.
+`OSError` et `ValueError` deviennent `invalid` avec leur message. La table de validations
+par empreinte est bornée (`VALIDATION_CACHE_MAX`, la plus ancienne sort d'abord).
 
 **Validation partagée.** `prepare_config(loaded, options)` est la suite de `main()` après
 la lecture des couches : hôte et port, `miaou_dist`, `self_update`, `lifecycle`, `--with-dev-auth`,
@@ -366,7 +387,12 @@ auth entrante, `build_upstreams`, `build_upstream_authorizers`. `main()` l'appel
 validation la rejoue, avec les mêmes `LaunchOptions` (surcharges de la ligne de commande),
 et substitue les `${VAR}` contre l'environnement du démarrage, recopié en tête de
 `main()` avant toute modification — celui que retrouvera le processus relancé. Toute
-erreur de config y est une `ValueError` dont le message est celui que `main()` affiche :
+erreur de config y est une `ValueError` dont le message est celui que `main()` affiche
+— y compris une FORME fausse (`mcpServers` qui n'est pas un objet, entrée non-objet,
+`env`/`headers`/`config` non-objet, `args` non-liste de chaînes, `port` hors 1-65535 ou
+non entier : `build_upstreams` et `_resolve_port`) ; en dernier filet,
+`ConfigWatch._validate` rend `invalid` pour toute autre exception plutôt que de laisser
+tomber `status`/`restart` (`main()`, lui, la laisserait remonter : c'est un bug) :
 `tests/test_proxy_configwatch.py` tient l'inventaire, un cas par sortie en 1. Elle ne fait
 que construire : ni `prepare` d'upstream (import, `env`), ni
 `apply_proxy_env_overrides_to_process`, ni écriture (les autorisations sortantes ne
@@ -399,10 +425,59 @@ d'aucun signal (non éprouvé sur le poste : dette). `--with-dev-auth` : toute r
 signal ou sortie demandée, invalide les jetons émis par l'AS de développement, et le
 journal le dit.
 
+**Durée de la relance.** MIAOU attend le retour du proxy trois minutes
+(`PROXY_RESTART_WAIT_MS`, en sondant toutes les 2 s, retour reconnu à un autre
+`instance`), puis annonce « démarrage échoue ». Mesuré : sous `supervise.sh`, nouvel
+`instance` en 0,8 s sans changement de dépendances, et une réinstallation complète par
+`uv run` tient en 0,7 s quand le cache uv est chaud. Rien ne borne en revanche un `uv`
+qui doit TÉLÉCHARGER (cache froid, réseau d'entreprise lent ou bloqué) : ni `uv` ni
+`supervise.sh` n'ont de délai, et le client ne distingue pas une relance lente d'une
+relance échouée. Une relance qui échoue arrête le superviseur (pas de nouvelle
+tentative), et seul son journal le dit : l'expiration des trois minutes côté MIAOU est le
+premier signe visible.
+
 **Identité de processus** (`ProcessIdentity`) : `instance` et `started_at`, tirés une
 fois dans `main()`, passés à `Lifecycle` ET à `VolatileSecrets` — une seule identité, que
 le client compare pour reconnaître le processus relancé (`head`, l'indice d'AT, ne bouge
 pas sans mise à jour).
+
+## Ordre et concurrence du démarrage
+
+Le lifespan (`app.py`, `_start_upstreams`) démarre les upstreams **distants d'abord et
+ensemble** : tout ce qui n'est pas `InProcessUpstream` (stdio, http) part dans une tâche
+fille d'un task group éphémère, puis les inprocess se démarrent dans la tâche du
+lifespan pendant que les distants avancent. Avant, les `start()` s'enchaînaient et les
+bornes s'additionnaient (15 s par stdio muet, 30 s par http injoignable) ; le démarrage
+dure désormais autant que le plus lent. Un `start()` qui échoue ne touche pas les
+autres : l'upstream est retiré de la table, comme avant (`AuthorizationRequired` seul y
+reste). Tout ce qui suit le démarrage (consommateurs de secrets volatils, authorizers,
+`publish_surface`, amorçage des catalogues) attend la fin du task group et garde son
+ordre. Le sondage d'état des authorizers (jeton utilisable, renouvellement) précède
+toujours les démarrages, en série.
+
+**Journal.** Chaque upstream rédige ses lignes (nombre d'outils, skills, ère, ou
+`unavailable`/`unauthorized`/`pending`) puis un vidage les écrit dans l'ORDRE DE LA
+CONFIG, dès que tous les précédents sont écrits : déterministe d'un lancement à l'autre
+et aussi précoce que possible, un lent en tête de config retenant l'affichage des
+suivants sans retarder leur démarrage.
+
+**Annulation.** `started` se remplit à mesure que les `start()` aboutissent ; le
+`finally` du lifespan arrête ceux-là. Un `start()` interrompu (Ctrl-C pendant le boot)
+nettoie lui-même : celui d'un stdio referme son transport avant de relever l'annulation,
+celui d'un http laisse sa tâche de service au task group du lifespan, annulé à
+l'extinction. L'ordre d'arrêt est l'ordre de fin de démarrage, pas celui de la config.
+
+**Modèle de tâche des stdio.** Les contextes du SDK (`Client`, `stdio_client`) portent des
+cancel scopes anyio qu'il faut ouvrir ET refermer dans la même tâche ; un `Client` ouvert
+par une tâche fille de démarrage et refermé par le lifespan lèverait « cancel scope in a
+different task ». `StdioUpstream` adopte donc le patron de `HttpUpstream` : `_serve()`,
+dans une tâche asyncio propre (`ensure_future`, sans task group hôte — la tâche fille qui
+appelle `start()` ne lui survit pas), ouvre le `Client`, signale `_ready`, attend
+`_stop_event`, referme au même endroit. `start()` attend `_ready` sous la borne du
+handshake (15 s, amorçage du listage compris) ; sur échec, délai ou annulation, il annule
+le `CancelScope` de la tâche de service (la seule prise sur un handshake bloqué), attend
+sa fin sous bouclier (`_STDIO_STOP_TIMEOUT_S`, 10 s) et relève : aucun subprocess
+orphelin. `stop()` demande la fermeture et attend, bornée, sans toucher un scope.
 
 ## Ère des upstreams stdio et http
 
@@ -539,7 +614,7 @@ Quatre points qui ne se devinent pas :
   autorisation obtenue en cours de route : une section omise lui manquerait jusqu'à
   sa reconnexion, alors qu'une section décrivant un outil temporairement absent ne
   coûte qu'un paragraphe. Après un `authorize()` réussi, le proxy recompose ses
-  `instructions` (et sa surface de skills) : la section d'un upstream non autorisé au
+  `instructions` (et sa surface de skills, `publish_surface`) : la section d'un upstream non autorisé au
   démarrage, qui n'avait jamais été interrogé, apparaît à la connexion suivante
   (`docs/auth.md`). Observé au passage sur un upstream Jira derrière WSO2 : `tools/list`
   y répond avant autorisation, seul `tools/call` refuse.
@@ -605,7 +680,9 @@ l'utilisateur, qu'un cache partagé ne doit pas resservir). Toutes les pages d'u
 skills. `resources/read` d'un upstream INPROCESS ne lit que les fichiers déclarés par une
 entrée (liste blanche), son `MCPServer` pouvant servir d'autres ressources sous d'autres
 schémas. Pour un upstream stdio/http, c'est l'UPSTREAM qui juge : la requête lui est
-transmise, il répond `-32602` pour ce qu'il ne sert pas. Une liste blanche tirée de son
+transmise, il répond `-32602` pour ce qu'il ne sert pas (la liste blanche de l'inprocess
+est l'ensemble figé au démarrage, pas le résultat de `list_entries` : un fichier disparu
+du disque rend `-32603` « indisponible », pas « non servi »). Une liste blanche tirée de son
 `skills/list` refuserait les fichiers d'une skill servie mais non listée, que la spec
 exige de savoir charger depuis sa seule URI ; la liste blanche du SEP est l'affaire du
 client.
@@ -649,10 +726,14 @@ retient pas `skills/list` du proxy jusqu'au délai de lecture du transport (300 
 par `_on_session`, qui fait courir la requête contre la mort de la tâche de service et
 déballe l'`ExceptionGroup` de son task group (`docs/auth.md`). Sans le déballage, une
 `MCPError` de l'upstream sur `skills/get` sortait du handler en erreur JSON-RPC de code 0.
-`StdioUpstream`, sans tâche de service, appelle la session en direct.
+`StdioUpstream` appelle la session en direct : sa tâche de service ne fait qu'héberger le
+transport, la mort du subprocess remonte en `MCPError` « Connection closed ».
 
 **Erreurs relayées.** Un `-32602` de l'upstream ressort avec l'URI du client ; toute autre
-`MCPError` (un `-32603` d'une skill devenue illisible) garde code et message. Une panne
+`MCPError` garde son code (un `-32603` d'une skill devenue illisible, le `-32000`
+« Connection closed » d'un transport mort) et son message, encadré de `Le serveur
+'<up>' n'a pas pu servir <uri> (<message>).` ; seules les erreurs à `data` (contrats
+AUTHORIZATION_REQUIRED, SECRET_REQUIRED) passent intactes. Une panne
 de transport, un délai dépassé ou une réponse que le SDK refuse deviennent une
 `MCPError(INTERNAL_ERROR, "Le serveur '<up>' n'a pas pu servir <uri> (…)")`
 (`_remote_failure`), jamais une erreur de code 0 ; une `AuthorizationRequired` en cours
@@ -701,14 +782,21 @@ il peut servir des skills que le proxy ne relaiera pas. Rien pour un legacy cons
 la sonde, qui ne peut pas servir l'extension.
 
 **Upstream absent.** Non autorisé (y compris resservi depuis `ToolCatalogCache`) : non
-vivant, aucune skill relayée, aucune requête ; ses outils restent listés avec leur
+vivant, aucune skill relayée, aucune requête — à la différence d'un upstream en attente
+de son secret volatil, dont les skills sont resservies du cache (« Upstream en attente
+de son secret », plus bas) ; ses outils restent listés avec leur
 `requiresSkill` préfixé, qui désigne alors une skill absente (garde ouverte côté client,
 et l'appel est de toute façon refusé). Mort en cours de vie : omis des listages ; les
 capacités du proxy restent publiées (la spec admet un `skills/list` vide) et le bloc des
 `instructions` reste en place, statique par construction — **il ment donc pendant la
 panne**, comme la section de texte libre d'un upstream dont les outils ont disparu : le
-rendre dynamique casserait la stabilité du message système. Les lectures échouent en
-`-32602` (résolution refusée, upstream non vivant) ou avec l'erreur du transport. Mort au
+rendre dynamique casserait la stabilité du message système. Les lectures d'une skill d'un upstream
+connu mais non vivant (`resolve_published_uri`) répondent comme `tools/call` : `-32603`
+« Le serveur '<up>' est injoignable : sa session s'est fermée (…). Le proxy ne s'y
+reconnecte qu'à son redémarrage. » (le texte de `_unreachable_message`), ou le contrat
+AUTHORIZATION_REQUIRED / SECRET_REQUIRED pour un upstream en attente d'autorisation ou de
+secret ; `-32602` reste réservé à ce qui n'est pas servi (premier segment inconnu). Le
+repli `read_skill` dit « Lecture de <uri> impossible : <cause> ». Mort au
 démarrage : retiré de la table, rien publié pour lui.
 
 **Bloc généré dans les instructions.** `build_skills_blocks()` (lifespan) termine la
@@ -796,13 +884,18 @@ couche.
 **Variables d'environnement.** Dans les valeurs chaînes : `${VAR}`, `${VAR:-défaut}`
 (absente ou vide), `${VAR-défaut}` (absente seulement), `$$` pour un `$` littéral ; un
 `$` suivi d'autre chose que `{` reste tel quel. Syntaxe de docker compose, pour qu'un
-même `.env` serve aux deux (`env_file` facultatif dans `docker-compose.yml`). Substitué
+même `.env` serve aux deux (`env_file` facultatif dans `docker-compose.yml`), mais
+seulement ces formes : **pas d'imbrication** (`${A:-${B}}` : le défaut s'arrête au
+premier `}`, il reste un `}` et un `${B` littéraux), pas de substitution dans un
+défaut, pas d'opérateurs `:?`/`:+`/`?`/`+` — une expression non reconnue reste telle
+quelle, sans signalement (compose, lui, lèverait pour `${A:?erreur}`). Substitué
 **après** la fusion : une valeur littérale de `config.json` qui remplace un
 `${ORG_API_SECRET}` de `config.site.json` n'exige rien de l'environnement. Une variable
 absente sans défaut devient `""` et est signalée au démarrage avec sa clé, comme le
 fait compose — et une clé vide fait déjà écarter un moteur ou refuser un serveur
-(« pas d'outil sans config fonctionnelle »). Clés `_*` jamais substituées (un
-`_comment` cite la syntaxe) ; bloc `disabled` substitué quand même — `--auth`
+(« pas d'outil sans config fonctionnelle »). Clés `_comment*` jamais substituées (un
+`_comment` cite la syntaxe ; même périmètre que `strip_comments`) — les autres clés à
+souligné le sont, `_JAVA_OPTIONS` d'un `env` par exemple ; bloc `disabled` substitué quand même — `--auth`
 réveille un bloc `auth` neutralisé — mais ses variables manquantes tues. Les
 variables propres à un serveur (`BRAVE_API_KEY`, `OLLAMA_API_KEY`) restent lues par
 lui en repli d'une clé vide : rien ne change pour elles.
@@ -810,17 +903,27 @@ lui en repli d'une clé vide : rien ne change pour elles.
 **`--print-config`** affiche la config effective (fusion + substitution) et quitte.
 Sortie faite pour être collée dans un ticket, donc masquée en `***` : valeurs non
 vides des clés dont le NOM ressemble à un secret (`secret`, `pass` non suivi d'une
-lettre, `password`, `pwd`, `api_key`/`api-key`, `token`, `auth` — casse ignorée,
-d'où `LOGS_PASS` ou un en-tête `X-Auth`), sauf suffixe public (`_endpoint`,
-`_url`, `_uri`, `_method`, `_scope(s)` : `token_endpoint` est ce qu'on vient lire
-dans un diagnostic OAuth) ; toutes les valeurs d'un `env`, aux noms imprévisibles ;
-le mot de passe d'une URL `scheme://user:mdp@hôte`. C'est une liste noire : elle
+lettre, `password`, `passphrase`, `pwd`, `api_key`/`api-key`, `private_key`, `token`,
+`auth`, `credential`, `cookie`, `bearer`, `session`, `jwt`, `signature`, et `key`/`sig`
+comme mot final : `access_key`, `X-Key` — casse ignorée, d'où `LOGS_PASS` ou un
+en-tête `X-Auth`), sauf suffixe public (`_endpoint`, `_url`, `_uri`, `_method`,
+`_scope(s)`, `_timeout` : `token_endpoint` est ce qu'on vient lire dans un
+diagnostic OAuth). Sous une telle clé, **tout le sous-arbre** (dict, liste, nombres)
+est masqué, sauf pour `auth` en dict/liste (un BLOC de config : `auth` d'un serveur,
+`authorization_servers`, dont les enfants sont jugés un à un) et pour un marqueur
+`{"volatile": clef}` (il nomme un secret, n'en est pas un). Les noms de serveurs de
+`mcpServers` ne sont jamais jugés. Aussi masqués : toutes les valeurs d'un `env`, aux
+noms imprévisibles ; le mot de passe d'une URL `scheme://user:mdp@hôte` ; les
+paramètres de query de nom secret d'une URL (`?api_key=***`, mêmes noms que les clés).
+**Jamais masqués : les `args` d'un upstream stdio** — un secret va dans `env`, pas dans
+`args` (`["--password", "hunter2"]` sortirait en clair). C'est une liste noire : elle
 réduit l'exposition, elle ne la garantit pas — un nom de clé imprévu passe en clair.
 
 **`--migrate-config`** allège le maillon local et quitte. Contrat : la config
 effective est INCHANGÉE — `merge_patch(base, allégé) == merge_patch(base, local)` aux
 `_comment*` près, propriété testée sur une copie retouchée du vrai
-`config.defaults.json`. Sont retirées les valeurs identiques à la fusion des couches
+`config.defaults.json` ET vérifiée à chaque exécution (`_slim_local`, donc aussi pour
+`--diff`) : si l'égalité ne tient pas, refus avant toute écriture. Sont retirées les valeurs identiques à la fusion des couches
 qui le précèdent, et **tous** les `_comment*`, changés ou non (ils documentent la
 base ; une copie locale ne fait que vieillir). Pas de comparaison à l'historique des
 samples : une valeur copiée d'un ancien sample et changée depuis en amont reste comme
@@ -830,7 +933,9 @@ un `config.json` léger l'absence veut dire « hériter » — un `disabled: tru
 d'office y couperait un serveur. Pour une config à l'ancienne, c'est la liste à
 relire (serveur ôté de la copie qui revient actif). Sauvegarde en `<fichier>.bak`
 (mode conservé, le fichier porte des secrets) ; refus si elle existe déjà, une
-seconde migration écraserait l'original. Jamais de réécriture au démarrage : le
+seconde migration écraserait l'original. La réécriture passe par `<fichier>.tmp` créé
+en `O_EXCL` (un `.tmp` périmé, lien symbolique compris, est retiré d'abord), `fsync`
+puis `os.replace` ; sur échec, `.tmp` et sauvegarde sont retirés et l'original reste. Jamais de réécriture au démarrage : le
 proxy se borne à la proposer tant que le maillon local répète la base
 (`needs_slimming`).
 
@@ -891,9 +996,22 @@ depuis `state/tools-cache.json` **sans notice**, à l'octet près comme le live,
 pour que la liste d'outils (et le cache KV du modèle) ne change pas à la
 saisie — d'où l'écriture du cache sans tri des clés, qui réordonnait les
 propriétés des schémas ; ses `instructions` (texte libre) aussi, mémorisées
-dans le même fichier quand il a été construit, alors que son bloc de skills
-n'apparaît qu'une fois construit (le proxy ne publie pas une skill qu'il ne
-sert pas) ; un appel est refusé en erreur JSON-RPC `data.code =
+dans le même fichier quand il a été construit ; et ses skills, sous la clé
+`skills` de son entrée (`remember_skills`/`recall_skills`) : entrées d'ORIGINE,
+avant préfixage, que `_collect` liste à sa place dans l'ordre de la config
+(`_listed_names`) et que `prefix_skill_entry` préfixe sur le même chemin que
+les vivantes — `skills/list` et `resources/list` à l'octet près (MIAOU lie
+l'approbation au manifeste), une skill `"dynamic"` telle quelle, et le bloc des
+`instructions` généré depuis ces entrées et les outils en cache, identique au
+bloc vivant. Elles comptent pour publier l'extension (`install_skills`) : sans
+elles, un proxy dont il est le seul upstream à skills ne la publierait pas avant
+la saisie. Le cache n'écrit de skills que pour un upstream à `volatile_key`
+(`_remembers_skills`), à chaque listage vivant (le contenu est relu, les
+empreintes peuvent changer) et à l'acceptation ; `remember` préserve la clé.
+Les lectures restent refusées en SECRET_REQUIRED (`resolve_published_uri`), d'un
+message qui nomme la skill (`UpstreamSecretRequired(name, skill_uri)`). Un
+upstream OAuth non autorisé n'est pas concerné : ses skills restent absentes ;
+un appel est refusé en erreur JSON-RPC `data.code =
 SECRET_REQUIRED` (`UpstreamSecretRequired`), avec un message qui dit au modèle
 que seul l'utilisateur peut agir, depuis MIAOU. `data` ne porte que
 l'upstream : les noms de clefs ne se lisent que par l'extension, gardée par
@@ -910,10 +1028,25 @@ sinon le proxy entier, et rien ne l'interrompt (pas de délai propre, AU-f) — 
 annuaire muet retient la requête jusqu'au délai du client. L'échec se classe par nom de
 classe dans le MRO (`CredentialsRejected`, `ConfigIncomplete`, le reste indéterminé),
 pour qu'une base importée sous un autre nom de module (`servers.mcp_base`) soit
-reconnue ; son texte est masqué (`volatile.mask`) avant d'être journalisé ou rendu. Une
-instance acceptée laisse ses outils et ses `instructions` dans le cache, sauf si elle y
-cite la valeur (`cache_forbidden`, ligne `WARNING:`). Le journal dit chaque verdict,
-jamais la valeur : `Secret volatil « <clef> » : <upstream> accepted.`
+reconnue ; son texte (gardé : c'est l'indice de diagnostic) est masqué
+(`volatile.mask`) avant d'être journalisé ou rendu, sous toutes les formes de
+`volatile.forms` : brute, `repr`, JSON ASCII et JSON brut (un `build` qui cite sa config
+l'écrit échappée), les plus longues d'abord. Une instance acceptée laisse ses outils et
+ses `instructions` dans le cache, sauf si elle y cite la valeur sous l'une de ces formes
+(`volatile.cites`, `cache_forbidden`, ligne `WARNING:`) : le contrôle compare au JSON
+sérialisé des outils et des entrées de skills (un `build` peut tirer ses skills de sa
+config), d'où les formes échappées. `cache_forbidden` est posé AVANT le
+contrôle et levé seulement s'il passe : si `_remember` ne peut pas le faire (`list_tools`
+en échec), le listage de `tools/list` (`server.py`) n'écrit pas le catalogue de cette
+instance (il l'écrivait sans contrôle avant le 2026-10-17). Une instance qui passe le
+contrôle (nouvelle saisie) lève le drapeau. La validation d'un `submit` tourne dans une
+tâche détachée de la requête (`_Key.task`, qui tient seule le verrou par clef) : un
+`submit` annulé (onglet fermé) laisse le `build` finir et publier, et un `submit` de la
+même valeur pendant ce temps attend cette tâche au lieu de lancer un second `build`
+concurrent (risque de verrouillage de compte) ; une autre valeur se met en file sur le
+verrou. Les empreintes des valeurs refusées sont bornées (`MAX_REJECTED` = 64 par clef,
+les plus récentes : au-delà, la plus ancienne peut être retestée). Le journal dit chaque
+verdict, jamais la valeur : `Secret volatil « <clef> » : <upstream> accepted.`
 
 ### `state/` (`state.py`)
 
@@ -963,11 +1096,17 @@ Une entrée `http` exige `url` ; `headers` et `timeout` y sont optionnels.
 `protocol_era` sur une entrée stdio ou http : `"auto"` (défaut, l'ère est négociée) ou
 `"legacy"` (`initialize` d'emblée, sans sonde) — cf. « Ère des upstreams stdio et http ».
 Toute autre valeur, ou la clé sur une entrée inprocess, est une erreur de config signalée
-au démarrage. Un bloc
+au démarrage. `call_timeout` (stdio et http) : cf. « Un appel d'outil est borné ». Le nom
+d'une entrée `mcpServers` active ne contient que lettres, chiffres, `-` et `_`, sans `__`
+ni `_` final (il préfixe les outils, coupés au premier `__`, et les URI de skills, coupées
+au premier `/`) : sinon erreur de config au démarrage. Un bloc
 `auth` sur une entrée `http` active l'auth **sortante** (le proxy devient client
 OAuth de ce serveur) ; il n'a de sens que là, et l'exiger ailleurs est une erreur
 de config signalée au démarrage.
-`"disabled": true` sur une entrée `mcpServers` → upstream ignoré au démarrage.
+`"disabled": true` sur une entrée `mcpServers` → upstream ignoré au démarrage. La valeur
+est un **booléen** (`null` = absent) : une chaîne, même `"false"` ou `"0"` (un
+`${DIS:-false}` en donne une), est une erreur de config — `bool("false")` est vrai, et le
+bloc serait neutralisé en silence. Vaut pour `disabled`, `_disabled`, et le bloc `auth`.
 L'ancienne orthographe `_disabled` reste lue si `disabled` est absente ; elle n'est plus celle qu'on écrit — dans ce fichier, un souligné en tête signale ailleurs (`_comment`) une clé ignorée, ce que cet interrupteur n'est justement pas. Le proxy le signale au démarrage, une ligne par bloc concerné, pour que la migration se voie plutôt que de traîner indéfiniment ; une config déjà en `disabled` ne dit rien.
 `env` sur une entrée inprocess → variables posées via `os.environ.setdefault` avant l'import.
 `instructions` (chaîne, tout type d'entrée) → consigne ajoutée par l'opérateur à la
@@ -1040,9 +1179,12 @@ tout autre verbe que GET/HEAD). Clé absente : aucune de ces routes, `/` reste u
 répond 304 sur `If-None-Match`/`If-Modified-Since`, mais ne pose AUCUN
 `Cache-Control`. Le navigateur applique alors une fraîcheur heuristique (~10 % de l'âge
 depuis `Last-Modified`) et peut resservir un vieux HTML sans revalider : un `git pull`
-de MIAOU ne serait pas vu au rechargement. D'où `Cache-Control: no-cache` sur TOUTE
-réponse de `/app/`, 304 compris (c'est `file_response` qui le pose, avant le test
-conditionnel, pour que `NotModifiedResponse` le recopie). Pas seulement sur le HTML :
+de MIAOU ne serait pas vu au rechargement. D'où `Cache-Control: no-cache` sur toute
+réponse FICHIER de `/app/` — 200, 206 et 304 (c'est `file_response` qui le pose, avant le
+test conditionnel, pour que `NotModifiedResponse` le recopie). Les autres réponses n'en
+portent pas : 404 (fichier absent ou caché), 405, 416, et les redirections de `/` et
+`/app` ; sans validateur ni `Last-Modified`, un navigateur ne leur applique aucune
+fraîcheur heuristique, et le service worker de MIAOU ne garde que du `text/html` en 2xx. Pas seulement sur le HTML :
 le service worker et `version.json` en ont besoin aussi, et une icône revalidée ne
 coûte qu'un 304.
 
@@ -1055,7 +1197,11 @@ worker servi sous un type qui n'est pas JavaScript.
 
 **Ce qui n'est jamais servi.** Rien hors du dossier (garde `realpath`/`commonpath` de
 `StaticFiles`, un `..` résiduel étant de toute façon refusé avec les fichiers cachés),
-aucun fichier caché (`.gitkeep`, `.DS_Store`).
+aucun fichier caché (`.gitkeep`, `.DS_Store`). Le filtre juge le chemin demandé, tout
+chemin contenant `:` est refusé (flux NTFS `miaou.html::$DATA` sous Windows), et le chemin
+RÉSOLU (`os.path.realpath`, relatif à la racine, qui rend le nom long sous Windows) :
+le nom court 8.3 d'un fichier caché (`GITKEE~1`) est donc un 404 aussi. Le test simule la
+résolution, faute de Windows en CI.
 
 **Démarrage : un refus, des avertissements.**
 - **Refus** (`ValueError`, sortie en erreur) si le dossier contient `config.json` ou

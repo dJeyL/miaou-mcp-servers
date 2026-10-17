@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "truststore"]
+# dependencies = ["mcp>=2.2,<3", "uvicorn", "starlette", "truststore", "pyyaml"]
 # ///
 """
 Serveur MCP de démonstration des secrets volatils (lot AU) : de quoi essayer,
@@ -32,6 +32,10 @@ indéterminé) ; toute autre valeur lève CredentialsRejected.
 Outil exposé :
   - whoami() : login et nombre d'instances. Jamais le mot de passe.
 
+Skill `secret-demo` (servers/skills/secret_demo/) : de quoi montrer une skill
+servie par un upstream en attente de son secret. Facultative — aucun outil ne
+l'exige : un client qui appelle `whoami` n'a rien à lire d'abord.
+
 Lancement autonome (sans proxy, le mot de passe vient de l'environnement) :
     MIAOU_SECRET_DEMO_PASSWORD=miaou uv run servers/mcp_secret_demo.py   # HTTP 127.0.0.1:8772
 """
@@ -40,6 +44,7 @@ import math
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -49,6 +54,9 @@ from mcp_base import ConfigIncomplete, CredentialsRejected, MiaouMCPBase
 DEFAULT_EXPECTED = "miaou"
 UNREACHABLE = "injoignable"
 MAX_DELAY_S = 10.0
+
+# Serveur mono-fichier : ses skills vivent dans servers/skills/<serveur>/.
+_SKILLS_DIR = Path(__file__).resolve().parent / "skills" / "secret_demo"
 
 INSTRUCTIONS = (
     "Serveur de démonstration : son outil whoami ne sert qu'à vérifier qu'un mot "
@@ -101,7 +109,13 @@ def _authenticate(config: dict) -> None:
 
 class SecretDemoServer(MiaouMCPBase):
     def __init__(self, config: dict) -> None:
-        super().__init__("miaou-secret-demo", default_port=8772, config=config, instructions=INSTRUCTIONS)
+        super().__init__(
+            "miaou-secret-demo",
+            default_port=8772,
+            config=config,
+            instructions=INSTRUCTIONS,
+            skills_dir=_SKILLS_DIR,
+        )
         login = config["login"]
         count = len(_instances(config))
 
@@ -124,6 +138,10 @@ def build(config: dict | None = None) -> MCPServer:
 
 
 if __name__ == "__main__":
+    if {"-h", "--help"} & set(sys.argv[1:]):
+        # L'aide ne dépend d'aucun secret : traitée AVANT l'authentification.
+        # main() la sert par argparse puis sort ; rien n'est contacté.
+        SecretDemoServer({"login": "demo", "password": "-"}).main()
     password = os.environ.get("MIAOU_SECRET_DEMO_PASSWORD")
     if not password:
         print("Erreur : MIAOU_SECRET_DEMO_PASSWORD absente.", file=sys.stderr)

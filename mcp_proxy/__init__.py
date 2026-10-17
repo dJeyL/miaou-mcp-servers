@@ -24,7 +24,7 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 Ce module ré-exporte la surface publique du fichier plat `mcp_proxy.py` dont il
 prend la suite : `import mcp_proxy` puis `mcp_proxy.X` continue de fonctionner
 pour les symboles qui existaient avant la mise en paquet. Une exception voulue,
-`_AUTH_DEBUG` — voir son docstring dans `auth_out.py`.
+`_AUTH_DEBUG` — voir son docstring dans `auth_out/debug.py`.
 """
 
 from __future__ import annotations

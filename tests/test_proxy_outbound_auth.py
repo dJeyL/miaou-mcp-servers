@@ -561,6 +561,49 @@ async def test_callback_route_without_pending_authorization(tmp_path):
     assert resp.status_code == 400
 
 
+async def test_callback_page_escapes_the_error_parameter(tmp_path):
+    """Z8-1 : `error` vient de la query string d'une route PUBLIQUE, sur la
+    même origine que MIAOU. Jamais interpolé brut."""
+    a = _authorizer(tmp_path)
+    await a._on_redirect("https://as.test/authorize?state=s1")
+
+    async with _callback_client({"remote": a}) as client:
+        resp = await client.get(
+            "/callback",
+            params={"error": "<script>alert(document.domain)</script>", "state": "s1"},
+        )
+
+    assert resp.status_code == 400
+    assert "<script>" not in resp.text
+    assert "&lt;script&gt;" in resp.text
+    assert "default-src 'none'" in resp.headers["content-security-policy"]
+
+
+def test_callback_page_escapes_the_upstream_name():
+    html = mcp_proxy.render_callback_page("<img src=x>", "access_denied")
+    assert "<img src=x>" not in html
+    html = mcp_proxy.render_callback_page("<img src=x>", None)
+    assert "<img src=x>" not in html
+
+
+async def test_callback_with_a_wrong_state_does_not_resolve_the_only_waiting_flow(tmp_path):
+    """Z8-2 : le repli « un seul en attente » laissait n'importe quelle page
+    tuer le parcours (premier résultat gagnant)."""
+    a = _authorizer(tmp_path)
+    await a._on_redirect("https://as.test/authorize?state=REAL")
+
+    async with _callback_client({"remote": a}) as client:
+        wrong = await client.get("/callback", params={"code": "evil", "state": "WRONG"})
+        missing = await client.get("/callback", params={"code": "evil"})
+        errored = await client.get("/callback", params={"error": "x"})
+        assert wrong.status_code == missing.status_code == errored.status_code == 400
+        assert a.pending._code is None
+        good = await client.get("/callback", params={"code": "c-1", "state": "REAL"})
+
+    assert good.status_code == 200
+    assert a.pending._code == "c-1"
+
+
 # --- câblage --------------------------------------------------------------
 
 def test_authorizers_built_only_for_http_upstreams_with_auth(tmp_path):
@@ -1288,6 +1331,21 @@ def test_non_403_failure_is_reported_without_the_scope_hint():
     assert "connection refused" in report
     assert "scopes sont insuffisants" not in report
 
+def test_a_403_inside_a_random_state_is_not_a_scope_failure():
+    """Z8-4 : l'erreur de state du SDK cite deux `token_urlsafe(32)` ; « 403 »
+    y apparaît par hasard. Ce n'est pas un refus HTTP."""
+    authorizer = _FakeAuthorizer()
+    authorizer.last_error = (
+        "State parameter mismatch: Ab403xYz_-0123456789abcdefghijklmnopqrstuv"
+        " != -403-Zk9QwErTyUiOpAsDfGhJkLzXcVbNm_1234567890ab"
+    )
+
+    report = mcp_proxy.build_status_report(
+        {"remote": _unauthorized_upstream()}, {"remote": authorizer}, None
+    )
+    assert "State parameter mismatch" in report
+    assert "scopes sont insuffisants" not in report
+
 
 # ---------------------------------------------------------------------------
 # Session ouverte MAIS autorisation manquante (correctif du 2026-09-07)
@@ -1599,6 +1657,44 @@ def test_a_failed_flow_says_why_instead_of_blaming_the_network():
     assert response.status_code == 502
     assert "insufficient_scope" in response.text
     assert "n'a pas pu être joint" not in response.text
+
+
+_NAV = {"Sec-Fetch-Mode": "navigate"}
+
+
+@pytest.mark.parametrize(
+    "headers, accepted",
+    [
+        ({}, True),                                                      # client non navigateur / origine non sûre
+        ({"Sec-Fetch-Site": "same-origin"}, True),
+        ({"Sec-Fetch-Site": "none"}, True),                              # barre d'adresse
+        ({"Sec-Fetch-Site": "same-site"}, False),
+        ({"Sec-Fetch-Site": "same-site", **_NAV}, False),
+        ({"Sec-Fetch-Site": "cross-site", **_NAV, "Sec-Fetch-User": "?1"}, True),  # clic / window.open dans un clic
+        ({"Sec-Fetch-Site": "cross-site", **_NAV}, False),
+        ({"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors",
+          "Sec-Fetch-Dest": "image"}, False),                            # <img>
+        ({"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "cors"}, False),
+    ],
+)
+def test_authorize_route_refuses_cross_site_requests_not_triggered_by_the_user(headers, accepted):
+    """A4 : GET à effet de bord, PUBLIC. Refusé quand le navigateur dit que la
+    requête vient d'ailleurs que d'un geste de l'utilisateur."""
+    with _authorize_client(_SlowAuthorizer(delay=0.01)) as client:
+        response = client.get("/authorize/jira", headers=headers, follow_redirects=False)
+
+    if accepted:
+        assert response.status_code == 302
+    else:
+        assert response.status_code == 403
+        assert "MIAOU" in response.text and "barre d'adresse" in response.text
+
+
+def test_authorize_refusal_does_not_start_the_flow():
+    authorizer = _SlowAuthorizer(delay=0.01)
+    with _authorize_client(authorizer) as client:
+        client.get("/authorize/jira", headers={"Sec-Fetch-Site": "cross-site"})
+    assert authorizer.pending is None and authorizer.redirect_ready is None
 
 
 def test_an_unknown_upstream_name_is_escaped():
@@ -2560,6 +2656,63 @@ def test_the_window_is_sampled_at_every_scale(lifetime):
         f"durée de vie {lifetime}s : fenêtre de {margin}s échantillonnée "
         f"toutes les {period}s — l'expiration peut passer entre deux réveils"
     )
+
+
+async def test_an_absurd_expires_in_does_not_crash_set_tokens(tmp_path):
+    """Z8-8 : un AS qui renvoie `expires_in: 10**400` levait OverflowError dans
+    le flow du SDK et le jeton n'était pas écrit."""
+    storage = UpstreamTokenStorage(tmp_path / "t.json", "remote")
+    await storage.set_tokens(_token(expires_in=10**400, refresh_token="r"))
+
+    stored = await storage.get_tokens()
+    assert stored is not None and stored.access_token == "at-1"
+    assert 0 < storage.observed_lifetime() <= 10 * 365 * 86400
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+async def test_a_non_finite_expires_at_in_the_file_does_not_crash_get_tokens(tmp_path, bad):
+    entry = {"tokens": {"access_token": "a", "token_type": "Bearer",
+                        "expires_in": 60, "refresh_token": "r"}, "expires_at": float(bad)}
+    # json.dumps écrit NaN / Infinity tels quels, comme le ferait Python.
+    (tmp_path / "t.json").write_text(json.dumps({"remote": entry}))
+    storage = UpstreamTokenStorage(tmp_path / "t.json", "remote")
+    token = await storage.get_tokens()
+    assert token is not None
+    assert token.expires_in == 0      # échéance illisible = expiré : on rafraîchit
+
+
+@pytest.mark.anyio
+async def test_a_failing_renewal_backs_off_and_logs_once(tmp_path, capsys):
+    """Z8-7 : sur un `lifetime` court la boucle se réveille toutes les secondes ;
+    un AS en panne était alors martelé et le journal rempli à chaque tour."""
+    _store_token(tmp_path, expires_in=2, lifetime=3)
+    authorizer = _authorizer(tmp_path, interactive=False)
+    calls = []
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            calls.append(1)
+            raise OSError("AS injoignable")
+
+    with patch("httpx2.AsyncClient", _Client):
+        for _ in range(5):
+            assert await authorizer.refresh_if_due() is False
+        assert len(calls) == 1          # les quatre réveils suivants attendent
+        assert capsys.readouterr().err.count("échoué") == 1
+
+        authorizer._retry_not_before = 0.0   # le délai de repli est écoulé
+        assert await authorizer.refresh_if_due() is False
+        assert len(calls) == 2
+        assert "échoué" not in capsys.readouterr().err   # épisode déjà signalé
 
 
 @pytest.mark.anyio

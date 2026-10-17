@@ -4,7 +4,7 @@ Instructions pour travailler dans ce dépôt.
 
 ## Ce qu'est le projet
 
-Six serveurs MCP de développement (bench, weather, web, ddg, brave, docs), un serveur de
+Quatre serveurs MCP de développement (bench, weather, web, docs), un serveur de
 démonstration des secrets volatils (secret_demo) et un serveur proxy qui les agrège,
 extraits du dépôt [MIAOU](https://github.com/dJeyL/miaou), un client de chat web pour API
 OpenAI-compatible (single-file HTML). Ils servent à tester l'agrégation MCP de MIAOU : connexion, invocation d'outils, rendu des résultats non-text.
@@ -21,7 +21,7 @@ miaou-mcp-servers/
 │   ├── __main__.py       # `python -m mcp_proxy`
 │   ├── contract.py       # constantes/exceptions partagées (casse le cycle server↔auth_out)
 │   ├── logging.py        # `_log` format uvicorn
-│   ├── upstream.py       # InProcess / Stdio / Http (ère négociée par `Client` ; skills : inprocess seulement)
+│   ├── upstream.py       # InProcess / Stdio / Http (ère négociée par `Client` ; skills : inprocess toujours, stdio/http relayées en ère moderne)
 │   ├── netproxy.py       # override --proxy / --noproxy
 │   ├── config.py         # load_config, build_upstreams
 │   ├── layers.py         # chaîne config.defaults → config.site → config.json, Merge Patch, ${VAR}, --migrate-config
@@ -52,8 +52,6 @@ miaou-mcp-servers/
 │   ├── mcp_bench.py      # banc d'essai général (port 8766)
 │   ├── mcp_weather.py    # météo réelle via wttr.in (port 8767)
 │   ├── mcp_web/          # téléchargement d'URL et recherche multi-moteurs (port 8768), package — `_meta` client sur fetch_url, `search/` = un module par moteur
-│   ├── mcp_ddg.py        # recherche DuckDuckGo HTML (port 8769) — DÉPRÉCIÉ, désactivé par défaut
-│   ├── mcp_brave.py      # recherche Brave Search API (port 8770) — DÉPRÉCIÉ, désactivé par défaut
 │   ├── mcp_secret_demo.py # démonstration des secrets volatils (port 8772), lot AU — désactivé par défaut
 │   ├── skills/           # skills des serveurs mono-fichier : skills/<serveur>/<skill>/SKILL.md
 │   └── mcp_docs/         # extraction PDF/Office/Zip (port 8771), package — OBSOLÈTE, désactivé par défaut
@@ -75,8 +73,7 @@ miaou-mcp-servers/
 │   ├── test_web_structure.py
 │   ├── test_web_pagemeta.py  # `_meta` de fetch_url : titre, site, URL finale, favicon (lot AI)
 │   ├── test_web_search.py  # search/image_search : chaîne de repli, pauses, budget, config
-│   ├── test_ddg.py
-│   ├── test_brave.py
+│   ├── test_web_hardening.py  # durcissements : URL invalide, bombe gzip, sonde de favicon, alias d'URL finale, filtre canonical_url
 │   ├── test_secret_demo.py
 │   ├── test_docs.py
 │   ├── test_proxy.py
@@ -102,13 +99,16 @@ miaou-mcp-servers/
 │                         # + [project.scripts] mcp_proxy et le build-system qui le rend
 │                         #   installable — c'est ce qui garde `uv run mcp_proxy` court
 ├── uv.lock               # lock uv, versionné
+├── Dockerfile            # image du proxy : COPY miaou_dist, CMD uv run --no-sync mcp_proxy
+├── docker-compose.yml
+├── LICENSE
 ├── .gitattributes        # *.sh en LF (Git Bash échoue sur CRLF)
 └── .gitignore
 ```
 
 ## Les serveurs en un coup d'œil
 
-Six serveurs de banc d'essai, un serveur de démonstration, et un proxy qui les agrège.
+Quatre serveurs de banc d'essai, un serveur de démonstration, et un proxy qui les agrège.
 Le détail de chacun (outils, contrats, variables d'environnement, décisions) est dans
 **`docs/servers.md`** — à lire quand on touche au serveur concerné, pas avant.
 
@@ -117,8 +117,6 @@ Le détail de chacun (outils, contrats, variables d'environnement, décisions) e
 | `mcp_bench.py` | 8766 | Banc d'essai général : exerce les chemins de résultat de MIAOU (texte, image, resource) | `echo`, `add`, `sleep`, `dns_lookup`, `reverse_dns`, `get_image`, `get_json_resource` |
 | `mcp_weather.py` | 8767 | Météo réelle via wttr.in | `get_weather` (`astronomy`, `hourly`, `extract`) |
 | `mcp_web/` | 8768 | Téléchargement d'URL, cache disque par checksum, pagination ; recherche multi-moteurs (Brave → Ollama → DDG, ordre en config) | `fetch_url`, `fetch_read`, `fetch_list`, `fetch_resource`, `search`, `image_search` (si un moteur sait chercher des images) |
-| `mcp_ddg.py` | 8769 | Recherche DuckDuckGo (HTML scrapé) — **déprécié** | `ddg_search` |
-| `mcp_brave.py` | 8770 | Recherche Brave Search API (clef requise) — **déprécié** | `brave_search`, `brave_image_search` |
 | `mcp_secret_demo.py` | 8772 | Démonstration des secrets volatils : `check_config`, `build` qui teste le mot de passe et lève `CredentialsRejected` | `whoami` |
 | `mcp_docs/` | 8771 | Extraction PDF/Office/Zip — **obsolète, désactivé par défaut** | `list`, `read`, `search`, `extract`, `drop_session` |
 | `mcp_proxy/` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) et les skills ; sert MIAOU sous `/app/` si `miaou_dist` est posée | (+ `status` si auth sortante, `read_skill` si une skill est servie) |
@@ -129,13 +127,12 @@ Deux points qu'on ne devine pas depuis le tableau :
   Il reste pour le travail **hors connexion** (l'ouverture native télécharge ses
   moteurs depuis un CDN). Ne pas « faire le ménage » dans ce package au motif qu'il
   ne sert plus par défaut.
-- **`mcp_ddg` et `mcp_brave` sont dépréciés** — remplacés par `search`/`image_search`
-  de `mcp_web`, désactivés dans `config.defaults.json`, conservés le temps de la
-  transition (avertissement à chaque démarrage). `mcp_ddg` actif à côté de `mcp_web`
-  ne partage pas son espacement vers DuckDuckGo.
-- **Pas d'outil sans config fonctionnelle** — `mcp_brave` refuse de s'initialiser sans
-  clef, et `mcp_web` refuse de même si `config.search.order` ne cite que des moteurs
-  non configurés (ce qui emporte aussi ses `fetch_*`). Côté proxy, l'upstream est
+- **`mcp_ddg` et `mcp_brave` ont été supprimés** (2026-10-17) — remplacés par
+  `search`/`image_search` de `mcp_web`, dont les moteurs `ddg` et `brave` reprennent
+  leur code. Les ports 8769 et 8770 sont libres ; un `config.json` qui patchait encore
+  leurs entrées fait refuser le démarrage avec un message qui dit quoi retirer.
+- **Pas d'outil sans config fonctionnelle** — `mcp_web` refuse de s'initialiser si
+  `config.search.order` ne cite que des moteurs non configurés (ce qui emporte aussi ses `fetch_*`). Côté proxy, l'upstream est
   retiré de la table de routage et les autres démarrent normalement.
 
 ## Lancement
@@ -152,8 +149,6 @@ uv run servers/mcp_bench.py --transport stdio        # mode stdio
 uv run servers/mcp_bench.py --host 0.0.0.0           # toutes interfaces
 
 uv run servers/mcp_weather.py                        # HTTP 127.0.0.1:8767
-uv run servers/mcp_ddg.py                            # HTTP 127.0.0.1:8769
-BRAVE_API_KEY=<key> uv run servers/mcp_brave.py      # HTTP 127.0.0.1:8770 (déprécié, comme mcp_ddg)
 MIAOU_SECRET_DEMO_PASSWORD=miaou uv run servers/mcp_secret_demo.py  # HTTP 127.0.0.1:8772
 
 # mcp_web et mcp_docs sont des packages (pas des scripts plats) — lancement différent :
@@ -188,8 +183,6 @@ et un `pkill` de test au même motif touche l'instance de l'utilisateur.
 pip install -r requirements.txt
 python servers/mcp_bench.py [options]
 python servers/mcp_weather.py [options]
-python servers/mcp_ddg.py [options]
-BRAVE_API_KEY=<key> python servers/mcp_brave.py [options]
 python -m mcp_web [options]     # depuis servers/ (package, pas un script plat)
 python -m mcp_docs [options]    # depuis servers/ (package, pas un script plat)
 python -m mcp_proxy [options]     # depuis la racine (package, plus un script plat)
@@ -228,11 +221,11 @@ Deux points à ne pas toucher sans bonne raison :
   le header et chaque appel repart sans session → erreur 404 ou réinitialisation.
 
 Tout appel réseau ou bloquant à l'intérieur d'un outil `async` (urllib dans
-weather/ddg/brave/web, résolution DNS dans bench, parsing de document dans
+weather/web, résolution DNS dans bench, parsing de document dans
 `mcp_docs`) est enveloppé dans `asyncio.to_thread(...)` — un outil async qui appelle
 directement une fonction bloquante gèlerait l'event loop pendant tout le round-trip,
 sérialisant les appels concurrents. Isoler l'I/O bloquante dans une fonction
-synchrone dédiée (ex. `_fetch_bytes`, `_fetch_ddg_html`, `_fetch_brave_bytes`) puis
+synchrone dédiée (ex. `_fetch_bytes` de `mcp_web`, `_fetch_weather_bytes`) puis
 l'appeler via `await asyncio.to_thread(...)` est le pattern à suivre pour tout
 nouvel outil qui ferait de l'I/O.
 
@@ -386,32 +379,39 @@ lots — piège déjà payé côté MIAOU.
   qu'il traverse `max`/`min` et qu'`asyncio.sleep(NaN)` ne termine jamais),
   `mcp_weather` (`astronomy`/`hourly` séparés et pourquoi, `extract`
   et le nom de ressource `weather-<lieu>-<yyyymmdd>.json`), `mcp_web` (cache par
-  checksum d'URL, caps
+  checksum d'URL et son alias d'URL finale, sweep limité aux noms du cache, caps
   `READ_CAP`/`LIST_CAP`, `fetch_resource` et le canal bytes→client, décompression
-  `Content-Encoding` non sollicitée — `_decompress`, WEB9 — et la troncature décidée
-  sur les octets reçus qu'elle impose ; `_meta["miaou/web"]` de `fetch_url` — titre,
-  `site_name`, URL finale, favicon reconnue aux octets et plafonnée, ICO réduit à
-  une image de 32 px (`shrink_ico`), cache par origine —, la `HTTPError` fermée
-  par `_guarded_fetch`, et le retour `CallToolResult` qui l'impose ; `"fetch": false` qui
+  `Content-Encoding` non sollicitée — `_decompress`, WEB9 — dont le plafond `max_bytes`
+  porte sur les octets DÉCOMPRESSÉS (bombe de décompression) et la troncature décidée
+  dans `_fetch_bytes`, redirections http/https seulement (`netguard`) ;
+  `_meta["miaou/web"]` de `fetch_url` — titre, `site_name`, URL finale omise si le client
+  la rejetterait, favicon reconnue aux octets et plafonnée, ICO réduit à une image de
+  32 px (`shrink_ico`), cache par origine à TTL court pour un échec transitoire, sonde
+  qui refuse IP/localhost à chaque saut et trou résiduel des noms internes —, la
+  `HTTPError` fermée par `_guarded_fetch`, et le retour `CallToolResult` qui l'impose ;
+  `"fetch": false` qui
   retire les quatre `fetch_*` ; recherche
   `search`/`image_search` — config `search` et `build_chain` (`order`, `false`, clefs, refus
   `SearchConfigError` si aucun moteur cité n'est utilisable), listage figé à la
   construction, vide = réponse, `fallback`, `_meta["miaou/search"]` = moteur
-  pour le client, `clean_snippet` et `MAX_RESULTS` = 10,
+  pour le client, `clean_snippet`, `is_result_url` (schéma des URL de résultats) et
+  `MAX_RESULTS` = 10,
   pauses par cause dont la clef refusée de Brave en 422 mesurée, budget
-  `SEARCH_BUDGET_S` raboté par moteur, `ddg.ENGINE` unique par processus et non
-  partagé avec `mcp_ddg`, ajout d'un moteur et réserves sur ddgs), `mcp_ddg`
-  — déprécié — (défi anti-bot reconnu à `anomaly-modal` au lieu d'un `[]` muet, blocage d'IP
-  de plus de 2 h mesuré, espacement `_MIN_INTERVAL_S`/`_MAX_WAIT_S` borné par
-  les 30 s de timeout MIAOU, sans effet entre instances), `mcp_brave` — déprécié — (`resolve_api_key`, refus d'init sans clef), `mcp_docs` (obsolète mais
+  `SEARCH_BUDGET_S` raboté par moteur, moteur `ddg` — défi anti-bot reconnu à
+  `anomaly-modal` au lieu d'un `[]` muet, blocage d'IP de plus de 2 h mesuré,
+  espacement `_MIN_INTERVAL_S`/`_MAX_WAIT_S` borné par le budget, `ddg.ENGINE` unique
+  par processus et sans effet entre processus —, ajout d'un moteur et réserves sur
+  ddgs), `mcp_docs` (obsolète mais
   conservé pour le hors-connexion : sessions, pagination, `search`, `extract` hors
   `READ_CAP`, sécurité archives, locales des headings docx), `mcp_secret_demo` (lot AU :
   contrat d'un serveur à secret volatil — `check_config` sans appel sortant et
   `ConfigIncomplete`, `build` qui s'authentifie et lève `CredentialsRejected`, toute autre
-  panne indéterminée, `instances` testées toutes, `delay_s`, valeur jamais citée).
+  panne indéterminée, `instances` testées toutes, `delay_s`, valeur jamais citée, skill
+  facultative `secret-demo` sans `requires_skill`).
 - **`docs/proxy.md`** — `mcp_proxy/` hors auth : les trois types d'upstream
-  (inprocess/stdio/http), `build_upstreams`/`build_proxy_server`/`build_app` et le
-  wrapper ASGI qui évite le 307 sur `/mcp`, le redémarrage sur place au SIGUSR1
+  (inprocess/stdio/http) et leur démarrage (distants d'abord, en parallèle, journal dans
+  l'ordre de la config ; stdio en tâche de service), `build_upstreams`/
+  `build_proxy_server`/`build_app` et le wrapper ASGI qui évite le 307 sur `/mcp`, le redémarrage sur place au SIGUSR1
   (`serve_http` : exec après l'arrêt complet, lifespan compris, sans `uv run` ; clés
   de `--with-dev-auth` perdues ; motif `pkill` ancré sur l'interpréteur et non sur
   son parent uv ; absent sous Windows, faute de SIGUSR1 ; sortie en 43 sous superviseur,
@@ -430,18 +430,26 @@ lots — piège déjà payé côté MIAOU.
   `LaunchOptions`, environnement du démarrage, journal `muted()`, `bind` d'essai par
   `loop.create_server` seulement si hôte/port effectifs changent —, `lifecycle.py` —
   `restartable()` source unique avec le SIGUSR1, refus dans l'ordre, `ExitRequest`
-  au premier code, `ProcessIdentity` —), l'override `--proxy`/`--noproxy` et ses
-  trois chemins d'application, le format de `config.json` ; config en couches
+  au premier code, `ProcessIdentity` —, durée de la relance non bornée si uv
+  télécharge), l'override `--proxy`/`--noproxy` (`ALL_PROXY` compris) et ses trois
+  chemins d'application, le format de `config.json` ; config en couches
   (`layers.py` : chaîne `config.defaults.json` → `config.site.json` → `config.json`,
   `--config` répétable qui la remplace, JSON Merge Patch sans variante, `${VAR}`
-  substitué APRÈS la fusion et hors clés `_*`, `miaou_dist` résolu contre la couche
-  qui le déclare, `--print-config` masqué, `--migrate-config` (et `--diff`, aperçu masqué sans écriture) et son contrat de config
-  effective inchangée, `_comment` retirés, absences listées et jamais neutralisées
-  d'office, `.bak` jamais écrasée), secrets volatils (marqueur `{"volatile": clef}`
+  substitué APRÈS la fusion et hors clés `_comment*` (pas d'imbrication des défauts),
+  `disabled` booléen strict, `miaou_dist` résolu contre la couche qui le déclare,
+  `--print-config` masqué (sous-arbres, query d'URL ; `args` jamais masqués, un secret
+  va dans `env`), `--migrate-config` (et `--diff`, aperçu masqué sans écriture) et son
+  contrat de config effective inchangée vérifié avant d'écrire, `_comment` retirés,
+  absences listées et jamais neutralisées d'office, `.bak` jamais écrasée), secrets
+  volatils (marqueur `{"volatile": clef}`
   dans le `config` d'un inprocess seulement, une clef par upstream, erreur de config
-  ailleurs, `WARNING:` jaune quand une couche suivante le remplace en clair) et `state/` (`state.py`, `state/<nom>/` pour une
+  ailleurs, `WARNING:` jaune quand une couche suivante le remplace en clair ; skills d'un
+  upstream en attente sous la clé `skills` de `tools-cache.json`, entrées d'origine,
+  `_listed_names`/`_remembers_skills`, `cache_forbidden` étendu aux entrées) et `state/` (`state.py`, `state/<nom>/` pour une
   autre config, anciens fichiers déplacés sans réécriture), le pattern
-  `build(config)` pour plusieurs instances d'un même module, ce que `call_tool`
+  `build(config)` pour plusieurs instances d'un même module, la borne `call_timeout`
+  d'un appel d'outil stdio/http (défaut 300 s, `isError` clair, `InFlight` libéré) et le
+  nom d'upstream validé, ce que `call_tool`
   relaie d'un upstream stdio/http (`relay_call_result` : `content`, `isError`,
   `_meta` sans le `serverInfo` de l'upstream, pas `structuredContent`), ce qu'il rend en erreur depuis le SDK 2.x
   (`isError` + `str(e)` comme en 1.x — la `MCPError` d'un upstream http déballée
@@ -491,10 +499,12 @@ lots — piège déjà payé côté MIAOU.
   `miaou/skillsFallback`.
   MIAOU servi sous `/app/` (`webapp.py`, clé `miaou_dist` relative au fichier de
   config) : `miaou.html` à `/app/` hors du mode `html` de `StaticFiles`, `/` en 302,
-  routes après `/mcp` et OAuth et hors auth, `Cache-Control: no-cache` partout (304
-  compris) faute de quoi la fraîcheur heuristique masque un `git pull`, table de types
-  `_MEDIA_TYPES` contre le registre Windows, fichiers cachés refusés, `check_config`
-  neutralisé (404 et non 500 sur dossier absent), refus de démarrer sur `config.json`/
+  routes après `/mcp` et OAuth et hors auth, `Cache-Control: no-cache` sur toute
+  réponse fichier (304 compris, pas les 404/405/416) faute de quoi la fraîcheur
+  heuristique masque un `git pull`, table de types
+  `_MEDIA_TYPES` contre le registre Windows, fichiers cachés refusés (`:` et nom court
+  8.3 compris, jugés sur le chemin résolu), `check_config` neutralisé (404 et non 500
+  sur dossier absent), refus de démarrer sur `config.json`/
   `.git` dans le dossier, avertissements sur `miaou.html`/manifeste/icônes lues dans
   `icons[].src`, et `miaou_dist/` versionné vide pour le `COPY` du `Dockerfile`.
 - **`docs/auth.md`** — campagne AB, les deux sens sans rapport entre eux. Entrante
@@ -507,7 +517,10 @@ lots — piège déjà payé côté MIAOU.
   `upstream_is_live` — « transport ouvert » ne vaut pas « autorisé » —,
   `has_usable_token` qui l'amorce au boot sans requête, contrat
   `AUTHORIZATION_REQUIRED`, `authorize_path` et le `_meta` de `tools/list`,
-  l'attente sur événement de `/authorize/{name}`, `_provoke_refusal` qui déroule
+  l'attente sur événement de `/authorize/{name}` et sa garde `Sec-Fetch-*` (refus 403
+  d'une requête cross-site qui n'est pas une navigation voulue : `navigate` + `?1`),
+  `/callback` aiguillé sur le `state` EXACT seulement et pages échappées sous CSP,
+  `_provoke_refusal` qui déroule
   la séquence jusqu'à `tools/call` (seul refusé sur un déploiement
   d'entreprise), `--debug-auth`, son masquage et la LISTE de loggers qui doit
   couvrir l'après-boot (`mcp.client.streamable_http`, et `httpx2` depuis le
@@ -550,8 +563,9 @@ lots — piège déjà payé côté MIAOU.
   (lot AU : garde `Host` loopback au port ET `Origin` de même origine, `status` et son
   `instance`, entrée par clef — `held`, `state`, `verdict` —, `submit` séquentiel arrêté
   au premier refus, valeur refusée jamais retestée, valeur acceptée = no-op, `forget`,
-  refus `SECRET_*`, `SECRET_REQUIRED` à l'appel, outils et `instructions` d'un upstream en
-  attente servis du cache sans notice), MIAOU servi sous `/app/` (portée,
+  refus `SECRET_*`, `SECRET_REQUIRED` à l'appel et à la lecture d'une skill, outils,
+  `instructions` et skills d'un upstream en attente servis du cache sans notice, à l'octet
+  près ; `-32601` sur `skills/list` à cache vide si lui seul sert des skills), MIAOU servi sous `/app/` (portée,
   `manifest.webmanifest` seul nom figé, icônes lues dans le manifeste, `no-cache`,
   types fixés), l'extension `miaou/self-update` (lot AT : ère moderne seulement,
   `miaou/update/status` et la forme de son état — `state`, `target` à renvoyer,
@@ -571,10 +585,11 @@ lots — piège déjà payé côté MIAOU.
   de MIAOU, sessions jamais expirées d'inactivité, formats de `ref` acceptés).
 - **`docs/tls.md`** — `enable_system_trust_store()` : pourquoi une AC d'entreprise
   interne échoue en `CERTIFICATE_VERIFY_FAILED` alors que le navigateur l'accepte,
-  l'injection `truststore` qui remplace la classe `ssl.SSLContext`, les trois points
-  d'appel (l'ordre contractuel dans `mcp_proxy.main()`, la copie assumée dans
-  `tests/live_call.py`), le best-effort assumé, et httpx2 (SDK 2.x) qui consulte le
-  magasin système de lui-même — l'injection ne sert plus qu'à urllib.
+  l'injection `truststore` qui remplace la classe `ssl.SSLContext`, les quatre points
+  d'appel (l'ordre contractuel dans `mcp_proxy.main()`, les deux copies assumées dans
+  `tests/live_call.py` et `tests/live_auth_probe.py`), le best-effort assumé, et httpx2
+  (SDK 2.x) qui consulte le magasin système de lui-même — l'injection ne sert plus qu'à
+  urllib.
 - **`docs/tests.md`** — ce que chaque suite mocke (aucun appel réseau réel, aucune
   clef requise), le harnais `tests/proxy_client.py` (`Client(mode="legacy")`, le
   chemin JSON-RPC de MIAOU, jamais le mode par défaut), les patchs qui visent

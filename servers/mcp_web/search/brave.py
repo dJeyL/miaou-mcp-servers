@@ -1,6 +1,6 @@
 """Moteur Brave Search (API à clef) : web et images.
 
-Reprise de servers/mcp_brave.py (déprécié), mapping normalisé sur la forme
+Reprise de l'ancien serveur mcp_brave (supprimé), mapping normalisé sur la forme
 commune de `search`/`image_search`.
 """
 
@@ -10,7 +10,7 @@ import json
 import urllib.parse
 import urllib.request
 
-from .common import EngineFailure, clean_snippet, http_read, key_rejected_by_status
+from .common import EngineFailure, clean_snippet, http_read, is_result_url, key_rejected_by_status
 
 API_KEY_ENV = "BRAVE_API_KEY"
 _WEB_URL = "https://api.search.brave.com/res/v1/web/search"
@@ -74,8 +74,12 @@ def _map_web(data: dict) -> list[dict]:
             "snippet": clean_snippet(r.get("description")),
         }
         for r in results
-        if isinstance(r, dict) and r.get("url")
+        if isinstance(r, dict) and is_result_url(r.get("url"))
     ]
+
+
+def _url_or_empty(value: object) -> str:
+    return value if is_result_url(value) else ""
 
 
 def _map_images(data: dict) -> list[dict]:
@@ -88,14 +92,14 @@ def _map_images(data: dict) -> list[dict]:
             continue
         props = r.get("properties")
         image_url = props.get("url") if isinstance(props, dict) else None
-        if not image_url:
+        if not is_result_url(image_url):
             continue  # pas d'image exploitable
         thumb = r.get("thumbnail")
         out.append({
             "title": clean_snippet(r.get("title")),
-            "page_url": r.get("url", ""),
+            "page_url": _url_or_empty(r.get("url")),
             "image_url": image_url,
-            "thumbnail_url": thumb.get("src", "") if isinstance(thumb, dict) else "",
-            "source": r.get("source", ""),
+            "thumbnail_url": _url_or_empty(thumb.get("src") if isinstance(thumb, dict) else None),
+            "source": r.get("source") if isinstance(r.get("source"), str) else "",
         })
     return out

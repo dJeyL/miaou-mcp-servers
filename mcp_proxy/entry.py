@@ -354,7 +354,7 @@ def main() -> None:
         default=None,
         metavar="[http://]host:port",
         help=(
-            "Force http_proxy/https_proxy (et variantes majuscules) vus par tous "
+            "Force http_proxy/https_proxy/all_proxy (et variantes majuscules) vus par tous "
             "les serveurs MCP servis (inprocess et stdio), même si ces variables "
             "sont déjà définies dans l'environnement ou dans config.json. "
             "'http://' est ajouté si absent."
@@ -365,7 +365,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Force l'absence de proxy pour tous les serveurs MCP servis (inprocess "
-            "et stdio), même si http_proxy/https_proxy sont définis dans "
+            "et stdio), même si http_proxy/https_proxy/all_proxy sont définis dans "
             "l'environnement ou dans config.json. Incompatible avec --proxy."
         ),
     )

@@ -289,7 +289,10 @@ async def test_http_upstream_jsonrpc_error_on_skills_get_keeps_code_and_message(
                 await _request(server, "skills/get", {"uri": "skill://ht/tips/SKILL.md"})
             result = await mcp_call_read_skill(server, "skill://ht/tips/SKILL.md")
     assert info.value.error.code == types.INTERNAL_ERROR
-    assert info.value.error.message == _REFUSAL
+    # Le motif de l'upstream est gardé tel quel, encadré du nom du serveur.
+    assert info.value.error.message == (
+        f"Le serveur 'ht' n'a pas pu servir skill://ht/tips/SKILL.md ({_REFUSAL})."
+    )
     # Le repli lit le fichier ; seule la note des autres fichiers, tirée de
     # `skills/get`, manque.
     assert result.is_error is not True
@@ -601,3 +604,76 @@ def test_free_text_prefixing_is_reserved_to_relayed_upstreams():
         "Lire skill://up/acme/SKILL.md (et skill://up/acme/ref.md)."
     )
     assert prefix_free_text_skill_uris("up", legacy, text) == text
+
+
+# --- Panne d'un upstream : la lecture dit QUI est en panne ---------------------------
+
+
+async def test_reading_a_skill_of_a_stopped_http_upstream_says_it_is_unreachable(skills_dir):
+    """Un upstream http dont la session est tombée n'est plus « vivant » : la
+    lecture ne répond pas « non servi » (`-32602`, réservé à ce qui ne l'est
+    pas) mais « injoignable » (`-32603`), en nommant le serveur — par
+    `resources/read`, `skills/get` et le repli `read_skill`."""
+    fixture, app = _skills_server(skills_dir)
+    async with fixture.session_manager.run():
+        async with _hosted(_http_upstream(app, _Recorder())) as upstream:
+            await upstream.start()
+            server, _ = await _proxy_over({"ht": upstream})
+            await upstream.stop()
+            uri = "skill://ht/tips/SKILL.md"
+            with pytest.raises(MCPError) as read_info:
+                await _read(server, uri)
+            with pytest.raises(MCPError) as get_info:
+                await _request(server, "skills/get", {"uri": uri})
+            fallback = await mcp_call_read_skill(server, uri)
+            with pytest.raises(MCPError) as ghost_info:
+                await _read(server, "skill://ht/ghost/SKILL.md")
+    for info in (read_info, get_info, ghost_info):
+        assert info.value.error.code == types.INTERNAL_ERROR
+        assert info.value.error.message.startswith("Le serveur 'ht' est injoignable")
+    assert fallback.is_error is True
+    text = fallback.content[0].text
+    assert text.startswith(f"Lecture de {uri} impossible : Le serveur 'ht' est injoignable")
+    assert "Aucun fichier de skill servi" not in text
+
+
+async def test_reading_an_unknown_upstream_is_still_unserved(skills_dir):
+    fixture, app = _skills_server(skills_dir)
+    async with fixture.session_manager.run():
+        async with _hosted(_http_upstream(app, _Recorder())) as upstream:
+            await upstream.start()
+            server, _ = await _proxy_over({"ht": upstream})
+            with pytest.raises(MCPError) as info:
+                await _read(server, "skill://nobody/tips/SKILL.md")
+    assert info.value.error.code == types.INVALID_PARAMS
+
+
+async def test_dead_stdio_upstream_read_names_the_server(skills_dir):
+    """« Connection closed » du transport ne nomme ni le serveur ni la skill : le
+    proxy garde le code et l'encadre."""
+    from tests.test_proxy_era import _kill_children
+
+    upstream = _stdio_skills(skills_dir)
+    try:
+        await upstream.start()
+        server, _ = await _proxy_over({"st": upstream})
+        _kill_children("skills_fixture_server.py")
+        await anyio.sleep(0.2)
+        uri = "skill://st/tips/SKILL.md"
+        with pytest.raises(MCPError) as info:
+            await _read(server, uri)
+        result = await mcp_call_read_skill(server, uri)
+    finally:
+        await upstream.stop()
+    assert info.value.error.code == -32000
+    assert info.value.error.message == f"Le serveur 'st' n'a pas pu servir {uri} (Connection closed)."
+    assert result.content[0].text == (
+        f"Lecture de {uri} impossible : Le serveur 'st' n'a pas pu servir {uri} (Connection closed)."
+    )
+
+
+def test_remote_failure_of_an_empty_message_has_no_dangling_colon():
+    from mcp_proxy.skills import _remote_failure
+
+    failure = _remote_failure("st", "skill://st/x", TimeoutError())
+    assert failure.error.message == "Le serveur 'st' n'a pas pu servir skill://st/x (TimeoutError)."

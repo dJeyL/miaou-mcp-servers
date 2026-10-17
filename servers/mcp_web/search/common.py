@@ -15,6 +15,7 @@ import math
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Callable
 
@@ -48,6 +49,22 @@ class EngineFailure(Exception):
         super().__init__(reason)
         self.reason = reason
         self.cooldown_s = cooldown_s
+
+
+def is_result_url(value: object) -> bool:
+    """Une URL de résultat de recherche exploitable : une chaîne non vide qui ne
+    porte pas un schéma autre que http/https (`javascript:`, `data:`, `file:`…).
+    Une URL sans schéma (lien relatif ou `//hôte/…`, forme des liens de
+    redirection de DuckDuckGo) passe : elle ne peut pas exécuter de script.
+    Le moteur est une source tierce, le résultat est lu par le modèle et peut
+    finir en lien dans un client."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        scheme = urllib.parse.urlsplit(value.strip()).scheme.lower()
+    except ValueError:
+        return False
+    return scheme in ("", "http", "https")
 
 
 def clean_snippet(text: object) -> str:

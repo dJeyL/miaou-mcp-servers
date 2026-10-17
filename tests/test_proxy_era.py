@@ -555,3 +555,58 @@ async def test_dead_http_upstream_without_oauth_is_unreachable_not_unauthorized(
     assert result.is_error is True
     assert "injoignable" in result.content[0].text
     assert "autorisation" not in result.content[0].text.lower()
+
+
+# --- Démarrage stdio qui échoue après l'ouverture du Client ----------------------------
+
+
+def _children(script: str) -> list[str]:
+    import os
+    import subprocess
+
+    return subprocess.run(
+        ["pgrep", "-P", str(os.getpid()), "-f", script], capture_output=True, text=True
+    ).stdout.split()
+
+
+async def _wait_no_children(script: str) -> list[str]:
+    for _ in range(50):
+        if not _children(script):
+            return []
+        await anyio.sleep(0.1)
+    return _children(script)
+
+
+async def test_stdio_start_failing_after_the_client_opened_leaves_no_subprocess(monkeypatch):
+    """Le `Client` est entré (subprocess lancé, handshake fait) quand le listage
+    d'amorçage échoue : `start()` referme tout avant de relever la cause."""
+    import mcp_proxy.upstream as up
+
+    async def boom(session):
+        raise RuntimeError("listage d'amorçage en panne")
+
+    monkeypatch.setattr(up, "_prime_tool_listing", boom)
+    upstream = _stdio_modern()
+    with pytest.raises(RuntimeError, match="listage d'amorçage"):
+        await upstream.start()
+    assert await _wait_no_children("era_fixture_server.py") == []
+
+
+async def test_stdio_start_cancelled_after_the_client_opened_leaves_no_subprocess(monkeypatch):
+    """Même fenêtre, par annulation (Ctrl-C pendant le boot, lifespan annulé)."""
+    import mcp_proxy.upstream as up
+
+    reached = anyio.Event()
+
+    async def hang(session):
+        reached.set()
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(up, "_prime_tool_listing", hang)
+    upstream = _stdio_modern()
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(upstream.start)
+        with anyio.fail_after(20):
+            await reached.wait()
+        tg.cancel_scope.cancel()
+    assert await _wait_no_children("era_fixture_server.py") == []

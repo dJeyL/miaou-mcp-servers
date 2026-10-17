@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "servers"))
 
@@ -24,7 +25,7 @@ async def test_unknown_tool_argument_is_rejected():
 
     tm = bench_server.mcp._tool_manager
     with patch("asyncio.sleep", new=AsyncMock()):
-        with pytest.raises(Exception):
+        with pytest.raises(ToolError, match="extra_forbidden"):
             await tm.call_tool("echo", {"text": "bonjour", "page": 2}, None)
 
 
@@ -141,7 +142,7 @@ def test_system_trust_store_patches_ssl_context_class():
 
     L'injection est globale et irréversible dans un process, donc exécutée dans
     un sous-process : la poser dans celui de pytest contaminerait les autres
-    tests (et le mock d'OpenerDirector.open de test_weather/test_ddg)."""
+    tests (et le mock d'OpenerDirector.open de test_weather)."""
     import subprocess
 
     code = (
@@ -220,3 +221,86 @@ def test_instructions_reach_the_server():
     # Jusque dans ce que le SDK enverra au client.
     opts = srv.mcp._lowlevel_server.create_initialization_options()
     assert opts.instructions == "Lire la skill `t-usage`."
+
+
+# ---------------------------------------------------------------------------
+# _make_app : CORS, Origin: null, plafond de corps (Z9-7)
+# ---------------------------------------------------------------------------
+
+_INIT = {
+    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+    "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+               "clientInfo": {"name": "t", "version": "0"}},
+}
+_MCP_HEADERS = {"Origin": "null", "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json"}
+
+
+def test_make_app_accepts_origin_null_and_exposes_session_id():
+    from starlette.testclient import TestClient
+
+    app = _DummyServer()._make_app()
+    with TestClient(app, base_url="http://127.0.0.1:9999") as client:
+        r = client.post("/mcp", json=_INIT, headers=_MCP_HEADERS)
+    assert r.status_code == 200
+    assert r.headers["access-control-expose-headers"] == "Mcp-Session-Id"
+    assert r.headers["access-control-allow-origin"] == "*"
+    assert r.headers.get("mcp-session-id")
+
+
+def test_make_app_rejects_oversized_body():
+    from mcp_base import MAX_REQUEST_BODY_BYTES
+    from starlette.testclient import TestClient
+
+    app = _DummyServer()._make_app()
+    with TestClient(app, base_url="http://127.0.0.1:9999") as client:
+        r = client.post("/mcp", content=b"x" * (MAX_REQUEST_BODY_BYTES + 1), headers=_MCP_HEADERS)
+    assert r.status_code == 413
+
+
+# ---------------------------------------------------------------------------
+# main() : -h et --port 0 (Z9-8)
+# ---------------------------------------------------------------------------
+
+def test_main_short_help_is_argparse_help_not_a_host(monkeypatch, capsys):
+    import mcp_base
+
+    monkeypatch.setattr(mcp_base, "enable_system_trust_store", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["srv", "-h"])
+    srv = MiaouMCPBase("t", default_port=9999)
+    ran = []
+    monkeypatch.setattr(srv, "run_http", lambda *a, **k: ran.append(a))
+    with pytest.raises(SystemExit) as exc:
+        srv.main()
+    assert exc.value.code == 0
+    assert ran == []
+    assert "--transport" in capsys.readouterr().out
+
+
+def test_main_help_after_a_positional_host_is_still_help(monkeypatch, capsys):
+    # `srv 0.0.0.0 --help` : la syntaxe positionnelle ne doit pas l'emporter et
+    # démarrer le serveur — mcp_secret_demo sert l'aide avec un mot de passe factice.
+    import mcp_base
+
+    monkeypatch.setattr(mcp_base, "enable_system_trust_store", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["srv", "0.0.0.0", "--help"])
+    srv = MiaouMCPBase("t", default_port=9999)
+    ran = []
+    monkeypatch.setattr(srv, "run_http", lambda *a, **k: ran.append(a))
+    with pytest.raises(SystemExit) as exc:
+        srv.main()
+    assert exc.value.code == 0
+    assert ran == []
+    assert "--transport" in capsys.readouterr().out
+
+
+def test_run_http_port_zero_is_honoured(monkeypatch):
+    import uvicorn
+
+    srv = MiaouMCPBase("t", default_port=9999)
+    seen = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update(kw))
+    srv.run_http("127.0.0.1", 0)
+    assert seen["port"] == 0
+    srv.run_http("127.0.0.1")
+    assert seen["port"] == 9999

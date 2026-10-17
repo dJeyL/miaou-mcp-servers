@@ -23,7 +23,7 @@ from .auth_out import (
 from .logging import _log
 from .server import aggregate_instructions, authorize_path, published_tools
 from .skills import build_skills_blocks, install_skills
-from .upstream import HttpUpstream, Upstream
+from .upstream import HttpUpstream, InProcessUpstream, Upstream
 from .webapp import build_miaou_routes
 
 
@@ -58,7 +58,8 @@ def build_app(
     ni méthode, ni extension, ni boucle de sonde — surface d'avant le lot).
 
     `catalog` : le `ToolCatalogCache`, où un upstream en attente de son secret
-    volatil (lot AU) retrouve ses `instructions`.
+    volatil (lot AU) retrouve ses `instructions`, et ses skills avec le bloc
+    qui les annonce.
 
     `secrets` : un `VolatileSecrets` (lot AU), ou None (aucun upstream à
     secret volatil : ni méthode, ni extension). L'extension n'est publiée que
@@ -106,13 +107,13 @@ def build_app(
         enregistrement tardif des skills l'est aussi. Une erreur ici prive le
         proxy de skills, pas d'outils."""
         try:
-            skills_blocks = await build_skills_blocks(upstreams, authorizers)
+            skills_blocks = await build_skills_blocks(upstreams, authorizers, catalog)
         except Exception as e:
             skills_blocks = {}
             _log(f"Bloc des skills non généré ({type(e).__name__}: {e}).")
         mcp_server.instructions = aggregate_instructions(upstreams, skills_blocks)
         try:
-            if await install_skills(mcp_server, upstreams, authorizers):
+            if await install_skills(mcp_server, upstreams, authorizers, catalog):
                 _log("Extension Skills servie.")
         except Exception as e:
             _log(f"Extension Skills non servie ({type(e).__name__}: {e}).")
@@ -121,7 +122,7 @@ def build_app(
     async def lifespan(app: Starlette):
         import anyio
 
-        async def _start_upstreams() -> list[Upstream]:
+        async def _start_upstreams(started: list[Upstream]) -> None:
             _log(f"Upstream servers ({len(upstreams)}):")
             # Un upstream qui refuse de démarrer (clef d'API absente, module
             # introuvable, subprocess qui ne répond pas) ne doit pas empêcher le
@@ -179,19 +180,46 @@ def build_app(
                     # l'appel reste le filet.
                     _log(f"  {name:<12} état d'autorisation indéterminé ({e})")
 
-            started: list[Upstream] = []
+            # Les distants (stdio, http) partent EN PREMIER et ENSEMBLE : un
+            # subprocess qui charge ses dépendances ou un serveur injoignable
+            # coûte jusqu'à sa borne (15 s, 30 s), et ces bornes ne doivent pas
+            # s'additionner. Les inprocess, rapides, se démarrent ensuite dans
+            # la tâche du lifespan, pendant que les distants avancent. Chaque
+            # `start()` tourne dans une tâche fille : les contextes du SDK d'un
+            # distant vivent dans SA tâche de service (cf. StdioUpstream et
+            # HttpUpstream), ce qui rend ce lancement depuis n'importe quelle
+            # tâche sans danger pour les cancel scopes.
+            #
+            # Journal : chaque upstream rédige ses lignes dans `lines`, et
+            # `flush` les écrit dans l'ORDRE DE LA CONFIG dès que tous les
+            # précédents sont écrits — déterministe, et le plus tôt possible.
             failed: list[str] = []
-            for name, upstream in list(upstreams.items()):
+            order = list(upstreams.items())
+            lines: dict[str, list[str]] = {}
+            written = 0
+
+            def flush() -> None:
+                nonlocal written
+                while written < len(order) and order[written][0] in lines:
+                    for line in lines[order[written][0]]:
+                        _log(line)
+                    written += 1
+
+            async def start_one(name: str, upstream: Upstream) -> None:
+                lines[name] = await _start_one(name, upstream)
+                flush()
+
+            async def _start_one(name: str, upstream: Upstream) -> list[str]:
                 try:
                     await upstream.start()
                 except AuthorizationRequired as e:
-                    _log(f"  {name:<12} unauthorized — {e}")
-                    _log(f"  {'':<12} autoriser : {authorize_path(name)}")
-                    continue
+                    return [
+                        f"  {name:<12} unauthorized — {e}",
+                        f"  {'':<12} autoriser : {authorize_path(name)}",
+                    ]
                 except Exception as e:
                     failed.append(name)
-                    _log(f"  {name:<12} unavailable — {e}")
-                    continue
+                    return [f"  {name:<12} unavailable — {e}"]
                 if getattr(upstream, "secret_pending", False) is True:
                     # Dans la table, non construit (lot AU) : ses outils et ses
                     # instructions viennent du cache, ses appels sont refusés
@@ -200,12 +228,11 @@ def build_app(
                     if catalog is not None:
                         upstream.instructions = catalog.recall_instructions(name)
                         known = len(catalog.recall(name)[0])
-                    _log(
+                    return [
                         f"  {name:<12} pending — volatile secret "
                         f"« {upstream.volatile_key} » to enter in MIAOU "
                         f"({known} tool{'s' if known != 1 else ''} from cache)"
-                    )
-                    continue
+                    ]
                 started.append(upstream)
                 # Le nombre d'outils n'est connu qu'après start() : un upstream
                 # inprocess n'a pas encore son MCPServer avant, et un stdio
@@ -230,10 +257,23 @@ def build_app(
                 # qu'on voit qu'un upstream est abordé en legacy.
                 if upstream.protocol_version:
                     detail += f" ({upstream.protocol_version})"
-                _log(f"  {name:<12} {detail}")
+                return [f"  {name:<12} {detail}"]
+
+            # Le task group n'est qu'un moyen d'attendre les distants : il ne
+            # porte aucun contexte du SDK, et une annulation le traverse.
+            async with anyio.create_task_group() as starting:
+                for name, upstream in order:
+                    if not isinstance(upstream, InProcessUpstream):
+                        starting.start_soon(start_one, name, upstream)
+                # `start_soon` ne lance rien avant le prochain point de
+                # suspension : sans lui, le premier inprocess partirait avant
+                # les distants.
+                await anyio.sleep(0)
+                for name, upstream in order:
+                    if isinstance(upstream, InProcessUpstream):
+                        await start_one(name, upstream)
             for name in failed:
                 del upstreams[name]
-            return started
 
         # UN task group, de la durée de vie du proxy, qui héberge deux sortes de
         # tâches : les tâches de service des upstreams HTTP (leurs contextes
@@ -273,9 +313,12 @@ def build_app(
                 if isinstance(upstream, HttpUpstream):
                     upstream.host_tasks_in(tg)
 
+            # Remplie AU FIL du démarrage par `_start_upstreams` : annulé en
+            # route (Ctrl-C pendant le boot, upstream qui ne répond pas), le
+            # `finally` arrête quand même ceux qui ont déjà démarré.
             started: list[Upstream] = []
             try:
-                started = await _start_upstreams()
+                await _start_upstreams(started)
                 # Les consommateurs ne sont connus qu'après le démarrage (un
                 # `check_config` qui lève écarte l'upstream) ; avant
                 # session_manager.run(), aucun client n'a encore découvert.
@@ -306,11 +349,15 @@ def build_app(
                 async with session_manager.run():
                     yield
             finally:
+                names = {id(u): n for n, u in upstreams.items()}
                 for upstream in started:
                     try:
                         await upstream.stop()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log(
+                            f"Arrêt de '{names.get(id(upstream), '?')}' en échec "
+                            f"({type(e).__name__}: {e})."
+                        )
                 # Sans annulation explicite, les tâches de service encore
                 # vivantes retiendraient le task group — donc l'extinction.
                 tg.cancel_scope.cancel()

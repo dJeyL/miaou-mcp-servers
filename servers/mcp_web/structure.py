@@ -1,7 +1,7 @@
 """Extraction de structure (headings + liens) d'une page HTML pour mcp_web.
 
 Parsing en stdlib pure (html.parser), pas de dépendance tierce — même esprit
-que mcp_ddg qui parse le HTML de DuckDuckGo sans lib externe. Le résultat est
+que le moteur ddg qui parse le HTML de DuckDuckGo sans lib externe. Le résultat est
 un flux plat ordonné d'entrées, dans l'ordre d'apparition sur la page :
     {"type": "heading", "level": 1..6, "text": "..."}
     {"type": "link", "text": "...", "url": "..."}

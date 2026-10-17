@@ -6,12 +6,15 @@ instance (`instances`, ou la config elle-même) : `EXPECTED` est accepté,
 `LEAKY_PREFIX` fait lever un message qui CITE la config (et donc la valeur),
 `INCOMPLETE` lève `ConfigIncomplete`, tout le reste lève
 `CredentialsRejected`. `"cite": true` fait citer la valeur dans la
-description de l'outil. `CHECKS` et `BUILDS` gardent ce que
-le proxy a passé à chacun.
+description de l'outil, `"cite_instructions": true` dans ses `instructions`.
+`"skills_dir"` (chemin) lui donne les skills de ce dossier.
+`DELAY_S` ralentit chaque `build` (test d'annulation). `CHECKS` et `BUILDS`
+gardent ce que le proxy a passé à chacun.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from mcp_base import ConfigIncomplete, CredentialsRejected, MiaouMCPBase
@@ -21,6 +24,7 @@ UNREACHABLE = "annuaire-injoignable"
 INCOMPLETE = "config-incomplete"
 LEAKY_PREFIX = "fuite-"
 
+DELAY_S = 0.0
 CHECKS: list[Any] = []
 BUILDS: list[Any] = []
 
@@ -38,6 +42,8 @@ def check_config(config: Any) -> None:
 def build(config: dict | None = None) -> Any:
     BUILDS.append(config)
     _check(config)
+    if DELAY_S:
+        time.sleep(DELAY_S)
     for instance in (config or {}).get("instances") or [config]:
         password = instance.get("password")
         if password == UNREACHABLE:
@@ -48,9 +54,12 @@ def build(config: dict | None = None) -> Any:
             raise ValueError(f"config invalide : {config}")
         if password != EXPECTED:
             raise CredentialsRejected("identifiants refusés")
+    instructions = "Consigne du serveur à secret."
+    if config.get("cite_instructions"):
+        instructions += f" Mot de passe : {config.get('password')}"
     server = MiaouMCPBase(
-        "volatile-fixture", default_port=0, config=config,
-        instructions="Consigne du serveur à secret.",
+        "volatile-fixture", default_port=0, config=config, instructions=instructions,
+        skills_dir=config.get("skills_dir"),
     )
     description = "Interroge le service."
     if config.get("cite"):

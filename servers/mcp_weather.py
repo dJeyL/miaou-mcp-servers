@@ -31,6 +31,7 @@ Dans MIAOU → Paramètres → Serveurs MCP → Ajouter :
 import asyncio
 import base64
 import datetime
+import hashlib
 import json
 import re
 import unicodedata
@@ -39,6 +40,7 @@ import urllib.parse
 from typing import Annotated, Optional
 
 from mcp import types
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from mcp_base import MiaouMCPBase, make_opener
@@ -51,13 +53,20 @@ def _fetch_weather_bytes(url: str) -> bytes:
         return resp.read(2 * 1024 * 1024)
 
 
+_SLUG_MAX = 60
+
+
 def _slug(text: str) -> str:
     """Réduit un libellé de lieu à un identifiant de nom de fichier : ASCII, minuscules,
     tirets. Sans ça, « Saint-Étienne, France » produirait un nom de ressource contenant
     accents, espaces et virgule."""
     ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_text).strip("-").lower()
-    return slug or "lieu"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_text).strip("-").lower()[:_SLUG_MAX]
+    slug = slug.strip("-")
+    if slug:
+        return slug
+    # Rien d'ASCII (日本, Москва) : un court condensé du lieu garde les noms distincts.
+    return "lieu-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
 
 
 def _resource_date(data: dict) -> str:
@@ -114,6 +123,10 @@ class WeatherServer(MiaouMCPBase):
             blocs astronomy ni hourly, donc sans découpage horaire, seulement les min/max
             et moyennes journalières. Les paramètres astronomy et hourly, indépendants,
             réintègrent chacun le sien. Attention : heures UTC."""
+            if not city.strip():
+                # Sans lieu, wttr.in géolocalise l'IP du serveur : une météo pour un
+                # lieu que l'appelant n'a pas demandé.
+                raise ToolError("Paramètre city vide : indiquer une ville.")
             parts = [city]
             if state:
                 parts.append(state)
@@ -121,7 +134,7 @@ class WeatherServer(MiaouMCPBase):
                 parts.append(country)
             location = ",".join(parts)
 
-            url = f"http://wttr.in/{urllib.parse.quote(location)}?format=j1"
+            url = f"http://wttr.in/{urllib.parse.quote(location, safe=',')}?format=j1"
 
             try:
                 raw = await asyncio.to_thread(_fetch_weather_bytes, url)
@@ -164,7 +177,7 @@ class WeatherServer(MiaouMCPBase):
                 return types.EmbeddedResource(
                     type="resource",
                     resource=types.TextResourceContents(
-                        uri=f"miaou://weather/{location}",  # type: ignore[arg-type]
+                        uri=f"miaou://weather/{urllib.parse.quote(location, safe=',')}",  # type: ignore[arg-type]
                         mimeType="application/json",
                         text=payload,
                     ),

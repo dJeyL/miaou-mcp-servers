@@ -2417,3 +2417,13 @@ async def test_list_materializes_off_the_event_loop(workdir, tmp_path):
     result = await call_task
     assert "a.txt" in result
     assert "dir/b.txt" in result
+
+
+def test_read_selector_description_does_not_promise_pptx_heading_titles():
+    """Z9-6 : pptx_read ne connaît que N ou N-M ; la description lue par le modèle
+    ne doit pas promettre un titre de heading pour pptx."""
+    tool = mcp_docs.server.mcp._tool_manager._tools["read"]
+    desc = tool.parameters["properties"]["selector"]["description"]
+    assert "heading (docx/pptx)" not in desc
+    assert "slide" in desc
+    assert "(docx)" in desc

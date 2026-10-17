@@ -13,6 +13,8 @@ for p in (_ROOT, _SERVERS):
         sys.path.insert(0, str(p))
 
 from mcp_proxy import entry
+from mcp_proxy import layers as layers_mod
+from mcp_proxy.contract import is_disabled
 from mcp_proxy.layers import (
     interpolate_env,
     load_layers,
@@ -21,6 +23,7 @@ from mcp_proxy.layers import (
     migrate_local,
     migration_diff,
     needs_slimming,
+    read_layer,
     resolve_chain,
     slim,
     strip_comments,
@@ -170,12 +173,30 @@ def test_unset_variable_becomes_empty_and_is_reported_with_its_key():
     assert unset == [("MISSING", "mcpServers.web.config.k")]
 
 
-def test_underscore_keys_are_left_verbatim():
-    """`_comment` cite la syntaxe sans l'employer."""
+def test_comment_keys_are_left_verbatim():
+    """`_comment` cite la syntaxe sans l'employer (même périmètre que
+    `strip_comments` : `_comment*`)."""
     unset: list = []
-    data = {"_comment": "écrire ${VAR}", "_example": {"k": "${VAR}"}}
+    data = {"_comment": "écrire ${VAR}", "_comment_auth": {"k": "${VAR}"}}
     assert interpolate_env(data, {}, unset) == data
     assert unset == []
+
+
+def test_other_underscore_keys_are_interpolated():
+    """Une variable d'environnement d'upstream peut commencer par `_`
+    (`_JAVA_OPTIONS`) : seule la famille `_comment*` est exemptée."""
+    unset: list = []
+    out = interpolate_env(
+        {"env": {"_JAVA_OPTIONS": "${X}"}, "_example": {"k": "${GONE}"}}, {"X": "-Xmx1g"}, unset
+    )
+    assert out["env"]["_JAVA_OPTIONS"] == "-Xmx1g"
+    assert out["_example"]["k"] == ""
+    assert unset == [("GONE", "_example.k")]
+
+
+def test_dollar_escape_still_works_in_underscore_env_keys():
+    out = interpolate_env({"env": {"_V": "$${X}"}}, {"X": "v"}, [])
+    assert out["env"]["_V"] == "${X}"
 
 
 def test_disabled_block_is_interpolated_but_its_missing_vars_stay_quiet():
@@ -451,3 +472,197 @@ def test_legacy_state_never_overwrites_a_newer_one(tmp_path):
     assert (tmp_path / "state" / "tokens.json").read_text() == "récent"
     assert (tmp_path / "config-tokens.json").read_text() == "ancien"
     assert "ignoré" in lines[0]
+
+
+# ---------------------------------------------------------------------------
+# `disabled` : un booléen, rien d'autre (Z3-1)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["true", "false", "0", "1", "", 0, 1, [], ["x"], {}, "${DIS:-false}"])
+@pytest.mark.parametrize("key", ["disabled", "_disabled"])
+def test_disabled_must_be_a_boolean(key, value):
+    """`bool("false")` est vrai : une chaîne issue d'un `${VAR:-false}` neutralisait
+    le bloc en silence."""
+    with pytest.raises(ValueError, match=r"mcpServers\.x.*true ou false"):
+        is_disabled({key: value}, "mcpServers.x")
+
+
+def test_disabled_booleans_and_null_are_accepted():
+    assert is_disabled({"disabled": True}, "x") is True
+    assert is_disabled({"disabled": False}, "x") is False
+    assert is_disabled({"disabled": None}, "x") is False
+    assert is_disabled({"_disabled": True}, "x") is True
+    assert is_disabled({}, "x") is False
+
+
+def test_a_string_disabled_does_not_silence_the_unset_variables_of_its_block():
+    """À l'interpolation, `"${DIS:-false}"` est encore une chaîne vraie : elle
+    ne doit pas passer pour un bloc neutralisé."""
+    unset: list = []
+    interpolate_env({"b": {"disabled": "${DIS:-false}", "k": "${GONE}"}}, {}, unset)
+    assert unset == [("GONE", "b.k")]
+
+
+# ---------------------------------------------------------------------------
+# Masquage de --print-config / --diff (Z3-3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("key", [
+    "private_key", "privateKey", "credentials", "key", "access_key", "X-Key", "passphrase",
+    "bearer", "Cookie", "Set-Cookie", "session", "session_id", "signature", "sig", "jwt",
+    "api_keys", "access_token", "client_secret", "apikey", "pass",
+])
+def test_mask_secrets_secret_key_families(key):
+    assert mask_secrets({key: "valeur-secrete"}) == {key: "***"}
+
+
+@pytest.mark.parametrize("key", ["monkey", "keys", "passthrough", "issuer_url", "username", "host"])
+def test_mask_secrets_leaves_ordinary_keys(key):
+    assert mask_secrets({key: "visible"}) == {key: "visible"}
+
+
+def test_mask_secrets_masks_numbers_but_keeps_empty_and_booleans():
+    assert mask_secrets({"password": 1234, "token": 1.5, "secret": "", "pass": None,
+                         "api_key": True}) == {
+        "password": "***", "token": "***", "secret": "", "pass": None, "api_key": True}
+
+
+def test_mask_secrets_masks_whole_subtrees_under_a_secret_key():
+    cfg = {"token": {"value": "t", "meta": ["a", 3]}, "api_keys": ["k1", "k2"],
+           "credentials": {"user": "u", "nested": {"p": "x"}}}
+    assert mask_secrets(cfg) == {
+        "token": {"value": "***", "meta": ["***", "***"]}, "api_keys": ["***", "***"],
+        "credentials": {"user": "***", "nested": {"p": "***"}}}
+
+
+def test_mask_secrets_keeps_auth_blocks_readable_but_masks_their_secrets():
+    """`auth` désigne ici un BLOC (inbound ou d'un upstream), pas un en-tête :
+    ce qu'on lit dans un diagnostic OAuth reste lisible."""
+    cfg = {"auth": {"issuer_url": "https://as", "authorization_servers": ["https://as"],
+                    "client_secret": "s", "token_endpoint": "https://as/token"},
+           "_auth_example": {"issuer_url": "https://as", "jwks_uri": "https://as/jwks"},
+           "headers": {"X-Auth": "a", "Auth": "b"}}
+    assert mask_secrets(cfg) == {
+        "auth": {"issuer_url": "https://as", "authorization_servers": ["https://as"],
+                 "client_secret": "***", "token_endpoint": "https://as/token"},
+        "_auth_example": {"issuer_url": "https://as", "jwks_uri": "https://as/jwks"},
+        "headers": {"X-Auth": "***", "Auth": "***"}}
+
+
+def test_mask_secrets_does_not_judge_server_names_and_keeps_volatile_markers():
+    cfg = {"mcpServers": {"token_vault": {"type": "http", "url": "https://h/mcp"},
+                          "auth0": {"command": "c", "args": ["--x"]}},
+           "config": {"password": {"volatile": "password"}}}
+    assert mask_secrets(cfg) == cfg
+
+
+@pytest.mark.parametrize("url, expected", [
+    ("https://h/mcp?token=abc&x=1", "https://h/mcp?token=***&x=1"),
+    ("https://h/mcp?x=1&api_key=zzz", "https://h/mcp?x=1&api_key=***"),
+    ("https://h/mcp?apikey=a&access_token=b&sig=c&password=d&key=e",
+     "https://h/mcp?apikey=***&access_token=***&sig=***&password=***&key=***"),
+    ("https://h/mcp?token=abc#frag", "https://h/mcp?token=***#frag"),
+    ("https://h/mcp?token=", "https://h/mcp?token="),
+    ("https://h/mcp?page=2&q=token", "https://h/mcp?page=2&q=token"),
+    ("https://me:pw@h/mcp?token=abc", "https://me:***@h/mcp?token=***"),
+    ("pas une url ?token=abc", "pas une url ?token=abc"),
+])
+def test_mask_secrets_masks_secret_query_parameters_of_urls(url, expected):
+    assert mask_secrets({"url": url}) == {"url": expected}
+    assert mask_secrets({"urls": [url]}) == {"urls": [expected]}
+
+
+def test_mask_secrets_never_masks_stdio_args():
+    """Décision assumée : `args` n'est jamais masqué — un secret va dans `env`."""
+    cfg = {"args": ["--password", "hunter2", "--token=abc"]}
+    assert mask_secrets(cfg) == cfg
+
+
+def test_migration_diff_masks_what_print_config_masks(tmp_path):
+    base = _write(tmp_path / "config.defaults.json", {"port": 1})
+    local = _write(tmp_path / "config.json", {"port": 2, "private_key": "PK", "cookie": "CK",
+                                              "url": "https://h/mcp?token=TV"})
+    text = "".join(migration_diff([base, local], local)[1])
+    for leaked in ("PK", "CK", "TV"):
+        assert leaked not in text
+
+
+# ---------------------------------------------------------------------------
+# --migrate-config : le contrat « config effective inchangée » est vérifié (Z3-6)
+# ---------------------------------------------------------------------------
+
+def _corrupt_slim(monkeypatch):
+    real = layers_mod.slim
+
+    def broken(base, local):
+        out = real(base, local)
+        out.content = {**out.content, "injecte": 1}
+        return out
+
+    monkeypatch.setattr(layers_mod, "slim", broken)
+
+
+def test_migrate_local_refuses_when_the_effective_config_would_change(tmp_path, monkeypatch):
+    base = _write(tmp_path / "config.defaults.json", {"port": 1})
+    local = _write(tmp_path / "config.json", {"port": 1, "k": "v"})
+    original = local.read_text()
+    _corrupt_slim(monkeypatch)
+    with pytest.raises(ValueError, match="config effective"):
+        migrate_local([base, local], local)
+    assert local.read_text() == original
+    assert not (tmp_path / "config.json.bak").exists()
+    assert not (tmp_path / "config.json.tmp").exists()
+
+
+def test_migration_diff_refuses_the_same_way(tmp_path, monkeypatch):
+    base = _write(tmp_path / "config.defaults.json", {"port": 1})
+    local = _write(tmp_path / "config.json", {"port": 1, "k": "v"})
+    _corrupt_slim(monkeypatch)
+    with pytest.raises(ValueError, match="config effective"):
+        migration_diff([base, local], local)
+
+
+def test_migrate_local_does_not_follow_a_stale_tmp_symlink(tmp_path):
+    base = _write(tmp_path / "config.defaults.json", {"port": 1})
+    local = _write(tmp_path / "config.json", {"port": 1, "k": "v"})
+    victim = tmp_path / "victime.txt"
+    victim.write_text("intacte")
+    (tmp_path / "config.json.tmp").symlink_to(victim)
+    migrate_local([base, local], local)
+    assert victim.read_text() == "intacte"
+    assert json.loads(local.read_text()) == {"k": "v"}
+    assert not (tmp_path / "config.json.tmp").exists()
+
+
+def test_migrate_local_failed_write_leaves_the_original_and_no_leftovers(tmp_path, monkeypatch):
+    base = _write(tmp_path / "config.defaults.json", {"port": 1})
+    local = _write(tmp_path / "config.json", {"port": 1, "k": "v"})
+    original = local.read_text()
+
+    def boom(src, dst):
+        raise OSError("disque plein")
+
+    monkeypatch.setattr(layers_mod.os, "replace", boom)
+    with pytest.raises(OSError):
+        migrate_local([base, local], local)
+    assert local.read_text() == original
+    assert not (tmp_path / "config.json.tmp").exists()
+    # Rien n'a été remplacé : la sauvegarde ne doit pas bloquer la reprise.
+    assert not (tmp_path / "config.json.bak").exists()
+
+
+# ---------------------------------------------------------------------------
+# Petites frictions (Z3-8)
+# ---------------------------------------------------------------------------
+
+def test_tools_cache_beside_only_strips_the_trailing_tokens_marker():
+    assert tools_cache_beside("a-tokens-x-tokens.json") == Path("a-tokens-x-tools.json")
+    assert tools_cache_beside("/d/x-tokens.json") == Path("/d/x-tools.json")
+    assert tools_cache_beside("/d/jetons.json") == Path("/d/jetons-tools.json")
+
+
+def test_a_very_deeply_nested_layer_is_a_config_error(tmp_path):
+    path = tmp_path / "deep.json"
+    path.write_text("[" * 100000 + "]" * 100000)
+    with pytest.raises(ValueError, match="deep.json"):
+        read_layer(path)

@@ -283,7 +283,64 @@ INVALID_CONFIGS = {
     "protocol_era": {"mcpServers": {"x": {"type": "stdio", "command": "c", "protocol_era": "x"}}},
     "volatile-misplaced": {"mcpServers": {"x": {"type": "stdio", "command": "c", "env": {"P": {"volatile": "k"}}}}},
     "auth-on-stdio": {"mcpServers": {"x": {"type": "stdio", "command": "c", "auth": {}}}},
+    # Z3-1 : `disabled` est un booléen, sur chacun des lecteurs.
+    "disabled-server-str": {"mcpServers": {"x": {"type": "stdio", "command": "c", "disabled": "false"}}},
+    "disabled-legacy-str": {"mcpServers": {"x": {"type": "stdio", "command": "c", "_disabled": "true"}}},
+    "disabled-auth-str": {"auth": {"issuer_url": "http://as", "disabled": "0"}},
+    "disabled-server-auth-str": {"mcpServers": {"x": {"type": "http", "url": "http://e/mcp", "auth": {"disabled": "no"}}}},
+    "disabled-from-variable": {"mcpServers": {"x": {"type": "stdio", "command": "c", "disabled": "${NOPE:-false}"}}},
+    # Z3-2 : valide en JSON, fausse en structure.
+    "servers-list": {"mcpServers": []},
+    "servers-str": {"mcpServers": "x"},
+    "servers-int": {"mcpServers": 3},
+    "entry-str": {"mcpServers": {"x": "y"}},
+    "entry-list": {"mcpServers": {"x": []}},
+    "entry-int": {"mcpServers": {"x": 3}},
+    "entry-bool": {"mcpServers": {"x": True}},
+    "env-list": {"mcpServers": {"x": {"type": "stdio", "command": "c", "env": [1]}}},
+    "env-str": {"mcpServers": {"x": {"type": "stdio", "command": "c", "env": "a"}}},
+    "inprocess-env-list": {"mcpServers": {"x": {"type": "inprocess", "module": "mcp_bench", "env": [1]}}},
+    "inprocess-config-list": {"mcpServers": {"x": {"type": "inprocess", "module": "mcp_bench", "config": [1]}}},
+    "args-str": {"mcpServers": {"x": {"type": "stdio", "command": "c", "args": "--a"}}},
+    "args-not-strings": {"mcpServers": {"x": {"type": "stdio", "command": "c", "args": [1]}}},
+    "command-list": {"mcpServers": {"x": {"type": "stdio", "command": ["c"]}}},
+    "headers-list": {"mcpServers": {"x": {"type": "http", "url": "http://e/mcp", "headers": [1]}}},
+    "url-int": {"mcpServers": {"x": {"type": "http", "url": 3}}},
+    "timeout-str": {"mcpServers": {"x": {"type": "http", "url": "http://e/mcp", "timeout": "a"}}},
+    "module-int": {"mcpServers": {"x": {"type": "inprocess", "module": 3}}},
+    "type-list": {"mcpServers": {"x": {"type": ["stdio"]}}},
+    "host-int": {"host": 3},
+    "host-list": {"host": [1]},
+    # Z3-8 : un port qui n'en est pas un.
+    "port-float": {"port": 8765.9},
+    "port-bool": {"port": True},
+    "port-zero": {"port": 0},
+    "port-negative": {"port": -1},
+    "port-too-big": {"port": 70000},
 }
+
+
+def test_an_unexpected_exception_in_validation_is_invalid_not_a_crash(chain, monkeypatch):
+    """Dernier filet : `status` et `restart` ne lèvent jamais, même sur une forme
+    de config que `prepare_config` n'aurait pas prévue."""
+    watch = _watch()
+    _write(chain / "config.json", {"mcpServers": {"y": {"type": "inprocess", "module": "m"}}})
+
+    def boom(loaded, options):
+        raise KeyError("forme imprévue")
+
+    monkeypatch.setattr(cw, "prepare_config", boom)
+    result = _check(watch)
+    assert result.state == cw.INVALID
+    assert "KeyError" in result.detail
+
+
+def test_validation_cache_is_bounded(chain):
+    watch = _watch()
+    for i in range(cw.VALIDATION_CACHE_MAX + 20):
+        _write(chain / "config.json", {"mcpServers": {}, "marqueur": i})
+        assert _check(watch).state == cw.CHANGED
+    assert len(watch._validated) <= cw.VALIDATION_CACHE_MAX
 
 
 def _no_bind(host, port):

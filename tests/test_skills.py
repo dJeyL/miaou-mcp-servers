@@ -405,3 +405,41 @@ def test_find_skills_extension_reads_the_sdk_private_attribute(spec_skills_dir):
     found = find_skills_extension(server.mcp)
     assert isinstance(found, Skills)
     assert found is server.skills
+
+
+# --- Liens symboliques : jamais hors du dossier de la skill ----------------------
+
+
+def test_symlink_pointing_outside_the_skill_folder_is_refused(spec_skills_dir, tmp_path):
+    secret = tmp_path / "outside" / "secret.txt"
+    write(secret, "SECRET")
+    link = spec_skills_dir / "pdf-processing" / "templates" / "link.md"
+    try:
+        link.symlink_to(secret)
+    except (OSError, NotImplementedError):
+        pytest.skip("liens symboliques indisponibles")
+    with pytest.raises(SkillError) as info:
+        scan_skills_dir(spec_skills_dir)
+    message = str(info.value)
+    assert "skill « pdf-processing »" in message
+    assert "templates/link.md" in message
+    assert "hors du dossier" in message
+
+
+def test_symlink_staying_inside_the_skill_folder_is_served(spec_skills_dir):
+    link = spec_skills_dir / "pdf-processing" / "templates" / "alias.md"
+    try:
+        link.symlink_to(Path("invoice.md"))
+    except (OSError, NotImplementedError):
+        pytest.skip("liens symboliques indisponibles")
+    [source] = scan_skills_dir(spec_skills_dir)
+    assert "templates/alias.md" in source.files
+
+
+def test_a_vanished_file_is_reported_once_per_cause(spec_skills_dir, capsys):
+    skills = Skills(spec_skills_dir)
+    (spec_skills_dir / "pdf-processing" / "templates" / "invoice.md").unlink()
+    assert skills.list_entries() == []
+    assert skills.list_entries() == []
+    err = capsys.readouterr().err
+    assert err.count("Skill « pdf-processing » omise") == 1

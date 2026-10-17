@@ -12,7 +12,6 @@ import importlib
 import os
 import sys
 from abc import ABC, abstractmethod
-from contextlib import AsyncExitStack
 from typing import Any, Awaitable, Callable
 
 import mcp.types as types
@@ -48,6 +47,11 @@ class Upstream(ABC):
     # "legacy" (`initialize` d'emblée), passée telle quelle en `mode` à
     # `Client`. None pour l'inprocess, qui n'a pas de fil.
     mode: str | None = None
+
+    # Borne d'un appel d'outil, en secondes (clé `call_timeout`), appliquée par
+    # le proxy autour de `call_tool`. None : pas de borne (inprocess, dont
+    # l'outil tourne dans le processus et se borne lui-même).
+    call_timeout: float | None = None
 
     @abstractmethod
     async def start(self) -> None: ...
@@ -367,18 +371,25 @@ class InProcessUpstream(Upstream):
     async def read_skill_file(self, uri: str) -> list[types.ResourceContents]:
         import base64
 
-        # Liste blanche : seuls les fichiers déclarés par une entrée. Le
+        # Liste blanche : seuls les fichiers de l'ensemble figé au démarrage. Le
         # MCPServer peut servir d'autres ressources, que le proxy ne publie pas.
-        listed = {
-            resource["uri"]
-            for entry in await self.list_skills()
-            if isinstance(entry.get("resources"), list)
-            for resource in entry["resources"]
-        }
-        if uri not in listed:
+        # Tirée des sources et non de `list_entries` : une skill dont un fichier
+        # a disparu est omise du listage, et refuser alors tous ses fichiers
+        # comme « non servis » ferait mentir le message.
+        skills = self._skills()
+        if skills is None or uri not in skills.served_uris():
             raise _unserved(uri)
         contents: list[types.ResourceContents] = []
-        for item in await self._server.read_resource(uri):
+        try:
+            items = await self._server.read_resource(uri)
+        except Exception as e:
+            from mcp.shared.exceptions import MCPError
+
+            raise MCPError(
+                types.INTERNAL_ERROR,
+                f"fichier de skill {uri} indisponible : {str(e) or type(e).__name__}",
+            ) from e
+        for item in items:
             if isinstance(item.content, bytes):
                 contents.append(
                     types.BlobResourceContents(
@@ -519,10 +530,19 @@ class _RemoteSkills:
 
 _STDIO_HANDSHAKE_TIMEOUT_S = 15
 
+# Borne par défaut d'un appel d'outil vers un upstream stdio ou http : alignée
+# sur le délai de lecture du client http (300 s), au-delà du plus long des
+# outils du dépôt (`bench__sleep` plafonne à 60 s).
+_CALL_TIMEOUT_S = 300
+
 # Borne d'une requête de skills vers un upstream stdio. Même valeur que celle
 # du handshake, mais pas le même objet : un subprocess déjà démarré qui ne
 # répond pas, et non un subprocess qui ne démarre pas.
 _STDIO_SKILLS_TIMEOUT_S = 15
+
+# Attente de la fermeture d'un subprocess (stdin fermé, puis arbre tué après 2 s
+# de grâce par le SDK) ; passé ce délai on annule le scope de la tâche de service.
+_STDIO_STOP_TIMEOUT_S = 10
 
 
 class StdioUpstream(_RemoteSkills, Upstream):
@@ -535,18 +555,34 @@ class StdioUpstream(_RemoteSkills, Upstream):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         protocol_era: str = "auto",
+        call_timeout: float = _CALL_TIMEOUT_S,
     ) -> None:
+        self.call_timeout = call_timeout
         self._command = command
         self._args = args
         self._env = env
         self._cwd = cwd
         self.mode = protocol_era
-        self._exit_stack = AsyncExitStack()
         self._session: Any = None
+        self._task: Any = None
+        self._scope: Any = None
+        self._cancel_requested = False
+        self._stop_event: Any = None
+        self._ready: Any = None
+        self._stopped: Any = None
+        self._failure: BaseException | None = None
 
-    async def start(self) -> None:
-        import asyncio
+    async def _serve(self) -> None:
+        """Tourne pour toute la vie du subprocess, dans une tâche à elle.
 
+        Même patron que `HttpUpstream._serve` : le `Client` et le transport
+        stdio portent des cancel scopes anyio, ouverts ET refermés ici, dans la
+        même tâche — ce qui permet à `start()` d'être appelé d'une tâche
+        quelconque (démarrage concurrent des upstreams) et à `stop()` d'une
+        autre (le `finally` du lifespan). Le `CancelScope` ci-dessous est la
+        seule prise de `start()`/`stop()` sur un handshake bloqué : annuler la
+        tâche entière reviendrait à sortir des contextes sans ordre."""
+        import anyio
         from mcp.client import Client
         from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -556,31 +592,101 @@ class StdioUpstream(_RemoteSkills, Upstream):
             env=self._env,
             cwd=self._cwd,
         )
-        async def _handshake() -> None:
-            # `Client` négocie l'ère : sonde `server/discover`, repli sur
-            # `initialize` pour un serveur qui ne parle pas 2026-07-28 (et sur
-            # délai dépassé, ce qui laisse sa chance à un subprocess lent). Le
-            # transport est construit ici et passé tel quel ; `cache=None` : le
-            # cache de réponses de `Client` ne sert pas les appels faits sur
-            # `client.session`, autant l'écarter sans ambiguïté.
-            client = Client(stdio_client(params), mode=self.mode, cache=None)
-            await self._exit_stack.enter_async_context(client)
-            _adopt_session(self, client.session)
-            await _prime_tool_listing(client.session)
-            self._session = client.session
-
         try:
-            # wait_for (pas asyncio.timeout, réservé à Python 3.11+) — le PEP 723
-            # de ce fichier déclare requires-python >= 3.10.
-            await asyncio.wait_for(_handshake(), timeout=_STDIO_HANDSHAKE_TIMEOUT_S)
-        except asyncio.TimeoutError as e:
+            with anyio.CancelScope() as scope:
+                self._scope = scope
+                if self._cancel_requested:
+                    scope.cancel()
+                # `Client` négocie l'ère : sonde `server/discover`, repli sur
+                # `initialize` pour un serveur qui ne parle pas 2026-07-28 (et
+                # sur délai dépassé, ce qui laisse sa chance à un subprocess
+                # lent). Le transport est construit ici et passé tel quel ;
+                # `cache=None` : le cache de réponses de `Client` ne sert pas
+                # les appels faits sur `client.session`.
+                async with Client(stdio_client(params), mode=self.mode, cache=None) as client:
+                    _adopt_session(self, client.session)
+                    await _prime_tool_listing(client.session)
+                    self._session = client.session
+                    self._ready.set()
+                    # Reste ouvert jusqu'à stop() : c'est ce maintien qui garde
+                    # le subprocess en vie entre deux appels d'outil.
+                    await self._stop_event.wait()
+        except Exception as e:
+            self._failure = _unwrap_exception_group(e)
+        finally:
+            self._session = None
+            # Toujours réveiller start(), y compris en échec ou annulation.
+            self._ready.set()
+            self._stopped.set()
+
+    async def start(self) -> None:
+        import asyncio
+
+        import anyio
+
+        self._stop_event = anyio.Event()
+        self._ready = anyio.Event()
+        self._stopped = anyio.Event()
+        self._failure = None
+        self._scope = None
+        self._cancel_requested = False
+        # Tâche asyncio propre, sans task group hôte : le lifespan démarre les
+        # upstreams depuis des tâches filles qui ne lui survivent pas, et un
+        # task group hôte les rendrait tributaires de celui qui les a lancées.
+        # La référence est gardée (une tâche sans référence peut être ramassée).
+        self._task = asyncio.ensure_future(self._serve())
+        try:
+            with anyio.move_on_after(_STDIO_HANDSHAKE_TIMEOUT_S):
+                await self._ready.wait()
+        except BaseException:
+            # Démarrage annulé (Ctrl-C pendant le boot) : le subprocess ne doit
+            # pas survivre. La fermeture se passe dans la tâche de service ;
+            # ici on ne fait que l'attendre, à l'abri de l'annulation en cours.
+            await self._shutdown(cancel=True)
+            raise
+
+        if self._session is None:
+            failure = self._failure
+            # Délai dépassé (la tâche est restée dans le handshake) ou échec :
+            # dans les deux cas le subprocess éventuel est à fermer, ici.
+            await self._shutdown(cancel=True)
+            if failure is not None:
+                raise failure
             raise RuntimeError(
                 f"Subprocess '{self._command}' n'a pas répondu à la négociation "
                 f"MCP (handshake) sous {_STDIO_HANDSHAKE_TIMEOUT_S}s."
-            ) from e
+            )
+
+    async def _shutdown(self, cancel: bool = False) -> None:
+        """Fait refermer le transport par SA tâche et attend qu'elle ait rendu.
+
+        `cancel` : le handshake n'a pas abouti, la tâche n'attend pas l'ordre
+        d'arrêt — on annule son scope. Attente bornée et protégée : un
+        subprocess qui refuse de mourir ne retient pas l'extinction, et
+        l'annulation en cours ne doit pas couper la fermeture."""
+        import anyio
+
+        task, self._task = self._task, None
+        if task is None:
+            return
+        self._stop_event.set()
+        if cancel:
+            self._cancel_requested = True
+            if self._scope is not None:
+                self._scope.cancel()
+        with anyio.CancelScope(shield=True):
+            with anyio.move_on_after(_STDIO_STOP_TIMEOUT_S):
+                await self._stopped.wait()
+            if not self._stopped.is_set():
+                self._cancel_requested = True
+                if self._scope is not None:
+                    self._scope.cancel()
+                with anyio.move_on_after(_STDIO_STOP_TIMEOUT_S):
+                    await self._stopped.wait()
+        self._session = None
 
     async def stop(self) -> None:
-        await self._exit_stack.aclose()
+        await self._shutdown()
 
     async def list_tools(self) -> list[types.Tool]:
         result = await self._session.list_tools()
@@ -635,8 +741,9 @@ class HttpUpstream(_RemoteSkills, Upstream):
     Le proxy réseau (--proxy/--noproxy) est honoré sans code ici : le client
     httpx2 est construit avec le défaut trust_env=True, donc il lit les
     variables d'environnement du process, que main() a déjà posées avant
-    build_upstreams(). Attention, httpx2 lit AUSSI ALL_PROXY et NO_PROXY, que
-    _PROXY_ENV_KEYS ne gère pas — limite documentée dans docs/proxy.md.
+    build_upstreams(). `_PROXY_ENV_KEYS` couvre aussi ALL_PROXY, que httpx2
+    lit : --proxy la pose et --noproxy la retire, pour l'upstream http comme
+    pour les subprocess stdio.
 
     **Le transport vit dans SA propre tâche, du début à la fin.** Les contextes
     asynchrones du SDK (streamable_http_client, ClientSession) portent des cancel
@@ -658,7 +765,9 @@ class HttpUpstream(_RemoteSkills, Upstream):
         auth: Any = None,
         timeout: float = _HTTP_HANDSHAKE_TIMEOUT_S,
         protocol_era: str = "auto",
+        call_timeout: float = _CALL_TIMEOUT_S,
     ) -> None:
+        self.call_timeout = call_timeout
         self._url = url
         self._headers = headers
         self._auth = auth

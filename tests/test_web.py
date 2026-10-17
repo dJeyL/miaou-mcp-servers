@@ -256,10 +256,11 @@ async def test_fetch_gzip_truncated_midstream_still_yields_text():
 
 
 @pytest.mark.asyncio
-async def test_fetch_gzip_not_truncated_despite_body_larger_than_max_bytes():
-    """La troncature se décide sur les octets REÇUS, jamais après
-    décompression : un corps décompressé plus gros que max_bytes n'a rien
-    perdu, et l'annoncer tronqué serait faux."""
+async def test_fetch_gzip_truncation_counts_decompressed_bytes():
+    """A1 : `max_bytes` borne les octets UTILES reçus, après décompression. Un
+    corps de 5000 octets décompressés au-delà d'un plafond de 1000 est tronqué
+    et annoncé tel quel, comme un corps non compressé — l'ancienne règle (plafond
+    sur les octets compressés) laissait passer une bombe de décompression."""
     payload = b"z" * 5000
     body = gzip.compress(payload)
     assert len(body) < 1000 < len(payload)
@@ -268,7 +269,8 @@ async def test_fetch_gzip_not_truncated_despite_body_larger_than_max_bytes():
         result = await _fetch_url(
             {"url": "http://example.com/nt", "max_bytes": 1000}
         )
-    assert "Tronqué" not in result.resource.text
+    assert "[Tronqué à 1000 octets]" in result.resource.text
+    assert result.resource.text.count("z") == 1000
 
 
 @pytest.mark.asyncio

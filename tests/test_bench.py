@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "servers"))
 from mcp_bench import server as bench_server
 
 
-# Tous les outils ont asyncio.sleep(2) — on le neutralise dans chaque test.
+# Tous les outils sauf `sleep` ont asyncio.sleep(2) — on le neutralise dans chaque test.
 
 
 @pytest.mark.asyncio
@@ -194,3 +194,50 @@ async def test_every_bench_tool_requires_the_bench_skill():
     assert {t.name: t.meta for t in tools} == {
         t.name: {REQUIRES_SKILL_META_KEY: BENCH_SKILL_URI} for t in tools
     }
+
+
+# --- Z9-1 / Z9-2 : aucune exception stdlib ne fuite, par le vrai Client ---------------
+
+async def _call_via_client(name: str, args: dict):
+    from mcp.client import Client
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        async with Client(bench_server.mcp, mode="legacy") as c:
+            return await c.call_tool(name, args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hostname", ["a" * 70 + ".com", "\u00e9" * 100])
+async def test_dns_lookup_degenerate_hostname_gives_reason_not_bare_error(hostname):
+    result = await _call_via_client("dns_lookup", {"hostname": hostname})
+    text = result.content[0].text
+    assert "Échec de résolution" in text
+    assert "Error executing tool" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ip", ["a\x00b", "x" * 300])
+async def test_reverse_dns_degenerate_input_gives_reason_not_bare_error(ip):
+    with patch("socket.gethostbyaddr", side_effect=OSError("mock")):
+        result = await _call_via_client("reverse_dns", {"ip": ip})
+    text = result.content[0].text
+    assert "Échec de résolution inverse" in text
+    assert "Error executing tool" not in text
+
+
+@pytest.mark.asyncio
+async def test_reverse_dns_nul_byte_real_gethostbyaddr_does_not_leak():
+    result = await _call_via_client("reverse_dns", {"ip": "a\x00b"})
+    assert "Échec de résolution inverse" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_dns_lookup_refuses_nul_byte_without_resolving():
+    """Un NUL embarqué serait résolu par certains OS pour le préfixe : le nom cité ne
+    serait pas celui résolu."""
+    with patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("192.0.2.1", 0))]) as gai:
+        result = await _call_via_client("dns_lookup", {"hostname": "a\x00b"})
+    gai.assert_not_called()
+    text = result.content[0].text
+    assert "Échec de résolution" in text
+    assert "192.0.2.1" not in text

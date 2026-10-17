@@ -1,12 +1,11 @@
 """Moteur DuckDuckGo (endpoint HTML scrapé, sans clef) : web seulement.
 
-Reprise de servers/mcp_ddg.py (déprécié), protections comprises : défi
+Reprise de l'ancien serveur mcp_ddg (supprimé), protections comprises : défi
 anti-bot reconnu au lieu d'un `[]` muet, et requêtes sortantes espacées.
 
 L'état (créneau suivant, pause après un défi) est celui de l'ADRESSE IP
 SORTANTE, pas d'une config : un seul moteur `ENGINE` par processus, partagé par
-toutes les instances de mcp_web. Il ne l'est pas avec mcp_ddg, qui garde son
-propre espacement s'il tourne encore à côté.
+toutes les instances de mcp_web.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 
-from .common import ENGINE_TIMEOUT_S, EngineFailure, clean_snippet, http_read
+from .common import ENGINE_TIMEOUT_S, EngineFailure, clean_snippet, http_read, is_result_url
 
 _URL = "https://html.duckduckgo.com/html/"
 _UA = (
@@ -139,7 +138,7 @@ class DDGEngine:
         return [
             {"title": clean_snippet(r["title"]), "url": r["url"], "snippet": clean_snippet(r["snippet"])}
             for r in results
-            if r["url"]
+            if is_result_url(r["url"])
         ][:n]
 
 

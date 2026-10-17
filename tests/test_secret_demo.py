@@ -66,3 +66,21 @@ def test_expected_value_comes_from_the_config_then_the_environment(monkeypatch):
 @pytest.mark.parametrize("raw, expected", [(None, 0.0), ("x", 0.0), (-3, 0.0), (99, 10.0), (float("nan"), 0.0), (0.5, 0.5)])
 def test_delay_is_clamped(raw, expected):
     assert demo._delay({"delay_s": raw} if raw is not None else {}) == expected
+
+
+def test_help_answers_without_any_password(tmp_path):
+    """D2-1 : `--help` se traite avant toute authentification."""
+    import os
+    import subprocess
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MIAOU_SECRET_DEMO")}
+    for password in (None, "mauvais"):
+        e = dict(env)
+        if password:
+            e["MIAOU_SECRET_DEMO_PASSWORD"] = password
+        r = subprocess.run(
+            [sys.executable, str(_SERVERS / "mcp_secret_demo.py"), "--help"],
+            capture_output=True, text=True, env=e, timeout=60, cwd=tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        assert "--transport" in r.stdout

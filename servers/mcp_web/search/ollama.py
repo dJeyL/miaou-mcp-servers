@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import urllib.request
 
-from .common import EngineFailure, clean_snippet, http_read, key_rejected_by_status
+from .common import EngineFailure, clean_snippet, http_read, is_result_url, key_rejected_by_status
 
 API_KEY_ENV = "OLLAMA_API_KEY"
 _URL = "https://ollama.com/api/web_search"
@@ -52,5 +52,5 @@ class OllamaEngine:
                 "snippet": clean_snippet(r.get("content")),
             }
             for r in results
-            if isinstance(r, dict) and r.get("url")
+            if isinstance(r, dict) and is_result_url(r.get("url"))
         ][:n]

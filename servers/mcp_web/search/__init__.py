@@ -11,7 +11,7 @@ Config (bloc `config` de l'entrée `web` de config.json, clé `search`) :
 `order` absent : DEFAULT_ORDER. Un moteur absent de `order` est désactivé ; un
 moteur à clef sans clef (ni dans son bloc, ni dans l'environnement) est écarté
 au démarrage, avec une ligne qui le dit. Si `order` cite des moteurs et
-qu'AUCUN n'est utilisable, la construction échoue, comme mcp_brave sans clef :
+qu'AUCUN n'est utilisable, la construction échoue :
 pas de serveur qui démarre sans la recherche qu'on lui a demandée — et le proxy
 écarte alors l'upstream ENTIER, outils fetch_* compris. `order: []` coupe la
 recherche exprès et ne lève pas. Un nom inconnu ou répété fait aussi échouer la
@@ -152,7 +152,7 @@ def build_chain(config: dict | None) -> SearchChain:
             continue
         engines.append(engine_cls(key))
     if order and not engines:
-        # Comme mcp_brave sans clef : refuser plutôt que démarrer sans la
+        # Refuser plutôt que démarrer sans la
         # recherche demandée. `order: []` reste le moyen de la couper exprès.
         raise SearchConfigError("aucun moteur de recherche utilisable — " + "; ".join(notes))
     return SearchChain(engines, notes)

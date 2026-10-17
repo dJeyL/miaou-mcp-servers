@@ -18,6 +18,7 @@ pour `${VAR}` : elles citent la syntaxe sans l'employer.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from typing import Any
 
@@ -117,10 +118,34 @@ def resolve(value: Any, secret: str) -> Any:
     return value
 
 
-def mask(text: str, secret: str | None) -> str:
-    """`text` sans aucune occurrence de `secret`. À appliquer à TOUT texte tiré
-    d'un échec de construction (message d'exception d'un serveur qui citerait
-    sa config) avant de le journaliser ou de le rendre à un client."""
+def forms(secret: str | None) -> list[str]:
+    """Les formes sous lesquelles `secret` peut se retrouver dans un texte : brute,
+    `repr` (antislash doublé, apostrophe échappée, `\\n`), JSON ASCII (`\\uXXXX`) et
+    JSON brut. Un serveur qui cite sa config dans une exception ou une
+    description l'écrit sous l'une d'elles, et un fichier JSON écrit la valeur
+    échappée. Les plus longues d'abord, sans doublon : à masquer dans cet ordre."""
     if not secret:
-        return text
-    return text.replace(secret, "***")
+        return []
+    found = {
+        secret,
+        repr(secret)[1:-1],
+        json.dumps(secret)[1:-1],
+        json.dumps(secret, ensure_ascii=False)[1:-1],
+    }
+    return sorted((f for f in found if f), key=lambda f: (-len(f), f))
+
+
+def cites(text: str, secret: str | None) -> bool:
+    """Vrai si `text` contient `secret` sous l'une de ses `forms`."""
+    return any(form in text for form in forms(secret))
+
+
+def mask(text: str, secret: str | None) -> str:
+    """`text` sans aucune occurrence de `secret`, brute ou échappée (`forms`). À
+    appliquer à TOUT texte tiré d'un échec de construction (message d'exception
+    d'un serveur qui citerait sa config) avant de le journaliser ou de le rendre
+    à un client. Le texte d'exception reste (indice de diagnostic) : c'est le
+    masquage qui doit tout couvrir."""
+    for form in forms(secret):
+        text = text.replace(form, "***")
+    return text

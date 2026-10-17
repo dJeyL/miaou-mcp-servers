@@ -7,9 +7,11 @@ parcours (`/authorize/{name}`, `/callback`).
 
 from __future__ import annotations
 
+import hmac
 import json
 import sys
 import time
+from html import escape
 from typing import Any, Awaitable, Callable
 
 from starlette.routing import Route
@@ -118,9 +120,9 @@ class PendingAuthorization:
     ancien paramètre `timeout` n'a jamais rien borné, et la 2.x l'a retiré) :
     la borne est ici, explicitement.
 
-    Le `state` n'est pas vérifié ici : le SDK le compare lui-même en
-    `secrets.compare_digest`. En rajouter une deuxième vérification donnerait
-    deux prédicats qui peuvent diverger.
+    Le `state` n'est pas vérifié ICI : le SDK le compare lui-même en
+    `secrets.compare_digest`. La route /callback, elle, n'aiguille un callback
+    que sur l'égalité exacte avec `self.state` (cf. build_callback_route).
     """
 
     def __init__(self, upstream_name: str, timeout: float) -> None:
@@ -300,6 +302,11 @@ class UpstreamAuthorizer:
         # seule fois par épisode : la trace sert à comprendre pourquoi le jeton
         # ne bouge pas, pas à la répéter jusqu'à noyer le reste.
         self._renewal_noop_reported = False
+        # Repli après un renouvellement en panne réseau : la période de
+        # la boucle peut tomber à 1 s sur un `lifetime` très court, et un AS
+        # injoignable serait martelé et le journal rempli à chaque tour.
+        self._retry_not_before = 0.0
+        self._renewal_failures = 0
         # Dernier échec de parcours, pour que `status` dise POURQUOI. Sans lui,
         # un scope insuffisant se présente comme une autorisation manquante, et
         # l'exploitant reclique indéfiniment sur un lien qui ne peut pas
@@ -397,10 +404,11 @@ class UpstreamAuthorizer:
         flow d'authentification AVANT de nous rendre la main, et c'est ce
         passage, pas le résultat, qui nous intéresse.
 
-        Le nom d'outil est sans importance : le refus d'autorisation précède la
-        résolution du nom. En inventer un est même préférable — appeler un outil
-        réel pour obtenir un jeton exécuterait une action non demandée, et rien
-        ne garantit qu'elle soit sans effet de bord.
+        Le nom d'outil IMPORTE : on lit `tools/list` et on appelle un outil réel
+        choisi en lecture seule (`_pick_probe_tool`), jamais un outil d'écriture.
+        Un nom inventé n'est qu'un repli (`_AUTH_PROBE_TOOL`) : une passerelle qui
+        route par ressource (WSO2, mesuré) le rejette en 403 avant toute question
+        d'autorisation — cf. `probe.py`.
         """
         headers = {
             "Accept": "application/json, text/event-stream",
@@ -578,16 +586,10 @@ class UpstreamAuthorizer:
                 auth=self.provider(), timeout=self.wait_timeout, follow_redirects=False
             ) as client:
                 await self._provoke_refusal(client)
-        except AuthorizationRequired:
-            # Ne peut pas arriver ici (`interactive` est vrai), mais si le
-            # parcours est inhibé pour une raison qu'on n'a pas prévue, ne
-            # surtout pas le présenter comme un succès.
-            raise
-        except Exception:
-            # L'autorisation reste due : un parcours qui échoue ne doit pas
-            # faire croire aux surfaces que le problème est réglé.
-            raise
         finally:
+            # Aucun `except` : toute exception (AuthorizationRequired comprise)
+            # remonte, et l'autorisation reste due — un parcours qui échoue ne
+            # doit pas faire croire aux surfaces que le problème est réglé.
             self.interactive = False
             self.pending = None
 
@@ -642,6 +644,9 @@ class UpstreamAuthorizer:
         # dira si un renouvellement a réellement eu lieu (cf. plus bas).
         deadline_before = time.time() + token.expires_in
 
+        if time.monotonic() < self._retry_not_before:
+            return False
+
         import httpx2
 
         # Une requête quelconque suffit : c'est son PASSAGE par le provider qui
@@ -687,9 +692,19 @@ class UpstreamAuthorizer:
             # courant reste valable jusqu'à son terme, et le prochain réveil
             # réessaiera. Ne PAS marquer l'autorisation comme due ici, ce
             # serait envoyer cliquer pour une panne réseau passagère.
-            _log(f"Renouvellement du jeton de '{self.name}' échoué ({e}) — "
-                 f"nouvelle tentative au prochain réveil.")
+            # Repli exponentiel plafonné à 5 min, et un seul message par épisode.
+            if self._renewal_failures == 0:
+                _log(f"Renouvellement du jeton de '{self.name}' échoué ({e}) — "
+                     f"nouvelles tentatives espacées.")
+            self._renewal_failures += 1
+            self._retry_not_before = time.monotonic() + min(
+                300.0, 2.0 ** self._renewal_failures
+            )
             return False
+
+        # L'AS a répondu : l'épisode de panne est clos.
+        self._renewal_failures = 0
+        self._retry_not_before = 0.0
 
         # Le témoin est le STOCKAGE, pas l'absence d'exception : la requête
         # peut très bien avoir abouti sans qu'aucun refresh n'ait eu lieu.
@@ -702,12 +717,6 @@ class UpstreamAuthorizer:
         # et la boucle recommençait à chaque réveil sur un jeton qu'elle venait
         # de renouveler, ce qui est exactement le rejeu qu'on veut éviter
         # devant un AS à rotation.
-        # Et l'échéance doit avoir avancé DANS LE FUTUR. « Avoir avancé » seul
-        # ne suffit pas : partant d'un jeton déjà expiré, `deadline_before` est
-        # dans le passé, et un `expires_in` de 0 le dépasse — on journalisait
-        # alors « renouvelé (valide 0s) » et on levait `authorization_pending`
-        # sur un jeton mort. Le proxy annonçait l'upstream comme autorisé, et
-        # le premier appel d'outil échouait. Mesuré le 2026-09-08.
         # LE CONTEXTE DU PROVIDER D'ABORD, et pas seulement le fichier. Quand
         # un refresh échoue, le SDK ne lève RIEN : il appelle `clear_tokens()`
         # — qui vide le contexte sans toucher au fichier —, repose
@@ -882,14 +891,23 @@ code {{ background: #f0f0f0; padding: .1rem .3rem; border-radius: .2rem; }}
 <body><h1 class="{cls}">{title}</h1><p>{message}</p></body></html>"""
 
 
+# Page sans script ni ressource : un échappement oublié ne devient pas exécutable.
+_PAGE_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+}
+
+
 def render_callback_page(upstream_name: str | None, error: str | None) -> str:
     """Page rendue au navigateur au retour de l'AS.
 
     Rendue AUSSI en cas d'erreur : un onglet blanc après un refus laisserait
     croire à une panne du proxy, alors que le refus vient de l'utilisateur.
     """
-    who = f" pour <code>{upstream_name}</code>" if upstream_name else ""
+    # `error` vient de la query string de /callback et `upstream_name` du
+    # dictionnaire de config : route PUBLIQUE, même origine que MIAOU. Échappés.
+    who = f" pour <code>{escape(upstream_name)}</code>" if upstream_name else ""
     if error:
+        error = escape(error)
         return _CALLBACK_PAGE.format(
             cls="ko",
             title="Autorisation refusée",
@@ -921,34 +939,38 @@ def build_callback_route(authorizers: dict[str, UpstreamAuthorizer]) -> Any:
         error = params.get("error")
         iss = params.get("iss")
 
-        # Le state ne sert PAS à valider ici (le SDK le compare lui-même en
-        # compare_digest) : il sert à savoir QUEL upstream attend, quand
-        # plusieurs partagent la route. Comparaison sur le paramètre `state`
-        # extrait de l'URL d'autorisation, jamais par sous-chaîne — un state
-        # est du texte arbitraire, il peut apparaître ailleurs dans l'URL.
-        waiting = [a for a in authorizers.values() if a.pending is not None]
+        # Le SDK compare lui aussi le state (compare_digest), mais le proxy ne
+        # remet un callback qu'à l'upstream dont le `state` EXACT est celui de
+        # son URL d'autorisation. Aucun repli sur « le seul en attente » : un
+        # appel sans state, ou au mauvais, tuerait le parcours (`resolve` garde
+        # le premier résultat) — déni de service par n'importe quelle page que
+        # le navigateur ouvre. Comparaison sur le paramètre `state` extrait de
+        # l'URL d'autorisation, jamais par sous-chaîne.
         target = None
         if state:
-            for auth in waiting:
-                if auth.pending.state == state:
+            for auth in authorizers.values():
+                if (
+                    auth.pending is not None
+                    and auth.pending.state
+                    and hmac.compare_digest(
+                        auth.pending.state.encode(), state.encode()
+                    )
+                ):
                     target = auth
                     break
-        # Un seul upstream en attente : pas d'ambiguïté à lever, on lui remet le
-        # callback même sans state (un AS qui ne le renvoie pas fera échouer la
-        # comparaison du SDK, ce qui est le bon endroit pour ce refus).
-        if target is None and len(waiting) == 1:
-            target = waiting[0]
 
         if target is None:
             return HTMLResponse(
                 render_callback_page(None, "aucune autorisation en attente"),
                 status_code=400,
+                headers=_PAGE_HEADERS,
             )
 
         target.pending.resolve(code, state, error, iss)
         return HTMLResponse(
             render_callback_page(target.name, error),
             status_code=400 if error else 200,
+            headers=_PAGE_HEADERS,
         )
 
     return Route("/callback", handle_callback, methods=["GET"])
@@ -974,10 +996,34 @@ def build_authorize_route(
     retour sur /callback.
     """
     import anyio
-    from html import escape
     from starlette.responses import HTMLResponse
 
     async def handle_authorize(request: Any) -> Any:
+        # GET à effet de bord sur une route publique : une page tierce ne doit
+        # pas pouvoir lancer le parcours (<img>, fetch, navigation automatique).
+        # Accepté : en-tête absent (client non navigateur, origine non sûre),
+        # same-origin, none (barre d'adresse), et toute navigation voulue par
+        # l'utilisateur (navigate + ?1) — c'est ce que font le <a target=_blank>
+        # et le window.open d'un clic de MIAOU, y compris depuis file:// ou un
+        # autre hôte derrière un reverse proxy.
+        site = request.headers.get("sec-fetch-site")
+        if site is not None and site not in ("same-origin", "none"):
+            user_navigation = (
+                request.headers.get("sec-fetch-mode") == "navigate"
+                and request.headers.get("sec-fetch-user") == "?1"
+            )
+            if not user_navigation:
+                return HTMLResponse(
+                    _CALLBACK_PAGE.format(
+                        cls="ko",
+                        title="Demande refusée",
+                        message="Cette demande ne vient pas d'un geste de ta part. "
+                        "Ouvre le lien depuis MIAOU ou la barre d'adresse.",
+                    ),
+                    status_code=403,
+                    headers=_PAGE_HEADERS,
+                )
+
         name = request.path_params["name"]
         authorizer = authorizers.get(name)
         if authorizer is None or name not in upstreams:

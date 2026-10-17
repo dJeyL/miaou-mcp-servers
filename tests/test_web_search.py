@@ -16,8 +16,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "servers"))
 
 from mcp import types
-import mcp_brave
-import mcp_ddg
 import mcp_web
 from mcp_web import search as web_search
 from mcp_web.search import common as search_common
@@ -493,14 +491,3 @@ def test_search_description_names_the_order_and_ddg_spacing(monkeypatch):
     assert "brave → ollama → ddg" in desc
     assert "[1, 10]" in desc and "15 s" in desc
     assert "15 s" not in {t.name: t for t in _server(order=["brave"]).mcp._tool_manager.list_tools()}["search"].description
-
-
-# --- Serveurs dépréciés ----------------------------------------------------------
-
-
-def test_deprecated_servers_announce_it(capsys, monkeypatch):
-    monkeypatch.setenv("BRAVE_API_KEY", "k")
-    mcp_brave.build(None)
-    assert mcp_ddg.build(None) is mcp_ddg.mcp
-    err = capsys.readouterr().err
-    assert "mcp_brave est déprécié" in err and "mcp_ddg est déprécié" in err

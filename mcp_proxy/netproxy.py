@@ -12,8 +12,13 @@ import os
 
 # Les 4 variantes de casse lues par urllib (make_opener) comme par la plupart
 # des clients HTTP — on les pose/efface toutes pour ne pas laisser une variante
-# existante contredire l'override CLI.
-_PROXY_ENV_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+# existante contredire l'override CLI. `all_proxy`/`ALL_PROXY` : lues par httpx2
+# (upstreams http, `trust_env`) et par bien des outils en sous-processus, pas par
+# urllib (mesuré : son `ProxyHandler` en tire un `all_open` que rien n'appelle).
+# Sans elles, `--noproxy` laissait un proxy monté pour un upstream http.
+_PROXY_ENV_KEYS = (
+    "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
+)
 
 
 def resolve_proxy_url(raw: str) -> str:

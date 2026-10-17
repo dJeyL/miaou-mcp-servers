@@ -63,6 +63,10 @@ from .updater import resolve_self_update
 LIFECYCLE_KEY = "lifecycle"
 from .webapp import resolve_miaou_dist
 
+#: Validations gardées par empreinte (une par état de fichier lu) : borne, sans
+#: quoi un éditeur qui enregistre souvent ferait croître la table sans fin.
+VALIDATION_CACHE_MAX = 32
+
 UNCHANGED = "unchanged"
 CHANGED = "changed"
 INVALID = "invalid"
@@ -137,16 +141,32 @@ def resolve_lifecycle(cfg: dict[str, Any]) -> bool:
     return value
 
 
+def _resolve_port(cli: int | None, configured: Any) -> int:
+    """Le port d'écoute : `--port` s'il est donné (0 compris, donc refusé), sinon
+    la clé `port`, entier de 1 à 65535. Un `8765.9` ou un booléen n'est pas un
+    port : `int()` les aurait arrondis en silence."""
+    value = configured if cli is None else cli
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError:
+            pass
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"'port' doit être un entier, reçu {value!r}.")
+    if not 1 <= value <= 65535:
+        raise ValueError(f"'port' doit être compris entre 1 et 65535, reçu {value}.")
+    return value
+
+
 def prepare_config(loaded: LoadedConfig, options: LaunchOptions) -> Prepared:
     """La suite de `main()` après la lecture des couches : chaque erreur de
     config y est une ValueError (`AuthConfigError` comprise), dont le message
     est celui que `main()` affiche avant de sortir en 1."""
     cfg = loaded.cfg
     host = options.host or cfg.get("host", "127.0.0.1")
-    try:
-        port = options.port or int(cfg["port"])
-    except (TypeError, ValueError):
-        raise ValueError(f"'port' doit être un entier, reçu {cfg['port']!r}.") from None
+    if not isinstance(host, str):
+        raise ValueError(f"'host' doit être une chaîne, reçu {type(host).__name__}.")
+    port = _resolve_port(options.port, cfg["port"])
     miaou_dist = resolve_miaou_dist(cfg, loaded.miaou_dist_base)
     self_update = resolve_self_update(cfg)
     lifecycle = resolve_lifecycle(cfg)
@@ -301,6 +321,11 @@ class ConfigWatch:
                 prepared = prepare_config(loaded, self.options)
         except ValueError as e:
             return _Validation(str(e), None)
+        except Exception as e:  # noqa: BLE001
+            # Dernier filet : `status` et `restart` ne lèvent jamais. Une forme
+            # que `prepare_config` n'a pas prévue est une config à ne pas
+            # relancer, avec le type de l'exception pour qu'on la corrige.
+            return _Validation(f"validation impossible ({type(e).__name__} : {e}).", None)
         return _Validation(None, (prepared.host, prepared.port))
 
     async def check(self, fresh_bind: bool = False) -> ConfigCheck:
@@ -316,6 +341,12 @@ class ConfigWatch:
         validation = self._validated.get(current)
         if validation is None:
             validation = await asyncio.to_thread(self._validate, loaded)
+            while len(self._validated) >= VALIDATION_CACHE_MAX:
+                # Les plus anciennes d'abord (ordre d'insertion) : une édition
+                # en cours en produit une par enregistrement.
+                oldest = next(iter(self._validated))
+                del self._validated[oldest]
+                self._bind.pop(oldest, None)
             self._validated[current] = validation
         detail = validation.detail
         if detail is None and validation.endpoint != self.endpoint:

@@ -1047,3 +1047,18 @@ def test_miaou_only_over_http_serves_the_new_build_without_exiting(repos, tmp_pa
     assert (before, after) == ("1", "2")
     assert result["restart"] is False
     assert status["served_build"] == "2" and status["state"] == su.UP_TO_DATE
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{}, {"target": None}, {"target": 12345}, {"target": ["a" * 40]}, {"target": True}],
+)
+async def test_apply_refuses_an_absent_or_non_textual_target_with_its_code(repos, tmp_path, params):
+    """Un refus sans `data.code` ne serait pas lisible par le client, qui teste
+    le code par égalité : `target` absent ou non textuel sort en
+    UPDATE_INVALID_TARGET comme une chaîne qui n'est pas un sha."""
+    _, server = _updater(repos, tmp_path)
+    with pytest.raises(MCPError) as info:
+        await _rpc(server, up.APPLY_METHOD, params)
+    assert info.value.error.data["code"] == up.INVALID_TARGET
+    assert info.value.error.code == types.INVALID_PARAMS

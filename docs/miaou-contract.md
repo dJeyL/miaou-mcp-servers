@@ -10,11 +10,11 @@ réponses JSON ou SSE `event:message`/`data:`). C'est le transport implémenté 
 
 Pour connecter les serveurs depuis MIAOU → Paramètres → Serveurs MCP :
 
-| Champ | bench | weather | web | ddg (déprécié) | brave (déprécié) | docs | proxy |
-|---|---|---|---|---|---|---|---|
-| Nom | `bench` | `weather` | `web` | `duckduckgo` | `brave` | `docs` | `proxy` |
-| URL | `:8766/mcp` | `:8767/mcp` | `:8768/mcp` | `:8769/mcp` | `:8770/mcp` | `:8771/mcp` | `:8765/mcp` |
-| Transport | `streamable-http` | idem | idem | idem | idem | idem | idem |
+| Champ | bench | weather | web | docs | proxy |
+|---|---|---|---|---|---|
+| Nom | `bench` | `weather` | `web` | `docs` | `proxy` |
+| URL | `:8766/mcp` | `:8767/mcp` | `:8768/mcp` | `:8771/mcp` | `:8765/mcp` |
+| Transport | `streamable-http` | idem | idem | idem | idem |
 
 (préfixe `http://127.0.0.1` pour toutes les URLs)
 
@@ -34,8 +34,10 @@ sert MIAOU à `http://<hôte>:<port>/app/` et redirige `/` vers `/app/` (détail
 - Le manifeste s'appelle **`manifest.webmanifest`**, à la racine du dossier : c'est le
   seul nom figé côté proxy (avertissement au démarrage s'il manque). Les icônes, elles,
   sont lues dans son `icons[].src` — les nommer et les ranger est l'affaire de MIAOU.
-- Tout part en `Cache-Control: no-cache` avec `ETag`/`Last-Modified` : chaque
-  chargement revalide, un `git pull` est vu au rechargement suivant.
+- Tout FICHIER part en `Cache-Control: no-cache` avec `ETag`/`Last-Modified` (200, 206,
+  304) : chaque chargement revalide, un `git pull` est vu au rechargement suivant. Les
+  404/405/416 et les redirections n'en portent pas (aucun validateur, rien à mettre en
+  cache).
 - Types fixés par le proxy pour `.html`, `.js`, `.json`, `.webmanifest`, `.png`,
   `.svg`, `.ico` ; une autre extension dépend du `mimetypes` de la machine.
 - Aucun fichier caché n'est servi, et un `dist/` qui contient `config.json` ou `.git`
@@ -67,6 +69,10 @@ que MIAOU affiche la source d'une citation (libellé, favicon) sans rien payer e
 Détail des champs et de leur validation : `docs/servers.md`, section `mcp_web`. `favicon`
 est une data-URL dont le type a été reconnu aux octets (PNG, ICO, GIF, JPEG, WebP ; jamais
 SVG), plafonnée à 16 384 caractères : le client la revalide quand même avant de la poser.
+`canonical_url` est l'URL finale après redirections (jamais le `<link rel=canonical>` de la
+page), **omise** si elle dépasse 2048 unités UTF-16 ou contient un blanc, un caractère
+<= 0x20 ou `]` — la grammaire que `webMetaFromResult` et `WEB_REF_MARKER_RE` imposent côté
+client : le client l'écarterait en silence et citerait l'URL demandée.
 
 Second usage : `search` et `image_search` de `mcp_web` posent
 `_meta["miaou/search"] = {"engine": "<nom>"}` (`brave`, `ollama`, `ddg`), le moteur
@@ -128,11 +134,16 @@ obligatoire pour tous ses outils. Ce que le proxy publie (détail de mise en œu
 1. **Capacités, ère 2026-07-28.** `extensions["io.modelcontextprotocol/skills"] = {}`
    (pas de `directoryRead`) et `resources`, dans `server/discover`, dès qu'au moins un
    upstream inprocess sert une skill, ou qu'un upstream stdio/http négocié en moderne
-   DÉCLARE l'extension — même avec un catalogue vide. Rien sinon. En legacy, `initialize` ne publie jamais
+   DÉCLARE l'extension — même avec un catalogue vide —, ou qu'un upstream en attente de
+   son secret volatil a des skills en cache (point 3). Rien sinon : un proxy dont le seul
+   upstream à skills attend son secret, à cache vide, répond `-32601` à `skills/list`
+   jusqu'à la première saisie acceptée (mesuré). En legacy, `initialize` ne publie jamais
    `extensions` ; il annonce en revanche `resources` quand une skill est servie.
 2. **URI préfixées du nom d'upstream** : `skill://bench/SKILL.md` de l'upstream `bench`
    devient `skill://bench/bench/SKILL.md`. Octets inchangés, empreintes valides ; le
-   dernier segment reste le `name`.
+   dernier segment reste le `name`. MIAOU rattache une skill à son upstream par ce
+   premier segment (skill approuvée absente parce que l'upstream attend son secret) :
+   la convention est une dépendance du client, à ne pas changer sans le prévenir.
 3. **`skills/list`, `skills/get`** : entrées de tous les upstreams vivants, URI
    réécrites dans `uri` ET chaque `resources[].uri`, `resultType: "complete"`, sans
    pagination. `ttlMs: 300000` et `cacheScope: "public"` au plus large ; plus court et
@@ -140,13 +151,26 @@ obligatoire pour tous ses outils. Ce que le proxy publie (détail de mise en œu
    → `-32602`. Une entrée d'upstream tiers est relayée telle quelle (seules celles dont
    les URI ne sont pas `skill://` sont écartées) : elle peut être invalide, à vérifier
    comme toute entrée (nom, dernier segment, `description`, empreintes), et `resources`
-   peut valoir `"dynamic"`. Un upstream en panne est omis, les autres répondent.
+   peut valoir `"dynamic"`. Un upstream en panne est omis, les autres répondent. Un
+   upstream en attente de son secret volatil est listé à sa place dans l'ordre de la
+   config, avec les entrées de sa dernière liste vivante (cache disque), **sans notice**
+   et à l'octet près — manifeste, empreintes et tailles compris, pour que l'approbation
+   de MIAOU (`mcpSkillManifestMatches`) tienne à la saisie ; une skill `"dynamic"` est
+   resservie telle quelle. Ses lectures (`skills/get`, `resources/read`) rendent
+   `SECRET_REQUIRED` (point 4), message qui nomme la skill et non les outils. Cache vide (premier démarrage) : aucune entrée pour lui.
+   Un upstream OAuth non autorisé, lui, n'a aucune entrée : seuls ses outils sont
+   resservis.
 4. **`resources/read`** d'une URI `skill://<upstream>/…` : contenu de l'upstream relayé
    tel quel (texte si UTF-8 valide, blob sinon), sous l'URI du client ; fichier non
    servi → `-32602`. Pour un upstream inprocess, « servi » veut dire déclaré par une
    entrée ; pour un upstream stdio/http, c'est lui qui juge — une skill servie mais non
-   listée se lit donc par son URI. Panne de l'upstream : `-32603` lisible, jamais une
-   erreur de code 0. Sur le fil moderne, l'en-tête `Mcp-Name` doit
+   listée se lit donc par son URI. Panne de l'upstream : `-32603` lisible, qui nomme le
+   serveur (« Le serveur '<up>' est injoignable : sa session s'est fermée… » pour un
+   upstream http tombé), jamais une erreur de code 0 ; un transport mort garde son
+   `-32000` « Connection closed », encadré du nom du serveur ; un upstream en attente de
+   son secret volatil ou d'une autorisation OAuth rend le même contrat qu'un appel
+   d'outil (`SECRET_REQUIRED`, `AUTHORIZATION_REQUIRED`). Sur le fil moderne, l'en-tête
+   `Mcp-Name` doit
    valoir `params.uri` (400 sinon) — `MCP_NAME_BEARING_METHODS` de MIAOU le porte déjà.
 5. **`tools/list`** : un outil dont l'upstream déclare `_meta["miaou/requiresSkill"]` le
    garde, URI réécrite. La valeur est l'URI du `SKILL.md`, relative au serveur qui liste
@@ -157,7 +181,8 @@ obligatoire pour tous ses outils. Ce que le proxy publie (détail de mise en œu
    Forme exacte : `docs/proxy.md`. Le texte libre d'un upstream dont les skills sont
    relayées voit ses URI `skill://` préfixées comme les entrées ; celui d'un upstream
    legacy est publié tel quel. Le bloc est statique : un upstream mort en cours de vie y
-   reste annoncé.
+   reste annoncé. Celui d'un upstream en attente de son secret est généré depuis ses
+   skills et ses outils en cache : identique au bloc vivant.
 7. **Outil de repli `read_skill(uri)`**, nom nu, publié seulement si une skill est
    servie, marqué `_meta["miaou/skillsFallback"] = true` : un client qui lit les skills
    lui-même le masque par cette marque, pas par son nom. Texte rendu étiqueté du serveur
@@ -232,7 +257,7 @@ message lisible, et selon le cas `data.before`, `data.target`, `data.remedy`.
 | `data.code` | `error.code` | Cas |
 |---|---|---|
 | `UPDATE_NOT_SUPERVISED` | `-32600` | variable du superviseur absente |
-| `UPDATE_INVALID_TARGET` | `-32602` | `target` n'est pas un sha complet |
+| `UPDATE_INVALID_TARGET` | `-32602` | `target` absent, non textuel, ou pas un sha complet |
 | `UPDATE_IN_PROGRESS` | `-32600` | une autre application tourne |
 | `UPDATE_RESTARTING` | `-32600` | une sortie est déjà demandée (`miaou/lifecycle/restart`, ou mise à jour qui redémarre) : le proxy s'arrête |
 | `UPDATE_TOOLS_IN_FLIGHT` | `-32600` | appels d'outils en cours, tous clients confondus (jamais pour `kind: miaou`) |
@@ -374,7 +399,9 @@ verrouillage de compte : une valeur **refusée** n'est jamais retestée tant que
 tourne (verdict `rejected`, `detail` le dit) ; une valeur **identique** à celle qu'un
 consommateur a acceptée ne le reconstruit pas (aucun appel sortant) — c'est ce qui rend
 sans danger le renvoi simultané par plusieurs onglets (les dépôts d'une même clef sont
-sérialisés). Un consommateur `ready` qui refuse la nouvelle valeur garde son instance.
+sérialisés, et un `submit` annulé en cours de validation n'en autorise pas un second
+concurrent : la validation finit côté proxy, un renvoi de la même valeur attend son
+résultat). Un consommateur `ready` qui refuse la nouvelle valeur garde son instance.
 Un appel d'outil en vol finit sur l'instance qui l'a reçu. Après chaque changement
 d'instance, le proxy republie ses `instructions` et ses skills (visibles à la
 prochaine connexion) : MIAOU doit reconnecter le serveur après une acceptation, faute
@@ -382,7 +409,7 @@ de `notifications/tools/list_changed`.
 
 **`miaou/secrets/forget`** `{ key }` → `{ secret: entrée }`. Jette les instances
 construites (le serveur garde ses identifiants dans son objet) et remet les
-consommateurs en attente. Les valeurs refusées restent mémorisées comme telles.
+consommateurs en attente. Les valeurs refusées restent mémorisées comme telles (les 64 plus récentes par clef).
 
 Refus d'une requête (erreur JSON-RPC, `error.data.code` à tester par égalité, message
 qui ne cite jamais la valeur) :
@@ -399,8 +426,9 @@ l'origine), message adressé au modèle (seul l'utilisateur peut agir, depuis MI
 même appel fonctionnera après la saisie). Un appel arrivé pendant la validation est
 refusé : vrai à l'instant de l'appel. Les outils d'un upstream en attente sont listés
 **sans notice**, à l'octet près comme une fois construit (cache disque), ses
-`instructions` aussi ; au tout premier démarrage d'une installation (cache vide), ils
-n'apparaissent qu'après la première saisie acceptée. Aucun `_meta` de `tools/list` ne
+`instructions` aussi, et ses skills avec le bloc qui les annonce (§ skills, points 3
+et 6) ; au tout premier démarrage d'une installation (cache vide), ils n'apparaissent
+qu'après la première saisie acceptée. Aucun `_meta` de `tools/list` ne
 signale l'attente : l'état se lit par l'extension.
 
 **La valeur** n'est jamais écrite sur disque, journalisée, ni rendue par une méthode,

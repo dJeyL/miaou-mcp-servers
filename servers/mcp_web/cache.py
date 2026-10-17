@@ -6,17 +6,23 @@ demandée à `fetch_url`. Une page déjà téléchargée reste paginable via
 `fetch_read` sans retélécharger, jusqu'à expiration du TTL (sweep opportuniste,
 même pattern que mcp_docs.session).
 
-Trois fichiers possibles par URL, mêmes clé et TTL :
+Quatre fichiers possibles, mêmes clé et TTL :
   - <hash>.txt  : texte rendu (html2text ou text/*), relu par fetch_read
   - <hash>.html : HTML brut, source pour fetch_list (structure headings/liens)
   - <hash>.json : structure déjà extraite par fetch_list, relue par fetch_list
-    lui-même pour paginer sans reparser"""
+    lui-même pour paginer sans reparser
+  - <hash>.alias : posé sous la clé de l'URL FINALE d'une redirection, contient
+    l'URL demandée dont les trois autres portent le contenu. `canonical_url`, ce
+    que MIAOU cite, est cette URL finale : sans alias, `fetch_read(<finale>)`
+    ratait un cache pourtant rempli par `fetch_url(<départ>)`. Une entrée propre
+    (.txt/.html) de l'URL finale l'emporte sur son alias."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -58,6 +64,42 @@ def structure_path(url: str) -> Path:
     return WORKDIR / f"{url_key(url)}.json"
 
 
+def alias_path(url: str) -> Path:
+    return WORKDIR / f"{url_key(url)}.alias"
+
+
+# Les seuls noms que ce module écrit : le sweep ne touche rien d'autre
+# (MIAOU_WEB_WORKDIR est libre et peut pointer un dossier qui n'est pas à nous).
+_CACHE_FILE_RE = re.compile(r"[0-9a-f]{64}\.(?:txt|html|json|alias)")
+
+
+def store_alias(final_url: str, requested_url: str) -> None:
+    """Fait retrouver le cache de `requested_url` sous `final_url`."""
+    if final_url == requested_url:
+        return
+    sweep_expired()
+    WORKDIR.mkdir(parents=True, exist_ok=True)
+    alias_path(final_url).write_text(requested_url, encoding="utf-8")
+
+
+def resolve(url: str) -> str:
+    """L'URL sous laquelle le cache de `url` est rangé : elle-même si elle a une
+    entrée propre, sinon la cible de son alias, sinon elle-même (le miss
+    s'annonce alors avec l'URL que l'appelant a donnée). Rafraîchit l'alias lu."""
+    if entry_path(url).exists() or html_path(url).exists():
+        return url
+    alias = alias_path(url)
+    try:
+        target = alias.read_text(encoding="utf-8")
+    except OSError:
+        return url
+    if entry_path(target).exists() or html_path(target).exists():
+        now = time.time()
+        os.utime(alias, (now, now))
+        return target
+    return url
+
+
 def _touch_all(url: str) -> None:
     """Rafraîchit le mtime des trois fichiers existants de la clé (W6) : un
     fetch_read répété touchait seulement .txt, laissant .html/.json expirer
@@ -77,7 +119,7 @@ def sweep_expired() -> None:
         return
     cutoff = time.time() - TTL_HOURS * 3600
     for entry in WORKDIR.iterdir():
-        if not entry.is_file():
+        if not _CACHE_FILE_RE.fullmatch(entry.name) or not entry.is_file():
             continue
         try:
             if entry.stat().st_mtime < cutoff:
@@ -109,12 +151,13 @@ def purge(url: str) -> None:
     renvoie du contenu binaire, pour ne pas laisser .txt/.html périmés servir
     fetch_read/fetch_list sur une URL désormais binaire."""
     sweep_expired()
-    for path in (entry_path(url), html_path(url), structure_path(url)):
+    for path in (entry_path(url), html_path(url), structure_path(url), alias_path(url)):
         path.unlink(missing_ok=True)
 
 
 def load(url: str) -> str:
     sweep_expired()
+    url = resolve(url)
     path = entry_path(url)
     if not path.exists():
         raise CacheMiss(
@@ -137,6 +180,7 @@ def store_html(url: str, html_text: str) -> Path:
 
 def load_html(url: str) -> str:
     sweep_expired()
+    url = resolve(url)
     path = html_path(url)
     if not path.exists():
         raise CacheMiss(
@@ -156,6 +200,7 @@ def store_structure(url: str, entries: list[dict]) -> Path:
 
 def load_structure(url: str) -> list[dict] | None:
     sweep_expired()
+    url = resolve(url)
     path = structure_path(url)
     if not path.exists():
         return None

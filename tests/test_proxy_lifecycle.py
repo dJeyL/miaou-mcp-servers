@@ -488,3 +488,22 @@ def test_supervised_proxy_comes_back_as_another_instance(tmp_path):
     output = (tmp_path / "proxy.log").read_text()
     assert "sortie en 43 : redémarrage demandé par un client" in output
     assert "supervise: redémarrage demandé" in output
+
+
+async def test_an_update_starting_during_the_trial_bind_blocks_the_restart(harness, supervised):
+    """`restart` ne juge pas l'état de la mise à jour avant son `await` seulement :
+    un `apply` qui prend son verrou pendant le `bind` d'essai ferait couper un
+    `git merge` par la sortie en 43."""
+    state = {"applying": False}
+    harness = Harness(harness.dir, applying=lambda: state["applying"])
+    real_check = harness.lifecycle.watch.check
+
+    async def slow_check(*args, **kwargs):
+        result = await real_check(*args, **kwargs)
+        state["applying"] = True  # l'apply a pris son verrou pendant l'attente
+        return result
+
+    harness.lifecycle.watch.check = slow_check
+    error = await _refusal(harness.server)
+    assert error.error.data["code"] == lc.UPDATE_IN_PROGRESS
+    assert harness.exits == []

@@ -58,6 +58,10 @@ def _write_secret_file(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
+_MAX_EXPIRES_IN_S = 10 * 365 * 86400
+"""Plafond d'un `expires_in` annoncé par l'AS : dix ans."""
+
+
 class UpstreamTokenStorage:
     """Implémente le protocol mcp.client.auth.TokenStorage pour UN upstream.
 
@@ -134,7 +138,13 @@ class UpstreamTokenStorage:
         # 401, et repartirait dans un parcours interactif au lieu de rafraîchir.
         expires_at = entry.get("expires_at")
         if expires_at is not None:
-            remaining = int(expires_at - time.time())
+            # Fichier édité à la main : NaN/Infinity (que le JSON de Python
+            # accepte) ou un non-nombre ne doivent pas faire planter la lecture.
+            # Une échéance illisible vaut « expiré » : on rafraîchit.
+            try:
+                remaining = int(expires_at - time.time())
+            except (TypeError, ValueError, OverflowError):
+                remaining = 0
             token.expires_in = max(remaining, 0)
         return token
 
@@ -171,6 +181,9 @@ class UpstreamTokenStorage:
         payload = tokens.model_dump(exclude_none=True, mode="json")
         fields: dict[str, Any] = {"tokens": payload}
         if tokens.expires_in is not None:
+            # Borné : un AS qui annonce `expires_in: 10**400` ferait lever
+            # OverflowError au calcul, dans le flow du SDK, jeton non écrit.
+            tokens.expires_in = min(tokens.expires_in, _MAX_EXPIRES_IN_S)
             fields["expires_at"] = time.time() + tokens.expires_in
             # DURÉE DE VIE À L'ÉMISSION, mémorisée parce que c'est le seul
             # endroit où on la voit : relu plus tard, `expires_in` est ce qu'il

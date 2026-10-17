@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -511,12 +511,6 @@ dependencies = [
     { name = "uvicorn" },
 ]
 
-[package.optional-dependencies]
-test = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -531,8 +525,6 @@ requires-dist = [
     { name = "openpyxl" },
     { name = "pyjwt", extras = ["crypto"] },
     { name = "pymupdf" },
-    { name = "pytest", marker = "extra == 'test'" },
-    { name = "pytest-asyncio", marker = "extra == 'test'" },
     { name = "python-docx" },
     { name = "python-pptx" },
     { name = "pyyaml" },
@@ -540,7 +532,6 @@ requires-dist = [
     { name = "truststore" },
     { name = "uvicorn" },
 ]
-provides-extras = ["test"]
 
 [package.metadata.requires-dev]
 dev = [

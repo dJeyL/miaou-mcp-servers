@@ -157,6 +157,13 @@ class Lifecycle:
             if self.applying is not None and self.applying():
                 raise _refusal(UPDATE_IN_PROGRESS, "Une mise à jour du proxy est en cours d'application.")
             check = await self.watch.check(fresh_bind=True)
+            # Revérifié APRÈS l'attente : un `apply` a pu prendre son verrou
+            # pendant le `bind` d'essai, et la sortie en 43 couperait alors son
+            # `git merge`. Aucun `await` entre ce contrôle et `request_exit`.
+            if self.exit_pending():
+                return self._accepted()
+            if self.applying is not None and self.applying():
+                raise _refusal(UPDATE_IN_PROGRESS, "Une mise à jour du proxy est en cours d'application.")
             if check.state == INVALID:
                 raise _refusal(
                     CONFIG_INVALID,

@@ -472,3 +472,75 @@ def test_wire_revalidation_sees_a_git_pull(live_proxy):
     assert status == 200
     assert body.decode().endswith("<!-- v2 -->")
     assert headers["etag"] != etag
+
+
+# --- Noms que le système de fichiers traduit (Windows : 8.3, flux NTFS) -----------------
+
+
+async def test_a_short_name_resolving_to_a_hidden_file_is_a_404(tmp_path, monkeypatch):
+    """Pas de Windows en CI : la résolution est SIMULÉE. Sous Windows,
+    `realpath("<racine>/RELECT~1.TXT")` rend le nom long du fichier caché."""
+    from mcp_proxy import webapp
+
+    dist = _dist(tmp_path)
+    (dist / ".relecture.txt").write_text("secret")
+    real = os.path.realpath
+
+    def windows_like(path, *args, **kwargs):
+        if os.path.basename(str(path)) == "RELECT~1.TXT":
+            return real(dist / ".relecture.txt")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(webapp.os.path, "realpath", windows_like)
+    async with _client(_app(dist)) as c:
+        assert (await c.get("/app/RELECT~1.TXT")).status_code == 404
+        assert (await c.get("/app/miaou.html")).status_code == 200
+
+
+async def test_the_resolved_name_is_judged_by_its_own_components(tmp_path, monkeypatch):
+    from mcp_proxy import webapp
+
+    dist = _dist(tmp_path)
+    (dist / ".hidden").mkdir()
+    (dist / ".hidden" / "a.txt").write_text("secret")
+    real = os.path.realpath
+
+    def windows_like(path, *args, **kwargs):
+        if os.path.basename(str(path)) == "HIDDEN~1":
+            return real(dist / ".hidden" / "a.txt")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(webapp.os.path, "realpath", windows_like)
+    async with _client(_app(dist)) as c:
+        assert (await c.get("/app/HIDDEN~1")).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["miaou.html::$DATA", "miaou.html:stream", "sub/x:y", "C:/x", "%3A", "miaou.html%3A%3A%24DATA"],
+)
+async def test_a_colon_in_the_requested_path_is_a_404(tmp_path, path):
+    dist = _dist(tmp_path)
+    async with _client(_app(dist)) as c:
+        assert (await c.get(f"/app/{path}")).status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("path", "hidden"),
+    [
+        ("miaou.html::$DATA", True),
+        ("miaou.html:stream", True),
+        ("sub/x:y", True),
+        ("C:/x", True),
+        (".gitkeep", True),
+        ("sub/.DS_Store", True),
+        ("miaou.html", False),
+        ("sub/file.js", False),
+    ],
+)
+def test_hidden_judgement_does_not_depend_on_the_platform(tmp_path, path, hidden):
+    """Sous POSIX un `:` ne désigne rien et le fichier n'existe pas : le 404 de
+    bout en bout ne prouverait rien. Le jugement lui-même, si."""
+    from mcp_proxy.webapp import MiaouStaticFiles
+
+    assert MiaouStaticFiles(_dist(tmp_path))._is_hidden(path) is hidden

@@ -92,6 +92,8 @@ def read_layer(path: Path) -> dict[str, Any]:
         data = json.loads(path.read_text())
     except json.JSONDecodeError as e:
         raise ValueError(f"La config '{path}' n'est pas un JSON valide : {e}") from e
+    except RecursionError:
+        raise ValueError(f"La config '{path}' est imbriquée trop profondément.") from None
     if not isinstance(data, dict):
         raise ValueError(
             f"La config '{path}' doit être un objet JSON, reçu {type(data).__name__}."
@@ -158,7 +160,10 @@ def load_layers(paths: list[Path], local: Path | None = None, env: Any = None) -
 # `$$` → `$` littéral ; `${VAR}`, `${VAR:-défaut}` (défaut si absente OU vide),
 # `${VAR-défaut}` (défaut si absente seulement) — la syntaxe de docker compose,
 # pour qu'un même `.env` serve au compose et à la config. Un `$` seul, ou suivi
-# d'autre chose que `{`, reste tel quel.
+# d'autre chose que `{`, reste tel quel. Le reste de la syntaxe de compose n'est
+# PAS géré : pas d'imbrication (`${A:-${B}}` : le défaut s'arrête au premier `}`),
+# pas de substitution dans un défaut, ni `${A:?erreur}` / `${A:+autre}` — une
+# expression non reconnue reste telle quelle, sans signalement.
 _VAR_RE = re.compile(
     r"\$\$|\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:(?P<op>:?-)(?P<default>[^}]*))?\}"
 )
@@ -166,10 +171,13 @@ _VAR_RE = re.compile(
 
 def _block_disabled(block: dict[str, Any]) -> bool:
     # Même règle que `contract.is_disabled`, sans son avertissement de
-    # migration : il sortira de toute façon quand le bloc sera lu.
+    # migration (il sortira quand le bloc sera lu) ni son refus d'une valeur
+    # non booléenne : à ce stade `"${DIS:-false}"` est encore une chaîne vraie,
+    # et seul `true` compte ; le refus viendra de `is_disabled`, après
+    # substitution.
     if "disabled" in block:
-        return bool(block["disabled"])
-    return bool(block.get("_disabled"))
+        return block["disabled"] is True
+    return block.get("_disabled") is True
 
 
 def interpolate_env(
@@ -183,16 +191,17 @@ def interpolate_env(
 
     Après la fusion et non par couche : une valeur littérale de `config.json`
     qui remplace un `${ORG_API_SECRET}` de `config.site.json` ne doit rien exiger
-    de l'environnement. Les clés à souligné en tête (`_comment`, `_example_*`)
+    de l'environnement. Les clés `_comment*` (même périmètre que `strip_comments`)
     sont laissées intactes : ignorées par le proxy, elles citent la syntaxe sans
-    l'employer. Un bloc `disabled` est interpolé (`--auth` réveille un bloc
+    l'employer. Les autres clés à souligné, `_JAVA_OPTIONS` d'un `env` par
+    exemple, sont substituées comme le reste. Un bloc `disabled` est interpolé (`--auth` réveille un bloc
     `auth` neutralisé) mais ses variables manquantes ne sont pas signalées.
     """
     if isinstance(value, dict):
         quiet = quiet or _block_disabled(value)
         out: dict[str, Any] = {}
         for k, v in value.items():
-            if k.startswith("_"):
+            if _is_comment_key(k):
                 out[k] = v
             else:
                 sub = f"{path}.{k}" if path else k
@@ -229,40 +238,91 @@ def interpolate_env(
 # Liste noire de NOMS de clés : un nom imprévu passe en clair, d'où les
 # familles larges (`pass` seul attrape `LOGS_PASS`, `auth` un en-tête
 # `X-Auth`). `pass` n'est pas suivi d'une lettre : `passthrough` n'est pas un
-# secret.
+# secret. `key` et `sig` ne comptent que comme mot entier final (`access_key`,
+# `X-Key`, pas `monkey` ni `keys`).
 _SECRET_KEY_RE = re.compile(
-    r"secret|pass(?![a-z])|password|passwd|pwd|api[-_]?key|token|auth",
+    r"secret|pass(?![a-z])|password|passwd|passphrase|pwd|api[-_]?key|private[-_]?key"
+    r"|token|auth|credential|cookie|bearer|session|jwt|signature"
+    r"|(?:^|[-_])(?:key|sig)$",
     re.IGNORECASE,
 )
 # Ces suffixes désignent une URL ou un choix de méthode, publics : sans eux,
 # `token_endpoint` ou `token_endpoint_auth_method` sortiraient masqués — et ce
 # sont justement eux qu'on vient lire dans un diagnostic OAuth.
-_PUBLIC_KEY_RE = re.compile(r"(_endpoint|_url|_uri|_method|_scopes?)$", re.IGNORECASE)
+_PUBLIC_KEY_RE = re.compile(
+    r"(_endpoint|_url|_uri|_method|_scopes?|_timeout)$", re.IGNORECASE
+)
+# `auth` ne désigne un secret que s'il est SCALAIRE (en-tête `X-Auth`) : en dict
+# ou en liste, c'est un BLOC de config (`auth` d'un serveur ou du proxy,
+# `_auth_example`, `authorization_servers`) dont les enfants sont jugés un à un,
+# pour que les URL d'un diagnostic OAuth restent lisibles. Les autres familles
+# masquent le sous-arbre entier.
+_AUTH_ONLY_RE = re.compile(r"auth", re.IGNORECASE)
 # Identifiants embarqués dans une URL (`https://user:mdp@hôte`) : seul le mot
 # de passe est masqué, l'utilisateur aide au diagnostic.
 _URL_PASSWORD_RE = re.compile(r"^([a-z][a-z0-9+.-]*://[^/@:]*):[^/@]*@", re.IGNORECASE)
+_URL_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+# Paramètre de query (`?token=abc&x=1`) : nom et valeur, jusqu'au `&` ou `#`.
+_QUERY_PARAM_RE = re.compile(r"([?&])([^=&#\s]+)=([^&#\s]+)")
 
 
 def _is_secret_key(key: str) -> bool:
     return bool(_SECRET_KEY_RE.search(key)) and not _PUBLIC_KEY_RE.search(key)
 
 
+def _is_secret_subtree(key: str) -> bool:
+    """Un dict ou une liste sous `key` se masque-t-il tout entier ?"""
+    if not _is_secret_key(key):
+        return False
+    return bool(_SECRET_KEY_RE.search(_AUTH_ONLY_RE.sub("", key)))
+
+
+def _mask_query_param(m: re.Match[str]) -> str:
+    sep, name, value = m.groups()
+    return f"{sep}{name}={'***' if _is_secret_key(name) else value}"
+
+
+def _mask_url(value: str) -> str:
+    if not _URL_RE.match(value):
+        return value
+    return _QUERY_PARAM_RE.sub(_mask_query_param, _URL_PASSWORD_RE.sub(r"\1:***@", value))
+
+
+def _is_volatile_marker(value: Any) -> bool:
+    # `{"volatile": clef}` nomme un secret à saisir dans MIAOU, n'en est pas un.
+    return isinstance(value, dict) and set(value) == {"volatile"}
+
+
 def mask_secrets(value: Any, mask_all: bool = False) -> Any:
     """Copie à afficher : les valeurs non vides des clés à l'air de secret
-    deviennent `***`, comme TOUTES celles d'un `env` (variables d'un upstream
-    stdio, aux noms imprévisibles), et le mot de passe d'une URL aussi. Pour
+    deviennent `***` — et tout un sous-arbre (dict, liste) sous une telle clé,
+    chiffres compris —, comme TOUTES celles d'un `env` (variables d'un upstream
+    stdio, aux noms imprévisibles). Le mot de passe d'une URL et ses paramètres
+    de query à nom de secret (`?api_key=***`) aussi. Les `args` d'un upstream
+    stdio ne sont JAMAIS masqués : un secret va dans `env`. Pour
     `--print-config`, qu'on colle dans un ticket. Liste noire : elle réduit
     l'exposition, elle ne la garantit pas."""
     if isinstance(value, dict):
-        return {
-            k: ("***" if isinstance(v, str) and v and (mask_all or _is_secret_key(k))
-                else mask_secrets(v, mask_all or k == "env"))
-            for k, v in value.items()
-        }
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if mask_all:
+                out[k] = mask_secrets(v, True)
+            elif k == "mcpServers" and isinstance(v, dict):
+                # Les noms de serveurs sont libres (`auth0`, `token_vault`) :
+                # ce sont leurs entrées qui sont jugées, pas leur nom.
+                out[k] = {n: mask_secrets(e) for n, e in v.items()}
+            elif (_is_secret_subtree(k) if isinstance(v, (dict, list)) else _is_secret_key(k)) \
+                    and not _is_volatile_marker(v):
+                out[k] = mask_secrets(v, True)
+            else:
+                out[k] = mask_secrets(v, k == "env")
+        return out
     if isinstance(value, list):
         return [mask_secrets(v, mask_all) for v in value]
     if isinstance(value, str):
-        return _URL_PASSWORD_RE.sub(r"\1:***@", value)
+        return "***" if mask_all and value else _mask_url(value)
+    if mask_all and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "***"
     return value
 
 
@@ -359,7 +419,17 @@ def _slim_local(paths: list[Path], local: Path) -> tuple[dict[str, Any], Slimmed
             f"'{local}' est la seule couche de la chaîne : rien à retrancher."
         )
     content = read_layer(local)
-    return content, slim(base, content)
+    result = slim(base, content)
+    # Le contrat de `slim`, vérifié et non plus seulement espéré : refuser est
+    # gratuit, écrire une config qui diffère de l'originale ne l'est pas.
+    if strip_comments(merge_patch(base, result.content)) != strip_comments(
+        merge_patch(base, content)
+    ):
+        raise ValueError(
+            f"l'allègement de '{local}' changerait la config effective : refusé, "
+            f"rien n'est écrit (bug de --migrate-config, à signaler)."
+        )
+    return content, result
 
 
 def migrate_local(paths: list[Path], local: Path) -> Slimmed:
@@ -377,13 +447,26 @@ def migrate_local(paths: list[Path], local: Path) -> Slimmed:
 
     # copy2 garde le mode : un config.json en 0600 (il porte des secrets) ne
     # doit pas devenir lisible de tous par sa sauvegarde ni par sa réécriture.
-    shutil.copy2(local, backup)
-    mode = local.stat().st_mode & 0o777
     tmp = local.with_name(local.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "w") as f:
-        f.write(json.dumps(result.content, indent=2, ensure_ascii=False) + "\n")
-    os.replace(tmp, local)
+    try:
+        shutil.copy2(local, backup)
+        mode = local.stat().st_mode & 0o777
+        # Un `.tmp` périmé (lien symbolique compris) est retiré, puis recréé en
+        # O_EXCL : l'écriture ne suit jamais un lien et ne reprend pas le mode
+        # d'un fichier qui n'est pas le nôtre.
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(result.content, indent=2, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, local)
+    except BaseException:
+        # `local` est resté tel quel : ni `.tmp` ni sauvegarde ne doivent
+        # bloquer la reprise (une `.bak` existante fait refuser la migration).
+        tmp.unlink(missing_ok=True)
+        backup.unlink(missing_ok=True)
+        raise
     return result
 
 
