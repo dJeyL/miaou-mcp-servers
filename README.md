@@ -308,6 +308,34 @@ Image Docker : copier le `dist/` de MIAOU dans le dossier `miaou_dist/` du dép�
 (versionné vide) avant `docker compose build`, et poser `"miaou_dist": "miaou_dist"` dans
 `config.json`. Sans copie, l'image se construit quand même. Détail : `docs/proxy.md`.
 
+### Relayer une API de LLM (clé `llm`)
+
+MIAOU appelle son LLM depuis le navigateur, ce qui le limite aux API qui acceptent
+toute origine et tout `User-Agent`. Le proxy peut servir de relais vers des API
+OpenAI-compatibles : chaque backend de `llm.backends` se sert sous
+`http://127.0.0.1:8765/llm/<slug>`, l'URL de base à donner à MIAOU.
+
+```json
+{ "llm": { "backends": {
+    "openrouter": { "disabled": false },
+    "interne": {
+      "base_url": "https://llm.example.org/v1",
+      "request_headers": { "Authorization": "Bearer ${INTERNE_API_KEY}", "User-Agent": "miaou-proxy" }
+    }
+} } }
+```
+
+Seuls les en-têtes que la config cite passent, dans les deux sens : `true` recopie
+la valeur reçue (la clef saisie dans MIAOU, pour `Authorization`), une chaîne pose
+une valeur fixe, `false` retire. Les listes de base (`Content-Type`, `Accept`, en-têtes
+de quota en réponse) sont dans `config.defaults.json`, et un exemple `openrouter` y
+est prêt, désactivé. `"disabled": true` neutralise un backend sans le retirer.
+
+Le relais ne répond qu'à MIAOU **servi par ce proxy** sous `/app/` (clé
+`miaou_dist`), par `127.0.0.1` ou `localhost` : avec une clef d'API dans la config,
+n'importe quelle page ouverte dans le navigateur pourrait sinon la dépenser. MIAOU
+ouvert en `file://` est refusé. Détail : `docs/proxy.md`.
+
 ### Mise à jour depuis MIAOU (clé `self_update`)
 
 Un proxy lancé depuis un clone git peut se mettre à jour à la demande de MIAOU : il
@@ -553,6 +581,8 @@ miaou-mcp-servers/
 │   ├── auth_out/         # client OAuth d'upstreams tiers (sortante), package
 │   ├── app.py            # application Starlette
 │   ├── webapp.py         # MIAOU servi sous /app/ (clé miaou_dist)
+│   ├── llm_relay.py      # relais vers des API de LLM sous /llm/<slug> (clé llm)
+│   ├── origin_guard.py   # garde « MIAOU servi ici, sur loopback » (relais LLM, secrets volatils)
 │   ├── selfupdate.py     # mise à jour par lui-même : état git du clone, fast-forward
 │   ├── updater.py        # extension miaou/self-update (état, application)
 │   ├── lifecycle.py      # extension miaou/lifecycle (config modifiée, redémarrage à la demande)
@@ -604,6 +634,7 @@ miaou-mcp-servers/
 │   ├── test_proxy_auth.py           # auth OAuth entrante
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante
 │   ├── test_proxy_webapp.py         # MIAOU servi sous /app/ (dont un vrai uvicorn)
+│   ├── test_proxy_llm.py            # relais LLM (dont deux vrais uvicorn : flux SSE, départ du client)
 │   ├── test_proxy_selfupdate.py     # mise à jour par lui-même (dépôts git jetables)
 │   ├── test_proxy_volatile.py       # secrets volatils (marqueurs, attente, extension)
 │   ├── test_proxy_configwatch.py    # config modifiée depuis le démarrage, validation partagée
@@ -630,6 +661,9 @@ du projet, lancement, conventions, et un index des domaines détaillés de `docs
 
 CORS ouvert, usage local uniquement. En production, placer derrière un reverse proxy
 (Caddy, nginx) avec authentification côté serveur.
+
+Le relais LLM et les secrets volatils sont les deux surfaces gardées par l'origine :
+elles ne répondent qu'à MIAOU servi par le proxy lui-même, sur loopback.
 
 Le proxy sait exiger une **autorisation OAuth 2.1** de ses clients (clé `auth` de
 `config.json`, désactivée par défaut) : sans jeton valide, il répond 401 en indiquant

@@ -33,6 +33,7 @@ from .layers import (
     needs_slimming,
     resolve_chain,
 )
+from .llm_relay import PREFIX as LLM_PREFIX, LlmRelay
 from .logging import _log, _warn
 from .netproxy import apply_proxy_env_overrides_to_process
 from .server import InFlight, ToolCatalogCache, build_proxy_server
@@ -569,9 +570,11 @@ def main() -> None:
             exit_code=RESTART_EXIT_CODE,
             applying=updater.applying if updater is not None else None,
         )
+    llm_relay = LlmRelay(prepared.llm.backends, port) if prepared.llm.backends else None
     app = build_app(
         mcp_server, upstreams, auth=auth, authorizers=authorizers, miaou_dist=miaou_dist,
         updater=updater, catalog=catalog, secrets=secrets, lifecycle=lifecycle,
+        llm_relay=llm_relay,
     )
 
     if auth is not None:
@@ -596,6 +599,18 @@ def main() -> None:
         for warning in miaou_dist_warnings(miaou_dist):
             _log(f"  attention : {warning}")
         print(f"MIAOU      → http://{host}:{port}{APP_PREFIX}/")
+    if llm_relay is not None:
+        _log(f"Relais LLM ({len(llm_relay.backends)}) :")
+        for slug, backend in llm_relay.backends.items():
+            _log(f"  {slug:<12} {LLM_PREFIX}/{slug} → {backend.base_url}")
+        if miaou_dist is None:
+            _log(
+                "  attention : le relais ne répond qu'à MIAOU servi par ce proxy sous "
+                f"{APP_PREFIX}/, et 'miaou_dist' n'est pas renseignée : aucune page ne "
+                "peut donc l'employer."
+            )
+    for slug in prepared.llm.disabled:
+        _log(f"Relais LLM : backend '{slug}' désactivé.")
     print(f"miaou-proxy → http://{host}:{port}/mcp  (Ctrl-C pour arrêter)")
 
     if args.with_dev_auth is None:

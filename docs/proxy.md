@@ -124,8 +124,13 @@ mcp_proxy/ (paquet, à la racine du projet)
 │   │              (bloc des skills compris)
 │   ├── auth (facultative) : routes RFC 9728 + RequireAuthMiddleware sur /mcp
 │   └── MIAOU (facultatif) : routes de webapp.py, posées après /mcp
+│   └── relais LLM (facultatif) : /llm/… aiguillé AVANT l'app par le wrapper
 ├── webapp.py      clé `miaou_dist` : resolve_miaou_dist(), miaou_dist_warnings(),
 │                  MiaouStaticFiles et build_miaou_routes() (/app/ et /)
+├── llm_relay.py   clé `llm` : resolve_llm_config(), LlmRelay (app ASGI de /llm/<slug>/…,
+│                  aiguillée par le wrapper final de build_app, hors auth et CORS)
+├── origin_guard.py loopback_same_origin() : garde Host loopback + même origine,
+│                  partagée par le relais LLM et les secrets volatils
 ├── selfupdate.py  état git du clone et fast-forward (lot AT), synchrone : probe(),
 │                  apply_update(), run_git() borné et jamais interactif
 ├── updater.py     extension miaou/self-update : SelfUpdater, sonde de 5 min,
@@ -1233,3 +1238,112 @@ avertit alors au démarrage si la clé est posée, et ne sert rien si elle ne l'
 local ; derrière un reverse proxy, c'est à lui de compresser (Caddy : directive
 `encode`).
 
+
+## Relais LLM (clé `llm`, `llm_relay.py`)
+
+MIAOU appelle son LLM depuis le navigateur : seule une API qui accepte toute origine
+(CORS) et tout `User-Agent` lui est accessible. Le relais lève cette contrainte pour
+des API OpenAI-compatibles : `/llm/<slug>/<reste>` part vers `<base_url>/<reste>`,
+méthode, query (encodage d'origine) et corps intacts, et la réponse revient morceau
+par morceau.
+
+```json
+"llm": {
+  "request_headers":  { "Content-Type": true, "Accept": true },
+  "response_headers": { "Content-Type": true, "Retry-After": true, … },
+  "backends": {
+    "openrouter": {
+      "disabled": false,
+      "base_url": "https://openrouter.ai/api/v1",
+      "request_headers": { "Authorization": true, "X-OpenRouter-Title": "MIAOU" },
+      "timeout": 600
+    }
+  }
+}
+```
+
+**En-têtes : liste blanche, dans les deux sens.** `true` recopie la valeur reçue (du
+client pour la requête, de l'amont pour la réponse, chaque occurrence d'un nom
+répété), une chaîne pose une valeur fixe (`${VAR}` compris), `false` retire. Un
+en-tête non cité TOMBE : c'est l'objet du relais, que `Origin`, `Referer`,
+`User-Agent` et `Sec-Fetch-*` du navigateur ne partent pas. Les listes globales
+(`config.defaults.json`) s'appliquent sous celles du backend, qui l'emportent clef par
+clef. Cette fusion est faite par le code, pas par le Merge Patch, d'où `false` :
+`null` n'agit que d'une couche à l'autre sur le même chemin, il ne retire pas une
+clef globale au niveau d'un backend. Forme en dictionnaire et non en tableau pour la
+même raison : un tableau se remplace en entier dans le Merge Patch, et ajouter un nom
+dans `config.json` obligerait à recopier toute la liste. Noms insensibles à la casse,
+et deux casses d'un même nom dans un dictionnaire font refuser le démarrage
+(`User-Agent` dans une couche, `user-agent` dans la suivante : le Merge Patch garde
+les deux, et l'une gagnerait en silence).
+
+**Ce qui ne se configure pas** (refusé au démarrage) : `Host`, `Content-Length`,
+`Accept-Encoding`, `Proxy-Authorization` et les hop-by-hop en requête ;
+`Content-Length`, `Content-Encoding`, `Proxy-Authenticate`, `Access-Control-*` et les
+hop-by-hop en réponse. httpx2 les calcule ou les décode : il n'annonce que les
+compressions qu'il sait défaire, et `aiter_bytes` rend le corps décompressé. Recopier
+l'`Accept-Encoding` du navigateur (`br`) ferait passer un corps compressé sous un
+`Content-Encoding` retiré. Le client httpx2 garde son `Accept: */*` et son
+`Accept-Encoding`, mais **son `User-Agent` est retiré** : sans déclaration, aucun
+n'est envoyé.
+
+**Garde** (`origin_guard.loopback_same_origin`, partagée avec les secrets volatils) :
+`Host` `127.0.0.1`/`localhost` au port du proxy (défense contre le DNS rebinding), ET
+`Origin` de même origine, ou bien, à défaut d'`Origin`, `Sec-Fetch-Site: same-origin`.
+Le navigateur n'envoie pas `Origin` sur un `GET` de même origine (`/models`), d'où ce
+second chemin (`fetch_metadata=True`), que les secrets volatils, en POST seulement,
+n'ouvrent pas. Refus en 403 (`LLM_ORIGIN_REFUSED`). Avec une clef d'API fixe dans la
+config, toute page ouverte dans le navigateur pourrait sinon la dépenser, puisque le
+CORS du proxy est ouvert. Conséquences : MIAOU ouvert en `file://` (`Origin: null`,
+que n'importe quel site obtient par une iframe sandboxée) est refusé, de même que
+curl ou un proxy servi derrière un reverse proxy sous un autre nom d'hôte. Sans
+`miaou_dist`, le démarrage le signale : aucune page ne peut alors employer le relais.
+
+**Hors de l'app Starlette.** Le wrapper ASGI final de `build_app`
+(`strip_trailing_slash_redirect`) aiguille `/llm` et `/llm/…` vers le `LlmRelay`
+AVANT l'app. Ni l'auth entrante (son `BearerAuthBackend` prendrait la clef d'API du
+client pour un jeton à vérifier, et journaliserait un refus à chaque appel), ni le
+CORS du proxy ne s'y appliquent : une réponse du relais ne porte aucun
+`Access-Control-*`, ce dont une page de même origine n'a pas besoin. Sans backend
+actif, aucun `LlmRelay` n'est construit et `/llm/…` est un 404 de Starlette.
+
+**Chemin.** `split_path` lit `raw_path`, et la suite part avec son encodage
+d'origine (`a%2Fb` reste tel quel). Slug inconnu ou désactivé : 404
+`LLM_UNKNOWN_BACKEND`, qui liste les slugs servis. Suite vide, ou segment `.`/`..`
+(encodé compris) : 400 `LLM_INVALID_PATH`, pour que le relais ne sorte pas du chemin
+de `base_url` sur l'hôte amont. `base_url` est une URL http(s) sans identifiants
+(ils vont dans un en-tête), sans query ni fragment, et sans slash final.
+
+**Streaming et départ du client.** Le corps de la requête est lu en entier, puis
+envoyé avec une `Content-Length` plutôt qu'en chunked, et sans plafond de taille. La
+réponse est relayée en ASGI brut, et non par `StreamingResponse`. Avec un serveur
+ASGI 2.4, celle-ci ne guette plus `http.disconnect` et compte sur un `OSError` à
+l'envoi, et elle prend ses en-têtes en dictionnaire. Une tâche lit le flux amont
+pendant qu'une autre attend `http.disconnect`. Le client parti, la seconde annule la première et la
+réponse amont est fermée, sinon la génération continuerait, facturée, jusqu'à son
+terme. Délais : 30 s de connexion, `timeout` (défaut 600 s) en LECTURE entre deux
+morceaux, parce qu'un modèle de raisonnement peut se taire plusieurs minutes avant
+son premier token.
+
+**Erreurs.** Au format OpenAI (`{"error": {"message", "type", "code"}}`) : amont
+injoignable en 502 (`LLM_UPSTREAM_UNREACHABLE`), délai dépassé avant la réponse en 504
+(`LLM_UPSTREAM_TIMEOUT`). Un statut d'erreur de l'amont (401, 429…) passe tel quel,
+corps compris. Une panne APRÈS le début de la réponse ne peut plus changer le statut :
+une ligne au journal, puis l'exception remonte et uvicorn coupe la connexion. Une
+réponse tronquée ne doit pas passer pour complète, ce que ferait une fin de flux
+propre.
+
+**Réseau.** Client httpx2 partagé, créé au premier appel et refermé à la fin du
+lifespan. `trust_env` est au défaut : `--proxy`/`--noproxy` s'appliquent au relais
+comme aux upstreams http, et le magasin de certificats système aussi (cf.
+`docs/tls.md`). Aucune redirection suivie.
+
+**Config.** `resolve_llm_config` est appelée par `prepare_config`. Une erreur fait
+donc sortir `main()` en 1 et rend `invalid` à `miaou/lifecycle/status` ; un
+changement sous `llm` y apparaît comme la clef racine `llm`. `disabled` est un
+booléen strict, et un backend désactivé n'est pas validé. Clefs inconnues refusées,
+`_comment*` exceptées. `--print-config` juge les entrées de `backends` comme celles
+de `mcpServers` (un slug `token_vault` ne masque pas son sous-arbre) : `Authorization`
+et `X-Api-Key` sortent masqués s'ils portent une chaîne, un `true` reste lisible. La
+couche de base porte les listes blanches et un exemple `openrouter` désactivé
+(`Authorization: true`, plus les en-têtes d'identification d'OpenRouter).

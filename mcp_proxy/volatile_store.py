@@ -42,6 +42,7 @@ from mcp.server import Server
 from mcp.shared.exceptions import MCPError
 
 from .logging import _log, _warn
+from .origin_guard import ALLOWED_HOSTS, loopback_same_origin  # noqa: F401 - ALLOWED_HOSTS ré-exporté
 from .volatile import cites, mask
 
 EXTENSION_ID = "miaou/volatile-secrets"
@@ -66,7 +67,6 @@ INDETERMINATE = "indeterminate"
 INCOMPLETE = "incomplete"
 UNTESTED = "untested"
 
-ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_VALUE_LENGTH = 4096
 # Empreintes de valeurs refusées gardées par clef (les plus récentes) : la
 # garde « jamais retestée » ne doit pas faire croître le processus sans borne.
@@ -212,13 +212,7 @@ class VolatileSecrets:
         """Refuse tout ce qui n'est pas MIAOU servi par ce proxy, sur loopback.
         Sans requête HTTP (transport en mémoire), sans port connu : refus."""
         request = getattr(ctx, "request", None)
-        headers = getattr(request, "headers", None)
-        host = origin = ""
-        if headers is not None:
-            host = (headers.get("host") or "").strip().lower()
-            origin = (headers.get("origin") or "").strip().lower()
-        allowed = {f"{h}:{self.port}" for h in ALLOWED_HOSTS} if self.port else set()
-        if host in allowed and origin == f"http://{host}":
+        if loopback_same_origin(getattr(request, "headers", None), self.port):
             return
         where = f"http://127.0.0.1:{self.port}/app/" if self.port else "/app/ de ce proxy"
         raise _refusal(

@@ -44,6 +44,38 @@ sert MIAOU à `http://<hôte>:<port>/app/` et redirige `/` vers `/app/` (détail
   est refusé au démarrage.
 - `/app/` reste public quand l'auth entrante du proxy est active.
 
+## Relais LLM (`/llm/<slug>`, clé `llm`)
+
+Quand la config du proxy déclare des backends sous `llm.backends`, chacun se sert à
+`http://<hôte>:<port>/llm/<slug>`, à donner à MIAOU comme **URL de base** de l'API, à
+la place de la `base_url` du backend (`…/v1` compris). MIAOU y ajoute
+`/chat/completions`, `/models`… comme d'habitude. Détail : `docs/proxy.md`, « Relais
+LLM ». Ce que ça engage côté MIAOU :
+
+- **Seulement depuis MIAOU servi par ce proxy sous `/app/`**, sur `127.0.0.1` ou
+  `localhost` au port du proxy : `Origin` de même origine, ou `Sec-Fetch-Site:
+  same-origin` sur un `GET` sans `Origin`. MIAOU ouvert en `file://`, ou une autre
+  origine, reçoit un 403 `LLM_ORIGIN_REFUSED`. Les appels sont de même origine : aucun
+  CORS en jeu, aucune réponse du relais ne porte d'`Access-Control-*`.
+- **La clef** : selon la config du backend, `Authorization` est soit recopié depuis
+  la requête de MIAOU (`true`, MIAOU garde sa clef), soit posé par le proxy (valeur
+  fixe : la clef saisie dans MIAOU est alors ignorée). MIAOU n'a pas à savoir
+  lequel ; une clef vide côté MIAOU suffit dans le second cas, s'il l'accepte.
+- **En-têtes** : seuls ceux que la config cite passent, dans les deux sens (par
+  défaut `Content-Type` et `Accept` en requête, `Content-Type`, `Cache-Control`,
+  `Retry-After`, `X-Request-Id` et les `X-Ratelimit-*` d'OpenAI en réponse).
+- **Flux SSE** relayé morceau par morceau. Annuler la requête (fermer le flux)
+  arrête la génération amont.
+- **Erreurs du relais** au format OpenAI, `{"error": {"message", "type", "code"}}` :
+  403 `LLM_ORIGIN_REFUSED`, 404 `LLM_UNKNOWN_BACKEND` (slug inconnu ou désactivé),
+  400 `LLM_INVALID_PATH`, 502 `LLM_UPSTREAM_UNREACHABLE`, 504 `LLM_UPSTREAM_TIMEOUT`.
+  Une erreur de l'API elle-même (401, 429…) passe telle quelle. Une panne en cours de
+  flux coupe la connexion, sans fin de flux propre.
+- La liste des backends n'est pas encore publiée : l'utilisateur tape l'URL du slug.
+  Une découverte (listage ou extension MCP) est un lot ultérieur.
+- Indépendant de l'auth entrante : `/llm/` n'exige pas le jeton de `/mcp`, et le
+  `Authorization` envoyé au relais n'est jamais pris pour lui.
+
 ## Ce que MIAOU attend d'un serveur MCP
 
 1. `initialize` (handshake JSON-RPC) → capte `Mcp-Session-Id`

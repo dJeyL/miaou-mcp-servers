@@ -8,6 +8,37 @@
   "self_update": false,
   "_comment_lifecycle": "FACULTATIF, true par défaut. Le proxy publie l'extension MCP miaou/lifecycle (méthodes miaou/lifecycle/status et miaou/lifecycle/restart) : MIAOU y lit si la config a changé depuis le démarrage du proxy, et propose de le redémarrer — accepté seulement sous scripts/supervise.sh. false la retire : MIAOU n'en parle plus, comme devant un proxy qui ne la connaît pas. À mettre à false là où la config ne se modifie pas sur place et où rien ne relance le proxy (image Docker). Le redémarrage par SIGUSR1 n'en dépend pas.",
   "lifecycle": true,
+  "llm": {
+    "_comment": "FACULTATIF. Relais vers des API de LLM OpenAI-compatibles, pour MIAOU servi par ce proxy sous /app/ (et lui seul : toute autre origine, ou un Host autre que 127.0.0.1/localhost au port du proxy, est refusée en 403). Chaque backend de 'backends' se sert sous http://<host>:<port>/llm/<slug>, à donner à MIAOU comme URL de base à la place de 'base_url'. Les en-têtes sont ceux que la config cite, et aucun autre : true recopie la valeur reçue (du client pour la requête, de l'amont pour la réponse), une chaîne pose une valeur fixe (${VAR} compris), false retire l'en-tête. Les listes ci-dessous s'appliquent à tous les backends, sous leurs propres request_headers/response_headers qui l'emportent clef par clef (false y retire une clef globale). Un en-tête non cité tombe : Origin, Referer, User-Agent du navigateur ne partent pas, et aucun User-Agent n'est envoyé sans déclaration. Host, Content-Length, Accept-Encoding et les en-têtes hop-by-hop (et, en réponse, Content-Encoding et Access-Control-*) sont gérés par le relais et refusés ici. 'timeout' (secondes, défaut 600) borne l'attente entre deux morceaux de la réponse. 'disabled': true neutralise un backend sans le retirer.",
+    "request_headers": {
+      "Content-Type": true,
+      "Accept": true
+    },
+    "response_headers": {
+      "Content-Type": true,
+      "Cache-Control": true,
+      "Retry-After": true,
+      "X-Request-Id": true,
+      "X-Ratelimit-Limit-Requests": true,
+      "X-Ratelimit-Limit-Tokens": true,
+      "X-Ratelimit-Remaining-Requests": true,
+      "X-Ratelimit-Remaining-Tokens": true,
+      "X-Ratelimit-Reset-Requests": true,
+      "X-Ratelimit-Reset-Tokens": true
+    },
+    "backends": {
+      "openrouter": {
+        "disabled": true,
+        "_comment": "Exemple, à activer par \"disabled\": false dans config.json : servi sous /llm/openrouter. 'Authorization': true transmet la clef saisie dans MIAOU ; pour une clef tenue par le proxy, une valeur fixe : \"Authorization\": \"Bearer ${MA_CLEF_LLM}\", la variable d'environnement venant du lancement. Les deux autres en-têtes identifient l'application auprès d'OpenRouter.",
+        "base_url": "https://openrouter.ai/api/v1",
+        "request_headers": {
+          "Authorization": true,
+          "X-OpenRouter-Title": "MIAOU",
+          "HTTP-Referer": "https://github.com/dJeyL/miaou"
+        }
+      }
+    }
+  },
   "_comment_auth": "Bloc 'auth' FACULTATIF (absent = aucune authentification exigée, comportement par défaut). Le renseigner fait du proxy un Resource Server OAuth 2.1 : il refuse les appels sans jeton valide et indique où s'authentifier. Il VÉRIFIE des jetons, il n'en émet jamais — cela appartient à un serveur d'autorisation distinct. Seul 'issuer_url' est obligatoire ; 'resource_url' (identité publique de ce proxy, ce à quoi le jeton doit être destiné) est dérivé de l'adresse d'écoute si omis. 'disabled': true neutralise le bloc sans le supprimer ; --no-auth fait de même à la volée.",
   "_auth_example": {
     "disabled": true,

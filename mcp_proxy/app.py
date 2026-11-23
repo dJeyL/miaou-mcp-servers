@@ -20,6 +20,7 @@ from .auth_out import (
     build_authorize_route,
     build_callback_route,
 )
+from .llm_relay import PREFIX as LLM_PREFIX
 from .logging import _log
 from .server import aggregate_instructions, authorize_path, published_tools
 from .skills import build_skills_blocks, install_skills
@@ -38,6 +39,7 @@ def build_app(
     catalog: Any = None,
     secrets: Any = None,
     lifecycle: Any = None,
+    llm_relay: Any = None,
 ) -> Any:
     """`auth` : sortie de resolve_auth_config(), ou None (auth désactivée —
     comportement d'avant le lot AB-1, à l'octet près).
@@ -67,6 +69,11 @@ def build_app(
 
     `lifecycle` : un `Lifecycle` (lot AV), ou None (`lifecycle` à false, et
     tests) : ni méthode, ni extension `miaou/lifecycle`.
+
+    `llm_relay` : un `LlmRelay`, ou None (clef `llm` sans backend actif) :
+    rien n'est servi sous `/llm/`. Aiguillé par le wrapper ASGI final, AVANT
+    l'app Starlette, donc hors de l'auth entrante et du CORS — cf.
+    llm_relay.py. Son client HTTP est refermé à l'extinction.
     """
     from contextlib import asynccontextmanager
 
@@ -358,6 +365,11 @@ def build_app(
                             f"Arrêt de '{names.get(id(upstream), '?')}' en échec "
                             f"({type(e).__name__}: {e})."
                         )
+                if llm_relay is not None:
+                    try:
+                        await llm_relay.aclose()
+                    except Exception as e:  # pragma: no cover - filet
+                        _log(f"Arrêt du relais LLM en échec ({type(e).__name__}: {e}).")
                 # Sans annulation explicite, les tâches de service encore
                 # vivantes retiendraient le task group — donc l'extinction.
                 tg.cancel_scope.cancel()
@@ -480,6 +492,16 @@ def build_app(
     inner_app = app
 
     async def strip_trailing_slash_redirect(scope: Any, receive: Any, send: Any) -> None:
+        # Relais LLM : avant l'app, donc avant l'AuthenticationMiddleware de
+        # l'auth entrante, qui prendrait la clef d'API du client pour un jeton
+        # à vérifier (et le journaliserait refusé à chaque appel).
+        if (
+            llm_relay is not None
+            and scope["type"] == "http"
+            and (scope["path"] == LLM_PREFIX or scope["path"].startswith(LLM_PREFIX + "/"))
+        ):
+            await llm_relay(scope, receive, send)
+            return
         if scope["type"] == "http" and scope["path"] == "/mcp":
             scope = dict(scope)
             scope["path"] = "/mcp/"

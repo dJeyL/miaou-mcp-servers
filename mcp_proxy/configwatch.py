@@ -21,7 +21,7 @@ config invalide. Rien ici ne lève : un JSON à moitié écrit par un éditeur
 rend `invalid` avec sa cause, et redevient `changed` à la lecture suivante.
 
 **La validation** est `prepare_config`, la séquence même de `main()` (hôte et
-port, `miaou_dist`, `self_update`, auth entrante, upstreams, autorisations
+port, `miaou_dist`, `self_update`, relais `llm`, auth entrante, upstreams, autorisations
 sortantes), rejouée avec les mêmes surcharges de la ligne de commande. Une
 seule fonction pour les deux : une validation qui passerait là où `main()`
 échoue laisserait redémarrer un proxy qui sort en 1, que le superviseur ne
@@ -54,6 +54,7 @@ from typing import Any, Mapping
 from .auth_in import resolve_auth_config
 from .auth_out import _default_tokens_path, build_callback_url, build_upstream_authorizers
 from .config import build_upstreams
+from .llm_relay import LlmConfig, resolve_llm_config
 from .layers import LoadedConfig, load_layers, resolve_chain, strip_comments
 from .logging import muted
 from .netproxy import compute_proxy_env_overrides
@@ -124,6 +125,7 @@ class Prepared:
     tokens_path: Path | str
     dev_auth_url: str | None
     proxy_overrides: dict[str, str | None] | None
+    llm: LlmConfig = field(default_factory=LlmConfig)
 
 
 def resolve_lifecycle(cfg: dict[str, Any]) -> bool:
@@ -170,6 +172,7 @@ def prepare_config(loaded: LoadedConfig, options: LaunchOptions) -> Prepared:
     miaou_dist = resolve_miaou_dist(cfg, loaded.miaou_dist_base)
     self_update = resolve_self_update(cfg)
     lifecycle = resolve_lifecycle(cfg)
+    llm = resolve_llm_config(cfg)
 
     proxy_overrides = compute_proxy_env_overrides(options.proxy, options.noproxy)
     cli_auth = options.cli_auth
@@ -200,7 +203,7 @@ def prepare_config(loaded: LoadedConfig, options: LaunchOptions) -> Prepared:
         loaded=loaded, cfg=cfg, host=host, port=port, miaou_dist=miaou_dist,
         self_update=self_update, lifecycle=lifecycle, auth=auth, upstreams=upstreams,
         authorizers=authorizers, tokens_path=tokens_path,
-        dev_auth_url=dev_auth_url, proxy_overrides=proxy_overrides,
+        dev_auth_url=dev_auth_url, proxy_overrides=proxy_overrides, llm=llm,
     )
 
 

@@ -307,9 +307,10 @@ def mask_secrets(value: Any, mask_all: bool = False) -> Any:
         for k, v in value.items():
             if mask_all:
                 out[k] = mask_secrets(v, True)
-            elif k == "mcpServers" and isinstance(v, dict):
-                # Les noms de serveurs sont libres (`auth0`, `token_vault`) :
-                # ce sont leurs entrées qui sont jugées, pas leur nom.
+            elif k in ("mcpServers", "backends") and isinstance(v, dict):
+                # Les noms de serveurs et les slugs de backends LLM sont libres
+                # (`auth0`, `token_vault`) : ce sont leurs entrées qui sont
+                # jugées, pas leur nom.
                 out[k] = {n: mask_secrets(e) for n, e in v.items()}
             elif (_is_secret_subtree(k) if isinstance(v, (dict, list)) else _is_secret_key(k)) \
                     and not _is_volatile_marker(v):

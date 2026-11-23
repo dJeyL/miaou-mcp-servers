@@ -102,6 +102,19 @@ Windows (registre qui type `.js` en `text/plain`) se simule en remplaçant
 **`starlette.responses.guess_type`** : Starlette importe la fonction par son nom, et
 remplacer `mimetypes.guess_type` laisse le test vert même sans la table de types —
 vérifié en retirant la table.
+`tests/test_proxy_llm.py` (relais LLM, `llm_relay.py`) : les purs (validation de
+`llm`, deux couches qui écrivent un nom en deux casses par vrai `load_layers`, règles
+d'en-têtes, découpe et garde du chemin), puis l'app de `build_app` sur
+`httpx2.ASGITransport`, vers un amont Starlette ENREGISTREUR injecté par le
+`transport` de `LlmRelay` (en-têtes reçus comparés à la liste exacte, `Set-Cookie`
+répété, garde d'origine, 502/504 par `MockTransport`, auth entrante dont le
+vérificateur n'est appelé que pour `/mcp`). Enfin **deux vrais uvicorn**, proxy et
+amont SSE. `ASGITransport` lit toute la réponse avant de la rendre : il ne prouve ni
+le streaming ni l'arrêt sur départ du client. L'amont attend le feu vert du test
+avant son second événement, donc un relais qui tamponne ne rend jamais le premier ;
+et un flux sans fin doit voir son générateur refermé après un `shutdown` de la
+socket cliente. Chacun des deux a été vu rouge, de même que la garde
+`Sec-Fetch-Site` et le retrait du `User-Agent` de httpx2, en cassant le code.
 Les tests qui interceptent le client HTTP du SDK patchent **`httpx2`** (`AsyncClient`,
 `MockTransport`, `Response`) : le SDK 2.x n'emploie plus `httpx`, et un patch resté sur
 l'ancien nom ne lève rien — il ne patche plus rien, et le test part sur le réseau.

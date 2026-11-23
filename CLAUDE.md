@@ -39,6 +39,8 @@ miaou-mcp-servers/
 │   │   └── authorizer.py # parcours, renouvellement, routes Starlette
 │   ├── app.py            # build_app (Starlette)
 │   ├── webapp.py         # MIAOU servi sous /app/ : clé miaou_dist, MiaouStaticFiles, garde et avertissements
+│   ├── llm_relay.py      # relais LLM sous /llm/<slug> (clé llm) : en-têtes en liste blanche, flux SSE, hors auth et CORS
+│   ├── origin_guard.py   # loopback_same_origin : Host loopback + même origine (relais LLM, secrets volatils)
 │   ├── selfupdate.py     # mise à jour par lui-même (lot AT) : état git du clone, fast-forward vers le sha affiché
 │   ├── updater.py        # extension miaou/self-update : status/apply, sonde de 5 min, refus (supervision, appels en vol) ; restartable()
 │   ├── lifecycle.py      # extension miaou/lifecycle (lot AV) : status (config relue), restart (sortie en 43), ProcessIdentity partagée avec les secrets
@@ -88,6 +90,7 @@ miaou-mcp-servers/
 │   ├── test_proxy_auth.py  # auth OAuth entrante (lot AB-1)
 │   ├── test_proxy_outbound_auth.py  # auth OAuth sortante (lot AB-2)
 │   ├── test_proxy_webapp.py  # MIAOU servi sous /app/ (lot AO-1) : purs, ASGI, vrai uvicorn
+│   ├── test_proxy_llm.py  # relais LLM : config, en-têtes, garde, deux vrais uvicorn (flux SSE, départ du client)
 │   ├── test_proxy_selfupdate.py  # mise à jour par lui-même (lot AT) : vrais dépôts jetables, faux git, extension
 │   └── test_dev_auth_server.py  # serveur d'autorisation de développement (lot AB-1.3)
 ├── config.defaults.json  # couche de BASE de la config, versionnée, lue telle quelle
@@ -119,7 +122,7 @@ Le détail de chacun (outils, contrats, variables d'environnement, décisions) e
 | `mcp_web/` | 8768 | Téléchargement d'URL, cache disque par checksum, pagination ; recherche multi-moteurs (Brave → Ollama → DDG, ordre en config) | `fetch_url`, `fetch_read`, `fetch_list`, `fetch_resource`, `search`, `image_search` (si un moteur sait chercher des images) |
 | `mcp_secret_demo.py` | 8772 | Démonstration des secrets volatils : `check_config`, `build` qui teste le mot de passe et lève `CredentialsRejected` | `whoami` |
 | `mcp_docs/` | 8771 | Extraction PDF/Office/Zip — **obsolète, désactivé par défaut** | `list`, `read`, `search`, `extract`, `drop_session` |
-| `mcp_proxy/` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) et les skills ; sert MIAOU sous `/app/` si `miaou_dist` est posée | (+ `status` si auth sortante, `read_skill` si une skill est servie) |
+| `mcp_proxy/` | 8765 | Agrège tout sur un port, préfixe les outils (`bench__echo`…) et les skills ; sert MIAOU sous `/app/` si `miaou_dist` est posée ; relaie des API de LLM sous `/llm/<slug>` si `llm.backends` en déclare | (+ `status` si auth sortante, `read_skill` si une skill est servie) |
 
 Deux points qu'on ne devine pas depuis le tableau :
 
@@ -269,11 +272,14 @@ auprès de serveurs tiers (campagne AB) — **désactivé par défaut** dans les
 sans clé `auth` dans `config.json`, le comportement est celui d'avant le lot, à
 l'octet près. Détail : `docs/auth.md`.
 
-Les secrets volatils (lot AU) sont la seule surface gardée par l'origine : l'extension
-`miaou/volatile-secrets` ne répond qu'à `Host` `127.0.0.1`/`localhost` au port du proxy
-ET `Origin` de même origine (MIAOU servi sous `/app/`). La valeur n'est jamais écrite,
-journalisée ni relue ; tout texte d'échec d'un `build` passe par `volatile.mask`.
-Détail : `docs/miaou-contract.md`.
+Deux surfaces sont gardées par l'origine (`origin_guard.loopback_same_origin`) : elles
+ne répondent qu'à `Host` `127.0.0.1`/`localhost` au port du proxy ET à une requête de
+même origine (MIAOU servi sous `/app/`). L'extension `miaou/volatile-secrets` (lot AU)
+exige `Origin` ; la valeur n'est jamais écrite, journalisée ni relue, et tout texte
+d'échec d'un `build` passe par `volatile.mask`. Le relais LLM (`/llm/<slug>`) accepte
+aussi `Sec-Fetch-Site: same-origin` sans `Origin` (un `GET` de même origine n'en porte
+pas) : il peut détenir une clef d'API payante, que toute page pourrait sinon dépenser.
+Détail : `docs/miaou-contract.md`, `docs/proxy.md`.
 
 ## Ajouter un outil
 
@@ -507,6 +513,17 @@ lots — piège déjà payé côté MIAOU.
   sur dossier absent), refus de démarrer sur `config.json`/
   `.git` dans le dossier, avertissements sur `miaou.html`/manifeste/icônes lues dans
   `icons[].src`, et `miaou_dist/` versionné vide pour le `COPY` du `Dockerfile`.
+  Relais LLM (`llm_relay.py`, clé `llm`) : `/llm/<slug>/<reste>` → `<base_url>/<reste>`,
+  `request_headers`/`response_headers` en dictionnaire (`true` recopie, chaîne fixe,
+  `false` retire, non cité = tombe ; global sous le backend, fusion par le code et non
+  par Merge Patch, deux casses d'un nom refusées), en-têtes gérés par httpx2 refusés
+  (`Accept-Encoding`, hop-by-hop, `Content-Encoding`, `Access-Control-*`), `User-Agent`
+  de httpx2 retiré, garde `loopback_same_origin(fetch_metadata=True)`, aiguillage
+  AVANT l'app par le wrapper final (hors auth entrante et CORS), `raw_path` et refus de
+  `.`/`..`, ASGI brut avec veille de `http.disconnect` qui ferme l'amont, `timeout` de
+  lecture (600 s), 502/504 au format OpenAI, coupure sur panne en cours de flux,
+  `disabled`, slugs de `backends` jugés comme `mcpServers` par `--print-config`,
+  `prepare_config` qui valide, exemple `openrouter` désactivé dans la base.
 - **`docs/auth.md`** — campagne AB, les deux sens sans rapport entre eux. Entrante
   (AB-1 : le proxy est Resource Server, `JwtTokenVerifier`, validation d'audience
   RFC 8707 non désactivable, `dev_auth_server.py`). Sortante (AB-2 : le proxy est
@@ -577,7 +594,10 @@ lots — piège déjà payé côté MIAOU.
   `config.state` unchanged/changed/invalid, chemins `mcpServers.<nom>` ou clef racine
   plafonnés à 20, ce qui compte comme changement —, `restart` et ses refus
   `RESTART_*` dans l'ordre, `force` qui ne lève que les appels en vol, réponse
-  idempotente, `UPDATE_RESTARTING` en retour),
+  idempotente, `UPDATE_RESTARTING` en retour), le relais LLM (`/llm/<slug>` comme URL
+  de base de l'API, servi seulement à MIAOU sous `/app/`, `Authorization` recopié ou
+  posé par le proxy, en-têtes filtrés dans les deux sens, flux SSE et annulation,
+  erreurs `LLM_*` au format OpenAI, pas encore de découverte des backends),
   et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
   `ref`+`content_b64`, `session_id`, idempotence de la matérialisation, REF_UNKNOWN
   levée en `MCPError` par l'outil et donc rejouable en autonome comme derrière le
@@ -604,6 +624,8 @@ lots — piège déjà payé côté MIAOU.
   `test_proxy_lifecycle.py` (refus de `restart` dans l'ordre, chacun avec les suivants
   réunis ; sortie en 43 sur vrai uvicorn ; vrai `main()` sous `supervise.sh`, revenu
   avec un autre `instance`, groupe de processus tué à la fin),
+  `test_proxy_llm.py` (amont enregistreur injecté par `transport`, deux vrais uvicorn
+  pour le streaming et le départ du client, qu'`ASGITransport` ne prouve pas),
   `test_proxy_webapp.py` et son vrai uvicorn sur port
   éphémère (en-têtes émis, revalidation après `git pull` ; `guess_type` à remplacer
   dans `starlette.responses`, pas dans `mimetypes`), les vrais handshakes de `test_proxy_era.py` (fixtures
