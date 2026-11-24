@@ -16,7 +16,7 @@ aucun autre. La réponse revient morceau par morceau, flux SSE compris.
           "base_url": "https://api.example.org/v1",
           "disabled": false,
           "request_headers": { … }, "response_headers": { … },
-          "timeout": 600
+          "timeout": null
         }
       }
     }
@@ -50,7 +50,16 @@ navigateur pourrait sinon la dépenser. Refus en 403.
 elle. Ni l'auth entrante (dont le `BearerAuthBackend` prendrait la clef de
 l'API pour un jeton à vérifier), ni le CORS du proxy ne s'y appliquent.
 
-**Erreurs** : amont injoignable en 502, délai dépassé avant la réponse en 504,
+**Délais** : 30 s pour se connecter, et AUCUNE limite de lecture par défaut.
+C'est le client qui décide combien de temps attendre : MIAOU propose, après un
+silence, d'attendre encore ou d'abandonner. Une limite ici couperait une
+attente que l'utilisateur vient d'accepter. Un client qui abandonne ferme sa
+requête, et la veille de `http.disconnect` referme alors la requête amont :
+rien ne reste pendu. `timeout` (secondes) pose une limite de lecture pour un
+backend, à ne pas régler plus court que ce que le client laisse attendre.
+
+**Erreurs** : amont injoignable en 502 (délai de connexion compris), délai de
+lecture dépassé (`timeout` posé) avant la réponse en 504,
 au format d'erreur OpenAI (`{"error": {"message", "type", "code"}}`). Une
 panne APRÈS le début de la réponse ne peut plus changer le statut : la
 connexion est coupée (exception relevée), pour qu'une réponse tronquée ne
@@ -76,9 +85,9 @@ REQUEST_HEADERS = "request_headers"
 RESPONSE_HEADERS = "response_headers"
 BACKENDS = "backends"
 
-#: Délai de LECTURE par défaut, entre deux morceaux de la réponse : un modèle
-#: de raisonnement peut se taire plusieurs minutes avant son premier token.
-DEFAULT_TIMEOUT_S = 600.0
+#: Délai de LECTURE par défaut (en-têtes de réponse compris, puis entre deux
+#: morceaux) : aucun. Le client décide de l'attente, cf. « Délais ».
+DEFAULT_TIMEOUT_S: float | None = None
 CONNECT_TIMEOUT_S = 30.0
 
 ORIGIN_REFUSED = "LLM_ORIGIN_REFUSED"
@@ -164,7 +173,7 @@ class Backend:
     base_url: str
     request_headers: dict[str, HeaderRule] = field(default_factory=dict)
     response_headers: dict[str, HeaderRule] = field(default_factory=dict)
-    timeout: float = DEFAULT_TIMEOUT_S
+    timeout: float | None = DEFAULT_TIMEOUT_S
 
 
 @dataclass(frozen=True)
@@ -190,7 +199,7 @@ def _base_url(where: str, value: Any) -> str:
     return url.rstrip("/")
 
 
-def _timeout(where: str, value: Any) -> float:
+def _timeout(where: str, value: Any) -> float | None:
     if value is None:
         return DEFAULT_TIMEOUT_S
     if (
@@ -421,7 +430,7 @@ class LlmRelay:
         )
         try:
             response = await client.send(request, stream=True)
-        except httpx2.TimeoutException as e:
+        except (httpx2.ReadTimeout, httpx2.WriteTimeout) as e:
             _log(f"Relais LLM '{backend.slug}' : délai dépassé ({type(e).__name__}).")
             await _send_error(
                 send, 504,

@@ -520,8 +520,9 @@ lots — piège déjà payé côté MIAOU.
   (`Accept-Encoding`, hop-by-hop, `Content-Encoding`, `Access-Control-*`), `User-Agent`
   de httpx2 retiré, garde `loopback_same_origin(fetch_metadata=True)`, aiguillage
   AVANT l'app par le wrapper final (hors auth entrante et CORS), `raw_path` et refus de
-  `.`/`..`, ASGI brut avec veille de `http.disconnect` qui ferme l'amont, `timeout` de
-  lecture (600 s), 502/504 au format OpenAI, coupure sur panne en cours de flux,
+  `.`/`..`, ASGI brut avec veille de `http.disconnect` qui ferme l'amont, aucune
+  limite de lecture par défaut (la modale d'attente de MIAOU décide ; `timeout`
+  facultatif), 502/504 au format OpenAI, coupure sur panne en cours de flux,
   `disabled`, slugs de `backends` jugés comme `mcpServers` par `--print-config`,
   `prepare_config` qui valide, exemple `openrouter` désactivé dans la base.
 - **`docs/auth.md`** — campagne AB, les deux sens sans rapport entre eux. Entrante
@@ -597,6 +598,7 @@ lots — piège déjà payé côté MIAOU.
   idempotente, `UPDATE_RESTARTING` en retour), le relais LLM (`/llm/<slug>` comme URL
   de base de l'API, servi seulement à MIAOU sous `/app/`, `Authorization` recopié ou
   posé par le proxy, en-têtes filtrés dans les deux sens, flux SSE et annulation,
+  aucune limite d'attente qui court-circuite la modale de MIAOU,
   erreurs `LLM_*` au format OpenAI, pas encore de découverte des backends),
   et le contrat `mcp_docs` ↔ dispatcher (détection de capability par
   `ref`+`content_b64`, `session_id`, idempotence de la matérialisation, REF_UNKNOWN

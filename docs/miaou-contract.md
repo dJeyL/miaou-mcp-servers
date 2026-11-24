@@ -66,9 +66,15 @@ LLM ». Ce que ça engage côté MIAOU :
   `Retry-After`, `X-Request-Id` et les `X-Ratelimit-*` d'OpenAI en réponse).
 - **Flux SSE** relayé morceau par morceau. Annuler la requête (fermer le flux)
   arrête la génération amont.
+- **Aucune limite d'attente côté relais par défaut** : la modale « attendre ou
+  abandonner » de MIAOU reste seule juge d'un backend muet. Un `timeout` posé sur un
+  backend la court-circuiterait s'il est plus court que l'attente qu'elle accorde. Les
+  commentaires SSE de maintien d'un fournisseur (`: …`) sont relayés tels quels :
+  MIAOU les voit comme en appel direct.
 - **Erreurs du relais** au format OpenAI, `{"error": {"message", "type", "code"}}` :
   403 `LLM_ORIGIN_REFUSED`, 404 `LLM_UNKNOWN_BACKEND` (slug inconnu ou désactivé),
-  400 `LLM_INVALID_PATH`, 502 `LLM_UPSTREAM_UNREACHABLE`, 504 `LLM_UPSTREAM_TIMEOUT`.
+  400 `LLM_INVALID_PATH`, 502 `LLM_UPSTREAM_UNREACHABLE`, 504 `LLM_UPSTREAM_TIMEOUT`
+  (seulement avec un `timeout` posé).
   Une erreur de l'API elle-même (401, 429…) passe telle quelle. Une panne en cours de
   flux coupe la connexion, sans fin de flux propre.
 - La liste des backends n'est pas encore publiée : l'utilisateur tape l'URL du slug.

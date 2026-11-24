@@ -1255,8 +1255,7 @@ par morceau.
     "openrouter": {
       "disabled": false,
       "base_url": "https://openrouter.ai/api/v1",
-      "request_headers": { "Authorization": true, "X-OpenRouter-Title": "MIAOU" },
-      "timeout": 600
+      "request_headers": { "Authorization": true, "X-OpenRouter-Title": "MIAOU" }
     }
   }
 }
@@ -1321,13 +1320,24 @@ ASGI 2.4, celle-ci ne guette plus `http.disconnect` et compte sur un `OSError` �
 l'envoi, et elle prend ses en-têtes en dictionnaire. Une tâche lit le flux amont
 pendant qu'une autre attend `http.disconnect`. Le client parti, la seconde annule la première et la
 réponse amont est fermée, sinon la génération continuerait, facturée, jusqu'à son
-terme. Délais : 30 s de connexion, `timeout` (défaut 600 s) en LECTURE entre deux
-morceaux, parce qu'un modèle de raisonnement peut se taire plusieurs minutes avant
-son premier token.
+terme.
+
+**Délais : 30 s de connexion, aucune limite de lecture par défaut.** Le délai de
+lecture de httpx2 couvre aussi l'attente des en-têtes de réponse, pas seulement le
+silence entre deux morceaux. Or MIAOU gère lui-même le silence d'un backend : après
+un délai configuré, une modale propose d'attendre ou d'abandonner, et abandonne seule
+au bout de trois fois ce délai en plus. Une limite côté relais rendrait un 504, ou
+couperait le flux, au milieu d'une attente que l'utilisateur vient d'accepter, avec
+une erreur que le backend n'a jamais émise. La veille de `http.disconnect` rend
+cette limite inutile au relais : un abandon côté client referme la requête amont, et
+un onglet fermé ferme la connexion. `timeout` (secondes, facultatif) en pose une pour
+un backend, pour un autre client que MIAOU ; à ne pas régler plus court que ce que le
+client laisse attendre.
 
 **Erreurs.** Au format OpenAI (`{"error": {"message", "type", "code"}}`) : amont
-injoignable en 502 (`LLM_UPSTREAM_UNREACHABLE`), délai dépassé avant la réponse en 504
-(`LLM_UPSTREAM_TIMEOUT`). Un statut d'erreur de l'amont (401, 429…) passe tel quel,
+injoignable en 502 (`LLM_UPSTREAM_UNREACHABLE`, délai de connexion compris), délai de
+lecture dépassé avant la réponse en 504 (`LLM_UPSTREAM_TIMEOUT`, seulement si
+`timeout` est posé). Un statut d'erreur de l'amont (401, 429…) passe tel quel,
 corps compris. Une panne APRÈS le début de la réponse ne peut plus changer le statut :
 une ligne au journal, puis l'exception remonte et uvicorn coupe la connexion. Une
 réponse tronquée ne doit pas passer pour complète, ce que ferait une fin de flux

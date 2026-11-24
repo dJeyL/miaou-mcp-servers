@@ -76,7 +76,7 @@ def test_backend_merges_global_rules_and_can_withdraw_one():
     assert a.base_url == "https://api.example.org/v1"
     assert a.request_headers == {"content-type": True, "accept": False, "authorization": "Bearer k"}
     assert a.response_headers == {"content-type": True, "x-extra": True}
-    assert a.timeout == DEFAULT_TIMEOUT_S
+    assert a.timeout is None and DEFAULT_TIMEOUT_S is None
 
 
 def test_disabled_backend_is_not_served_and_not_validated():
@@ -389,14 +389,39 @@ async def test_unreachable_and_timeout_are_502_and_504():
     def handler(request):
         if request.url.path.endswith("/slow"):
             raise httpx2.ReadTimeout("trop lent", request=request)
+        if request.url.path.endswith("/connect"):
+            raise httpx2.ConnectTimeout("pas de poignée de main", request=request)
         raise httpx2.ConnectError("refusé", request=request)
 
     relay = _relay({"a": {"base_url": "http://amont.test/v1"}}, httpx2.MockTransport(handler))
     async with _client(_proxy(relay)) as c:
         down = await c.get("/llm/a/models", headers=SAME)
+        connect = await c.get("/llm/a/connect", headers=SAME)
         slow = await c.get("/llm/a/slow", headers=SAME)
     assert down.status_code == 502 and down.json()["error"]["code"] == "LLM_UPSTREAM_UNREACHABLE"
+    assert connect.status_code == 502 and connect.json()["error"]["code"] == "LLM_UPSTREAM_UNREACHABLE"
     assert slow.status_code == 504 and slow.json()["error"]["code"] == "LLM_UPSTREAM_TIMEOUT"
+
+
+@pytest.mark.parametrize("configured, read", [(None, None), (45, 45.0)])
+async def test_no_read_limit_unless_configured(configured, read):
+    """Sans `timeout`, aucune limite de lecture : la modale d'attente de MIAOU
+    décide seule. La connexion reste bornée."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.extensions["timeout"])
+        return httpx2.Response(200, json={})
+
+    entry = {"base_url": "http://amont.test/v1"}
+    if configured is not None:
+        entry["timeout"] = configured
+    relay = _relay({"a": entry}, httpx2.MockTransport(handler))
+    async with _client(_proxy(relay)) as c:
+        await c.get("/llm/a/models", headers=SAME)
+    assert seen[0]["read"] == read
+    assert seen[0]["connect"] == 30.0
+
 
 
 async def test_without_relay_llm_paths_are_not_served():
